@@ -1,0 +1,19 @@
+# Generated compiler artifacts
+build/*.exe
+build/**/*.exe
+build/*.obj
+build/**/*.obj
+build/*.pdb
+build/**/*.pdb
+build/*.ilk
+build/**/*.ilk
+build/*.idb
+build/**/*.idb
+build/*.log
+build/**/*.log
+build/fixtures/
+
+# Local diagnostics and editor state
+debug_full.log
+.vs/
+*.user

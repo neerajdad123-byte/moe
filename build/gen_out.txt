@@ -1,0 +1,16 @@
+static resident: 1023.342 MiB
+
+=== GENERATION (correctness gate) ===
+prompt: "The capital of France is"
+output: "!"
+prompt-decode+first-tok latency: 1658.6 ms
+VRAM: 5654 / 6140 MiB  (experts pinned: 977)
+sanity: WARNING output is a single repeated token
+
+=== CEILING BENCHMARK (resident-route, 100% hit) ===
+timed tokens:   64
+elapsed:        7.566 s
+route drift:    2865 (0 == true 100%-hit ceiling)
+decode tok/s:   8.46
+ms/token mean:  118.23
+per-token ms:   min 115.2  p50 117.4  p90 121.6  p99 125.0  max 125.3
