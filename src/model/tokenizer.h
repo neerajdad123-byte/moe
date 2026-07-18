@@ -1,10 +1,17 @@
-// MoEx clean-room. GPT-2 byte-level BPE detokenizer for Qwen3.
+// MoEx clean-room. GPT-2 byte-level BPE tokenizer for Qwen3.
 //
-// v1 scope: DECODE (id -> text). The vocab strings come straight from the GGUF
+// Decode (id -> text): vocab strings come straight from the GGUF
 // `tokenizer.ggml.tokens` array. GPT-2 byte-level BPE maps each raw byte to a
 // printable Unicode codepoint so the vocab has no control bytes; detokenizing
-// reverses that map. Encoding (text -> ids) is out of scope for the correctness
-// gate — prompt ids are provided externally.
+// reverses that map. This remains the correctness-gate path.
+//
+// Encode (text -> ids): `Encoder` below is a benchmarking/data-collection
+// utility, not part of the numerical conformance gate. It implements
+// standard GPT-2 byte-level BPE (pretokenize, byte->unicode map, greedy
+// merge by rank from `tokenizer.ggml.merges`, vocab lookup). The
+// pretokenizer regex is ASCII-scoped (`[A-Za-z]+`/`[0-9]+` in place of
+// `\p{L}+`/`\p{N}+`, since std::regex has no Unicode property classes
+// without ICU) — correct for plain ASCII prompt text, not general UTF-8.
 #pragma once
 
 #include <cstdint>
@@ -38,6 +45,23 @@ class Detokenizer {
   std::unordered_map<uint32_t, uint8_t> u2b_;  // unicode codepoint -> raw byte
   int eos_id_ = -1;
   int bos_id_ = -1;
+};
+
+// Text -> token ids (GPT-2 byte-level BPE encode). See file header for scope.
+class Encoder {
+ public:
+  // Loads vocab (tokenizer.ggml.tokens) and merge ranks (tokenizer.ggml.merges).
+  bool load(const gguf::Model& m, std::string* err);
+
+  // Encode UTF-8 text (ASCII-scoped pretokenizer, see file header) to ids.
+  // On an out-of-vocab symbol (should not happen against a matching model),
+  // the symbol is skipped and `err` is set if provided; encoding continues.
+  std::vector<int> encode(const std::string& text, std::string* err = nullptr) const;
+
+ private:
+  std::unordered_map<std::string, int> tok2id_;
+  std::unordered_map<uint8_t, uint32_t> b2u_;       // raw byte -> unicode codepoint
+  std::unordered_map<std::string, int> merge_rank_;  // "left\0right" -> priority
 };
 
 }  // namespace moex

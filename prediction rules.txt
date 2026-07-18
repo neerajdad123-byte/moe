@@ -1,0 +1,577 @@
+# Complete Expert-Prediction Idea Checklist
+
+The **router chooses the real top-8 experts**. Your predictor can prefetch more than eight—such as 10, 12, or 16—to maximize cache hits.
+
+## A. Basic baselines
+
+- [ ] **Random prediction**  
+  Sanity-check/worst-case baseline.
+
+- [ ] **Keep all experts**, if VRAM permits  
+  Upper-bound with no misses.
+
+- [ ] **Global hottest experts**  
+  Most frequently selected experts across the entire dataset.
+
+- [ ] **Per-layer hottest experts**  
+  Separate frequency ranking for every MoE layer.
+
+- [ ] **LFU cache**  
+  Retain experts with the highest historical usage counts.
+
+- [ ] **LRU cache**  
+  Retain the most recently used experts.
+
+- [ ] **EMA hotness**  
+  Track recent usage with an exponential moving average.
+
+- [ ] **Windowed frequency**  
+  Count expert usage over the last \(N\) tokens or requests.
+
+- [ ] **Hybrid LRU/LFU**  
+  Combine recency and frequency.
+
+---
+
+## B. Request-local prediction
+
+- [ ] **Experts used earlier in the same request**  
+  Maintain a request-specific hot set.
+
+- [ ] **Request-local EMA**  
+  Adapt quickly to the current prompt instead of relying only on global data.
+
+- [ ] **Prefix routing statistics**  
+  Use experts observed during the first prompt tokens to predict later usage.
+
+- [ ] **Stable-core detection**  
+  Detect experts repeatedly present in the current request.
+
+- [ ] **Core plus alternatives**  
+  If six experts are stable and two positions vary, prefetch the stable six plus likely alternatives.
+
+- [ ] **Change-point detection**  
+  Reset or reduce old statistics when the request changes topic or routing behavior.
+
+- [ ] **Separate prefill and decode histories**  
+  Routing during prompt processing may differ from token generation.
+
+---
+
+## C. Previous-token prediction
+
+For the same layer:
+
+- [ ] **Copy previous token’s experts**
+
+\[
+\hat E_{l,t}=E_{l,t-1}
+\]
+
+- [ ] **Last-\(N\)-token union**  
+  Prefetch every expert used during the previous few tokens.
+
+- [ ] **Token-to-token transition table**
+
+\[
+P(E_{l,t+1}=j\mid E_{l,t}=i)
+\]
+
+- [ ] **Multi-token route history**  
+  Use routes from \(t-1,t-2,\ldots\).
+
+- [ ] **Route persistence score**  
+  Estimate how likely each currently active expert is to remain active.
+
+- [ ] **Variable-position prediction**  
+  Track which experts replace one another between adjacent tokens.
+
+---
+
+## D. Cross-layer prediction
+
+For the same token:
+
+- [ ] **Previous layer’s experts**  
+  Use layer \(l\) to predict layer \(l+1\).
+
+- [ ] **Cross-layer transition table**
+
+\[
+P(E_{l+1}=j\mid E_l=i)
+\]
+
+- [ ] **Two-layer look-back**
+
+\[
+P(E_{l+1}\mid E_l,E_{l-1})
+\]
+
+- [ ] **Layer-route chain**  
+  Model the entire sequence:
+
+```text
+L0 route → L1 route → L2 route → ...
+```
+
+- [ ] **Multi-layer look-ahead**  
+  Predict experts one, two, or more layers ahead to hide transfers.
+
+- [ ] **Layer-position-specific statistics**  
+  Never assume expert `5` in one layer is the same as expert `5` in another.
+
+---
+
+## E. Combined token-and-layer prediction
+
+- [ ] **Previous token + previous layer**
+
+\[
+P(E_{l,t}\mid E_{l,t-1},E_{l-1,t})
+\]
+
+- [ ] **2D routing neighborhood**
+
+```text
+same layer, previous tokens
+previous layers, same token
+previous layers, previous tokens
+```
+
+- [ ] **Weighted combination of temporal and cross-layer transitions**
+
+- [ ] **Backoff model**  
+  If an exact context has too little data:
+
+```text
+exact route context
+→ pairwise transition
+→ request hot set
+→ domain hot set
+→ global layer hot set
+```
+
+---
+
+## F. Expert co-occurrence prediction
+
+- [ ] **Pairwise co-occurrence matrix**  
+  Count how often experts \(i\) and \(j\) appear together.
+
+- [ ] **Conditional completion**
+
+\[
+P(j\mid i)
+\]
+
+  If expert \(i\) is likely, load experts commonly selected with it.
+
+- [ ] **Multi-expert conditional completion**
+
+\[
+P(j\mid \{i_1,i_2,\ldots\})
+\]
+
+- [ ] **Association-rule mining**
+
+```text
+{1, 4, 7} → {12, 19}
+```
+
+- [ ] **Frequent item-set mining**  
+  Discover repeatedly occurring subsets of the router’s top-8.
+
+- [ ] **Lift-based co-occurrence**  
+  Separate meaningful associations from experts that are merely globally hot.
+
+- [ ] **Jaccard similarity between experts**  
+  Experts are related when they often occur in the same route transaction.
+
+- [ ] **Expert graph**  
+  Experts are nodes; co-occurrence/transition strength creates weighted edges.
+
+- [ ] **Graph-neighbor expansion**  
+  Start with high-confidence experts and add their strongest neighbors.
+
+- [ ] **Community detection**  
+  Find overlapping groups of experts with high internal co-occurrence.
+
+---
+
+## G. Stable-core and alternative-slot modelling
+
+This directly addresses the “six static, two changing” case.
+
+- [ ] Calculate per-context expert support.
+- [ ] Mark high-support experts as the **core**.
+- [ ] Discover experts that commonly fill the remaining slots.
+- [ ] Track which experts substitute for one another.
+- [ ] Construct:
+
+```text
+prefetch set = stable core + likely alternatives
+```
+
+- [ ] Measure **full-route coverage**: whether all real top-8 experts are inside the prefetched set.
+- [ ] Allow overlapping clusters.
+- [ ] Do not force one expert into only one cluster.
+- [ ] Allow variable cluster sizes.
+- [ ] Split clusters when the union becomes too large.
+- [ ] Merge clusters when their route distributions are nearly identical.
+
+---
+
+## H. Route-pattern clustering
+
+- [ ] **Exact top-8 route clustering**
+- [ ] **Jaccard clustering of top-8 sets**
+- [ ] **Per-request route-frequency-vector clustering**
+- [ ] **Layer-specific route clustering**
+- [ ] **Whole-model route-signature clustering**
+- [ ] **K-means/MiniBatchKMeans**
+- [ ] **Hierarchical clustering**
+- [ ] **HDBSCAN**, when the cluster count is unknown.
+- [ ] **Spectral/community clustering** on the co-occurrence graph.
+- [ ] **Mixture models** that produce soft cluster probabilities.
+- [ ] **Online clustering** to adapt as new requests arrive.
+- [ ] **Overlapping clusters**, because an expert can participate in multiple patterns.
+
+Cluster count is **not related to router top-k=8**. Test values such as:
+
+```text
+8, 16, 32, 64, 128 clusters
+```
+
+Choose using held-out cache-hit rate and latency.
+
+---
+
+## I. Prompt/domain-based prediction
+
+- [ ] **Known metadata domains**  
+  Code, mathematics, translation, conversation, legal, medical, etc.
+
+- [ ] **Language detection**
+- [ ] **Prompt embedding clustering**
+- [ ] **Semantic nearest-neighbor search**
+- [ ] **Domain-specific per-layer hot experts**
+- [ ] **Prompt-length bucket**
+- [ ] **Task-type classifier**
+- [ ] **User/workload-specific prior**, when appropriate and privacy-safe.
+- [ ] **Prompt cluster + route cluster hybrid**
+- [ ] **Early prompt classification**, then update after routing evidence arrives.
+- [ ] **Hierarchical domain model**
+
+```text
+global → language → domain → route pattern
+```
+
+Important: Qwen experts usually do **not** come with official labels like “math expert” or “code expert.” Domains must be discovered from traces.
+
+---
+
+## J. Similar-request retrieval
+
+- [ ] Store previous request embeddings and route signatures.
+- [ ] Find the nearest historical prompts.
+- [ ] Reuse their per-layer expert distributions.
+- [ ] Weight neighbors by semantic similarity.
+- [ ] Combine semantic similarity with early-route similarity.
+- [ ] Use approximate nearest-neighbor search, such as FAISS.
+- [ ] Age or expire old examples.
+- [ ] Fall back to cluster/global statistics when no similar request exists.
+
+---
+
+## K. Router-score-based prediction
+
+- [ ] Use full router logits when available.
+- [ ] Store top-16/top-32 scores instead of only the real top-8.
+- [ ] Prefetch experts near the top-8 cutoff.
+- [ ] Use the score gap between ranks 8 and 9.
+- [ ] Load more candidates when the router distribution is uncertain.
+- [ ] Load fewer when the router has a large confidence margin.
+- [ ] Sum router probabilities over all batch tokens.
+- [ ] Predict batch-level expert demand.
+- [ ] Calibrate router probabilities on trace data.
+- [ ] Use entropy to determine prefetch-set size.
+
+The current layer’s router output may arrive too late to prefetch that same layer, but it can help predict later layers or schedule expert execution.
+
+---
+
+## L. Learned predictors
+
+- [ ] **Linear predictor** from an earlier hidden state.
+- [ ] **Small MLP predictor**
+- [ ] **Low-rank predictor** to reduce overhead.
+- [ ] **Multi-label classifier** predicting all potentially required experts.
+- [ ] **Per-layer predictor**
+- [ ] **Shared predictor with layer embeddings**
+- [ ] **Predict from previous-layer router logits**
+- [ ] **Predict from selected expert IDs**
+- [ ] **Predict from hidden state + route history**
+- [ ] **Predict batch-level expert union**
+- [ ] **RNN/GRU over route history**
+- [ ] **Small Transformer over the route chain**
+- [ ] **Graph neural network over the expert graph**
+- [ ] **Mixture-of-predictors**, specialized by domain or phase.
+- [ ] **Knowledge distillation** from full router behavior into a cheaper look-ahead model.
+- [ ] **Online learning** from recent misses.
+- [ ] **Contextual bandit**, balancing prefetch benefit and transfer cost.
+
+Training targets:
+
+- [ ] Multi-hot selected-expert vector.
+- [ ] Expert-use probability.
+- [ ] Full-route coverage.
+- [ ] Number of tokens expected to use each expert.
+- [ ] Time until next expert use.
+- [ ] Expected reuse count.
+- [ ] Expected latency saved.
+
+---
+
+## M. Ensemble prediction
+
+Combine multiple signals:
+
+\[
+S_{l,e}=
+w_gG_{l,e}
++w_dD_{l,e}
++w_rR_{l,e}
++w_xX_{l,e}
++w_tT_{l,e}
++w_cC_{l,e}
++w_mM_{l,e}
+\]
+
+Where:
+
+- \(G\): global hotness.
+- \(D\): domain prior.
+- \(R\): request-local hotness.
+- \(X\): cross-layer transitions.
+- \(T\): cross-token transitions.
+- \(C\): co-occurrence/completion.
+- \(M\): learned-model score.
+
+Checklist:
+
+- [ ] Fixed weighted sum.
+- [ ] Weights tuned on validation traces.
+- [ ] Learned ranking model.
+- [ ] Different weights for prefill and decode.
+- [ ] Different weights by layer.
+- [ ] Confidence-aware fallback.
+- [ ] Conservative union of multiple predictors for maximum recall.
+
+---
+
+## N. Candidate-set-size strategies
+
+The router top-k is fixed, but the prefetch size should usually be dynamic.
+
+- [ ] Fixed sizes: 8, 9, 10, 12, 16, 20.
+- [ ] Select until cumulative probability reaches a threshold.
+- [ ] Select until estimated route recall reaches a threshold.
+- [ ] Select until available VRAM is full.
+- [ ] Select according to available transfer bandwidth.
+- [ ] Add more candidates when prediction entropy is high.
+- [ ] Add alternatives when router ranks are close.
+- [ ] Use fewer candidates for highly stable contexts.
+- [ ] Allocate more slots to layers with poor predictability.
+- [ ] Allocate more slots to expensive-to-reload experts.
+- [ ] Optimize candidate counts globally across upcoming layers.
+
+For top-8, a good initial experiment is:
+
+```text
+8, 10, 12, 16 candidates
+```
+
+---
+
+## O. Batch and multi-request prediction
+
+- [ ] Predict experts separately for every sequence.
+- [ ] Union predictions across active sequences.
+- [ ] Count expected expert demand across batch tokens.
+- [ ] Prioritize experts required by many sequences.
+- [ ] Group requests with similar predicted routes.
+- [ ] Route-aware batching.
+- [ ] Reorder safe work to reuse resident experts.
+- [ ] Fairness/latency protection so rare workloads are not starved.
+
+---
+
+## P. Cache-aware prediction and ranking
+
+Prediction and cache management should be optimized together.
+
+- [ ] Prefer already resident experts.
+- [ ] Penalize candidates with high transfer cost only when their hit probability is low.
+- [ ] Avoid evicting an expert needed soon.
+- [ ] Include expected reuse count.
+- [ ] Include expert size.
+- [ ] Include load latency.
+- [ ] Include time-to-use/deadline.
+- [ ] Include transfer already in progress.
+- [ ] Pin globally hot experts.
+- [ ] Reserve adaptive slots for request-specific experts.
+- [ ] Separate permanent, warm, and speculative cache regions.
+- [ ] Cancel speculative transfers when predictions change.
+- [ ] Predict multiple layers ahead only if transfer can complete in time.
+
+A practical value score:
+
+\[
+V_e=
+\frac{
+P(\text{use})\times
+\text{expected uses}\times
+\text{miss latency}
+}{
+\text{expert bytes}
+}
+\]
+
+---
+
+## Q. Cold-start strategy
+
+At the first request:
+
+- [ ] Use offline per-layer global frequencies.
+- [ ] Use prompt/domain prior.
+- [ ] Optionally preload universally hot experts.
+- [ ] If no trace data exists, start with uniform/random baseline.
+- [ ] Collect routes during warm-up.
+- [ ] Switch to request-local prediction after several tokens.
+- [ ] Save learned statistics for future process restarts.
+- [ ] Version statistics by exact model checkpoint and quantization/layout.
+
+Recommended fallback:
+
+```text
+Global hot experts
+→ prompt cluster
+→ early request routes
+→ transitions/co-occurrences
+→ learned dynamic prediction
+```
+
+---
+
+## R. Data to collect
+
+- [ ] Model/checkpoint ID.
+- [ ] Request ID.
+- [ ] Token index.
+- [ ] Layer index.
+- [ ] Prefill/decode phase.
+- [ ] Real selected top-8 experts.
+- [ ] Router weights/logits or top-\(m\) candidates.
+- [ ] Previous-token routes.
+- [ ] Previous-layer routes.
+- [ ] Prompt/domain cluster.
+- [ ] Batch size.
+- [ ] Predicted candidates.
+- [ ] Cache state before prediction.
+- [ ] Hits and misses.
+- [ ] Expert transfer bytes.
+- [ ] Transfer start/end time.
+- [ ] Expert execution time.
+- [ ] Eviction and reload events.
+- [ ] Available VRAM.
+
+---
+
+## S. Offline simulation checklist
+
+- [ ] Split traces by **request**, not random token, to prevent leakage.
+- [ ] Train statistics only on the training split.
+- [ ] Tune candidate size and weights on validation data.
+- [ ] Report final results on unseen requests.
+- [ ] Replay events in chronological order.
+- [ ] Simulate limited VRAM slots.
+- [ ] Simulate PCIe/NVLink transfer time.
+- [ ] Simulate asynchronous look-ahead.
+- [ ] Separate prefill and decode results.
+- [ ] Test domain shifts.
+- [ ] Test different batch sizes.
+- [ ] Compare every predictor against the same cache policy.
+- [ ] Run an oracle predictor as the upper bound.
+- [ ] Run random/LRU/LFU as lower baselines.
+
+---
+
+## T. Metrics
+
+- [ ] **Per-expert recall**
+
+\[
+\frac{|E_{\text{actual}}\cap E_{\text{predicted}}|}
+{|E_{\text{actual}}|}
+\]
+
+- [ ] **Full-route hit rate**  
+  Percentage of events where all real top-8 experts were prefetched.
+
+- [ ] **At-least-\(m\)-of-8 coverage**
+- [ ] Precision.
+- [ ] Cache-hit rate.
+- [ ] Blocking misses per token.
+- [ ] Transfer bytes per token.
+- [ ] Wasted-prefetch bytes.
+- [ ] Evictions and reloads.
+- [ ] Prefetch timeliness.
+- [ ] Time-to-first-token.
+- [ ] Decode latency.
+- [ ] Throughput.
+- [ ] VRAM usage.
+- [ ] Predictor computation overhead.
+
+For your goal, prioritize:
+
+1. **Full top-8 route hit rate**
+2. **Per-expert recall**
+3. **Blocking misses**
+4. **End-to-end latency**
+5. Transfer waste
+
+---
+
+# Best implementation order
+
+1. [ ] Build route-trace collection.
+2. [ ] Implement random, global-hot, LRU, LFU and EMA baselines.
+3. [ ] Add per-layer and request-local hotness.
+4. [ ] Add previous-token prediction.
+5. [ ] Add cross-layer transition tables.
+6. [ ] Add pairwise co-occurrence and conditional completion.
+7. [ ] Add stable-core plus alternatives.
+8. [ ] Add route-pattern and prompt clustering.
+9. [ ] Add dynamic candidate sizes: 8/10/12/16.
+10. [ ] Combine signals using an ensemble score.
+11. [ ] Build chronological cache/transfer simulation.
+12. [ ] Train a small MLP/route-sequence predictor.
+13. [ ] Integrate asynchronous prefetching.
+14. [ ] Tune against actual latency, not only prediction accuracy.
+
+## Most promising initial strategy
+
+Start with:
+
+```text
+per-layer global hotness
++ request-local EMA
++ previous-token routes
++ cross-layer transitions
++ co-occurrence completion
++ stable core and alternatives
++ domain/route-cluster prior
+```
+
+Generate 8–16 ranked candidates dynamically, then let the VRAM/cache budget determine how many are actually prefetched. Most importantly, every predictor must use only information available **before** the target expert is needed; otherwise, offline results will contain future-data leakage.

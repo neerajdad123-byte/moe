@@ -20,7 +20,10 @@ class Forward {
   Forward(const DeviceModel& dm, const ModelConfig& cfg, uint32_t max_ctx);
   ~Forward();
 
-  int step(int token_id, int pos, std::vector<int>* route_out);
+  // `weight_out`, if given, mirrors `route_out` layout (n_layers*n_experts_used)
+  // and receives each routed expert's renormalized router weight.
+  int step(int token_id, int pos, std::vector<int>* route_out,
+           std::vector<float>* weight_out = nullptr);
 
   std::function<void(uint32_t layer, const int* ids, uint32_t n)> ensure_experts;
   const std::vector<int>& last_route() const { return last_route_; }

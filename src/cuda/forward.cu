@@ -311,7 +311,8 @@ Forward::~Forward() {
   free(h_router_);
 }
 
-int Forward::step(int token_id, int pos, std::vector<int>* route_out) {
+int Forward::step(int token_id, int pos, std::vector<int>* route_out,
+                  std::vector<float>* weight_out) {
   const ModelConfig& c = cfg_;
   const int D = c.d_model;
   const int threads = 256;
@@ -508,6 +509,7 @@ int Forward::step(int token_id, int pos, std::vector<int>* route_out) {
       route_ids[j] = e;
       last_route_[(size_t)l * c.n_experts_used + j] = e;
       if (route_out) (*route_out)[(size_t)l * c.n_experts_used + j] = e;
+      if (weight_out) (*weight_out)[(size_t)l * c.n_experts_used + j] = sel_w[j];
       if (pf) {
         pf->expert_hist[(size_t)l * c.n_experts + e] += 1;
         if (dm_.expert(l, e).resident) pf->expert_hits += 1;

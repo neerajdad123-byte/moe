@@ -7,6 +7,8 @@
 // design doc B2. This is the module that turns "0% VRAM" into real residency.
 #pragma once
 
+#include <cuda_runtime.h>
+
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -32,6 +34,8 @@ struct DeviceExpert {
   DeviceTensor up;    // [d_ff x d_model]
   DeviceTensor down;  // [d_model x d_ff]
   bool resident = false;
+  bool pinned = false;    // protected from ensure_bounded()'s LRU eviction
+  uint64_t last_used = 0;  // tick_ snapshot, for LRU victim selection
 };
 
 // Per-layer resident static tensors.
@@ -54,10 +58,50 @@ class DeviceModel {
 
   // Upload experts [layer][0..n_experts) for the layers/experts requested.
   // `which` is a per-layer list of expert ids to make resident. Returns bytes.
+  // Grow-only: never evicts. Used by the unbounded resident-ceiling tools.
   uint64_t upload_experts(const gguf::Model& gguf, const Manifest& man,
                           const uint8_t* host_base,
                           const std::vector<std::vector<uint32_t>>& which,
                           std::string* err);
+
+  // --- Bounded, evicting arena (Step 2 / hit-rate data collection) ---
+
+  // Set the max number of experts allowed resident at once. Call once before
+  // the first ensure_bounded(); 0 (default) means unbounded (evict never).
+  void set_capacity(uint32_t n_experts_capacity) { capacity_ = n_experts_capacity; }
+
+  // Slot-pool mode (design doc P0 "preallocated arena"): ONE cudaMalloc for
+  // `capacity` fixed-stride expert slots + a pinned host staging ring, made
+  // BEFORE the decode loop. ensure_bounded() then uploads misses via
+  //   mmap -> pinned segment (CPU memcpy) -> cudaMemcpyAsync -> slot
+  // on the default stream (ordered before the expert kernels by stream FIFO,
+  // so the host never blocks on a copy), and eviction is just slot reuse —
+  // zero cudaMalloc/cudaFree/cudaDeviceSynchronize in the loop.
+  // `capacity==0` auto-sizes from live free VRAM minus `vram_reserve_bytes`.
+  // Returns the chosen capacity, or 0 on failure.
+  uint32_t init_arena(const Manifest& man, uint32_t capacity,
+                      uint64_t vram_reserve_bytes, std::string* err);
+
+  uint64_t slot_stride() const { return slot_stride_; }
+
+  // Protect/unprotect one expert from ensure_bounded()'s LRU eviction.
+  void pin(uint32_t layer, uint32_t expert, bool value);
+
+  // Touch (for LRU recency) every id in `ids`, and make resident any that
+  // are missing, evicting the least-recently-used *unpinned* resident expert
+  // first if at capacity. Returns the number of experts evicted this call.
+  // `bytes_uploaded`/`bytes_evicted`/`n_uploaded`, if given, accumulate
+  // (added, not overwritten) so callers can sum precise costs across many
+  // calls without diffing bytes_resident() (which can move either direction
+  // per call). Unlike upload_experts, this never leaves the arena over
+  // capacity. In slot-pool mode (init_arena) the upload path is
+  // pinned+async and eviction never touches the CUDA allocator.
+  uint32_t ensure_bounded(const gguf::Model& gguf, const Manifest& man,
+                          const uint8_t* host_base, uint32_t layer,
+                          const int* ids, uint32_t n, std::string* err,
+                          uint64_t* bytes_uploaded = nullptr,
+                          uint64_t* bytes_evicted = nullptr,
+                          uint32_t* n_uploaded = nullptr);
 
   const DeviceLayer& layer(uint32_t l) const { return layers_[l]; }
   const DeviceExpert& expert(uint32_t l, uint32_t e) const {
@@ -68,19 +112,47 @@ class DeviceModel {
   const DeviceTensor& output() const { return output_; }
 
   uint64_t bytes_resident() const { return bytes_resident_; }
+  uint32_t resident_expert_count() const { return resident_count_; }
 
  private:
   // Allocate + copy one tensor's bytes to VRAM.
   DeviceTensor upload_tensor_(const gguf::TensorInfo* t, const uint8_t* host_base,
                               uint64_t rows, uint64_t cols);
   DeviceTensor upload_slice_(const ByteSlice& s, const uint8_t* host_base);
+  // Same as upload_slice_ but does NOT register the pointer in `allocs_`:
+  // used for expert bundles under ensure_bounded(), whose dptrs are freed
+  // directly on eviction (and, for whatever's still resident, at teardown)
+  // instead of via the flat cleanup list, to avoid a double free.
+  DeviceTensor upload_slice_untracked_(const ByteSlice& s, const uint8_t* host_base);
+  // Evict the LRU unpinned resident expert. Returns false if none evictable.
+  // In slot-pool mode `freed_slot` receives the vacated slot index and no
+  // CUDA allocator call is made; otherwise the dptrs are cudaFree'd.
+  bool evict_one_(uint64_t* bytes_freed, int64_t* freed_slot = nullptr);
 
   std::vector<DeviceLayer> layers_;
   std::vector<DeviceExpert> experts_;
   uint32_t n_experts_ = 0;
   DeviceTensor token_embd_, output_norm_, output_;
-  std::vector<void*> allocs_;  // everything we cudaMalloc'd, for cleanup
+  std::vector<void*> allocs_;  // static-weight cudaMalloc'd ptrs, for cleanup
   uint64_t bytes_resident_ = 0;
+
+  uint32_t capacity_ = 0;        // 0 = unbounded
+  uint32_t resident_count_ = 0;  // experts currently resident
+  uint64_t tick_ = 0;            // monotonic recency counter
+
+  // --- slot-pool arena state (only set when init_arena succeeded) ---
+  bool arena_mode_ = false;
+  void* arena_ = nullptr;            // one device allocation, capacity_ slots
+  uint64_t slot_stride_ = 0;         // aligned max bundle bytes per slot
+  uint64_t gate_off_ = 0, up_off_ = 0, down_off_ = 0;  // fixed intra-slot offsets
+  std::vector<int32_t> slot_of_;     // (layer*n_experts+e) -> slot idx or -1
+  std::vector<uint32_t> free_slots_; // vacated / never-used slot indices
+  // pinned staging ring
+  uint8_t* pin_buf_ = nullptr;
+  uint32_t n_segs_ = 0;
+  uint64_t seg_next_ = 0;            // monotonic; segment = seg_next_ % n_segs_
+  std::vector<cudaEvent_t> seg_ev_;
+  std::vector<bool> seg_ev_valid_;
 };
 
 }  // namespace moex
