@@ -29,6 +29,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <numeric>
 #include <string>
 #include <vector>
@@ -124,6 +125,127 @@ static const char* kPromptsPython10[10] = {
     "Respond with only a single Python markdown code block containing a function that implements bubble sort on a list. Do not include any text before or after the code block. Do not include comments inside the code.",
 };
 
+// ---- Route predictor: cross-layer transitions (N+1, N+2) + within-layer
+// co-occurrence, learned online from live routes and optionally warm-loaded
+// from a previous run's route_trace.jsonl. Checklist refs: D (cross-layer
+// transition table), F (co-occurrence), G/H (cluster completion for pins).
+// Prediction never touches execution — it only feeds speculative prefetch.
+struct RoutePredictor {
+  uint32_t L = 0, E = 0, K = 0;
+  std::vector<uint32_t> t1;   // [(l)*E+i]*E+j : i in route(l) -> j in route(l+1)
+  std::vector<uint32_t> t2;   // same, l -> l+2
+  std::vector<uint32_t> co;   // same layer: i,j co-selected in route(l)
+  std::vector<uint32_t> n1, n2;  // per-layer training-token counts for gating
+
+  void init(uint32_t L_, uint32_t E_, uint32_t K_) {
+    L = L_; E = E_; K = K_;
+    t1.assign((size_t)L * E * E, 0);
+    t2.assign((size_t)L * E * E, 0);
+    co.assign((size_t)L * E * E, 0);
+    n1.assign(L, 0);
+    n2.assign(L, 0);
+  }
+  size_t at(uint32_t l, int i, int j) const {
+    return ((size_t)l * E + (uint32_t)i) * E + (uint32_t)j;
+  }
+  void upd_co(uint32_t l, const int* r) {
+    for (uint32_t a = 0; a < K; ++a)
+      for (uint32_t b = 0; b < K; ++b)
+        if (a != b && r[a] >= 0 && r[b] >= 0) co[at(l, r[a], r[b])] += 1;
+  }
+  void upd_t1(uint32_t l_from, const int* prev, const int* cur) {
+    for (uint32_t a = 0; a < K; ++a)
+      for (uint32_t b = 0; b < K; ++b)
+        if (prev[a] >= 0 && cur[b] >= 0) t1[at(l_from, prev[a], cur[b])] += 1;
+    n1[l_from] += 1;
+  }
+  void upd_t2(uint32_t l_from, const int* prev, const int* cur) {
+    for (uint32_t a = 0; a < K; ++a)
+      for (uint32_t b = 0; b < K; ++b)
+        if (prev[a] >= 0 && cur[b] >= 0) t2[at(l_from, prev[a], cur[b])] += 1;
+    n2[l_from] += 1;
+  }
+  // Rank experts of layer l_from+delta given route(l_from); returns top-M
+  // (id, score) pairs, best first. Empty if the table row is undertrained
+  // (< min_tokens observations).
+  std::vector<std::pair<int, uint64_t>> predict(uint32_t l_from, int delta,
+                                                const int* r, uint32_t M,
+                                                uint32_t min_tokens = 32) const {
+    const std::vector<uint32_t>& T = (delta == 1) ? t1 : t2;
+    const std::vector<uint32_t>& N = (delta == 1) ? n1 : n2;
+    if (l_from >= L || N[l_from] < min_tokens) return {};
+    std::vector<uint64_t> score(E, 0);
+    for (uint32_t a = 0; a < K; ++a)
+      if (r[a] >= 0) {
+        const uint32_t* row = &T[at(l_from, r[a], 0)];
+        for (uint32_t j = 0; j < E; ++j) score[j] += row[j];
+      }
+    std::vector<int> idx(E);
+    for (uint32_t j = 0; j < E; ++j) idx[j] = (int)j;
+    if (M > E) M = E;
+    std::partial_sort(idx.begin(), idx.begin() + M, idx.end(),
+                      [&](int a, int b) { return score[a] > score[b]; });
+    std::vector<std::pair<int, uint64_t>> out;
+    out.reserve(M);
+    for (uint32_t j = 0; j < M && score[idx[j]] > 0; ++j)
+      out.push_back({idx[j], score[idx[j]]});
+    return out;
+  }
+  // Feed one complete token route (L x K ids) — used by the warm loader.
+  void feed_token(const std::vector<int>& route) {
+    for (uint32_t l = 0; l < L; ++l) {
+      upd_co(l, &route[(size_t)l * K]);
+      if (l + 1 < L) upd_t1(l, &route[(size_t)l * K], &route[(size_t)(l + 1) * K]);
+      if (l + 2 < L) upd_t2(l, &route[(size_t)l * K], &route[(size_t)(l + 2) * K]);
+    }
+  }
+};
+
+// Parse one route_trace.jsonl line (our own writer's format) -> layer + 8 ids.
+static bool parse_trace_line(const char* s, int* layer, int ex[8], int K) {
+  const char* pl = std::strstr(s, "\"layer\":");
+  if (!pl) return false;
+  *layer = std::atoi(pl + 8);
+  const char* pe = std::strstr(s, "\"experts\":[");
+  if (!pe) return false;
+  pe += 11;
+  char* end = nullptr;
+  for (int j = 0; j < K; ++j) {
+    ex[j] = (int)std::strtol(pe, &end, 10);
+    if (end == pe) return false;
+    pe = (*end == ',') ? end + 1 : end;
+  }
+  return true;
+}
+
+// Warm-load a previous run's route trace into the predictor tables.
+static long warm_load_trace(const char* path, RoutePredictor& pred) {
+  FILE* f = std::fopen(path, "rb");
+  if (!f) return -1;
+  std::vector<int> cur((size_t)pred.L * pred.K, -1);
+  std::vector<bool> have(pred.L, false);
+  long tokens = 0;
+  char line[4096];
+  while (std::fgets(line, sizeof(line), f)) {
+    int layer = -1, ex[64];
+    if (!parse_trace_line(line, &layer, ex, (int)pred.K)) continue;
+    if (layer < 0 || layer >= (int)pred.L) continue;
+    for (uint32_t j = 0; j < pred.K; ++j) cur[(size_t)layer * pred.K + j] = ex[j];
+    have[layer] = true;
+    if (layer == (int)pred.L - 1) {
+      bool all = true;
+      for (uint32_t l = 0; l < pred.L; ++l) all = all && have[l];
+      if (all) {
+        pred.feed_token(cur);
+        ++tokens;
+      }
+      std::fill(have.begin(), have.end(), false);
+    }
+  }
+  std::fclose(f);
+  return tokens;
+}
+
 static std::string json_escape(const std::string& s) {
   std::string o;
   o.reserve(s.size() + 8);
@@ -173,6 +295,7 @@ int main(int argc, char** argv) {
   std::string corpus = argc > 7 ? argv[7] : "mixed50";
   int passes = argc > 8 ? std::atoi(argv[8]) : 1;
   int profile = argc > 9 ? std::atoi(argv[9]) : 0;  // 0 = clean headline mode
+  const char* warm_path = argc > 10 ? argv[10] : "-";  // "-" = no warm trace
   if (num_prompts < 1) num_prompts = 1;
   if (num_prompts > 50) num_prompts = 50;
   if (decode_tokens < 1) decode_tokens = 1;
@@ -271,6 +394,34 @@ int main(int argc, char** argv) {
   // profiler so pin refresh works in clean mode too.
   std::vector<long> tool_hist((size_t)c.n_layers * c.n_experts, 0);
 
+  // ---- Predictor state ----
+  RoutePredictor pred;
+  pred.init(c.n_layers, c.n_experts, c.n_experts_used);
+  if (std::strcmp(warm_path, "-") != 0) {
+    long wtok = warm_load_trace(warm_path, pred);
+    if (wtok < 0)
+      std::fprintf(stderr, "warm trace open failed: %s (continuing cold)\n", warm_path);
+    else
+      std::printf("predictor warm-loaded %ld tokens from %s\n", wtok, warm_path);
+  }
+  const uint32_t M1 = 12, M2 = 8;          // candidate counts (N+1, N+2)
+  const uint32_t UP1 = 6, UP2 = 2;          // per-layer speculative upload caps
+  // per-token predicted sets, as bitmasks[layer][2] (128 experts = 2x u64)
+  std::vector<uint64_t> pmask1((size_t)c.n_layers * 2, 0);
+  std::vector<uint64_t> pmask2((size_t)c.n_layers * 2, 0);
+  std::vector<uint64_t> smask((size_t)c.n_layers * 2, 0);  // spec-uploaded this token
+  // accuracy + speculative-traffic counters, per pass
+  std::vector<long> r1_hit(passes, 0), r1_den(passes, 0);
+  std::vector<long> r2_hit(passes, 0), r2_den(passes, 0);
+  std::vector<long> spec_up(passes, 0), spec_used(passes, 0);
+  std::vector<uint64_t> spec_bytes(passes, 0);
+  auto mask_set = [](std::vector<uint64_t>& m, uint32_t l, int e) {
+    m[(size_t)l * 2 + (e >> 6)] |= 1ull << (e & 63);
+  };
+  auto mask_has = [](const std::vector<uint64_t>& m, uint32_t l, int e) {
+    return (m[(size_t)l * 2 + (e >> 6)] >> (e & 63)) & 1ull;
+  };
+
   std::vector<PromptRecord> records;
   records.reserve(total_iters);
 
@@ -292,9 +443,15 @@ int main(int argc, char** argv) {
     rec.n_prompt_tokens = (int)ids.size();
     rec.trace_begin = prof.trace.size();
 
+    std::vector<int> route_buf((size_t)c.n_layers * c.n_experts_used, -1);
+    std::vector<float> weight_buf((size_t)c.n_layers * c.n_experts_used, 0.f);
+
     Forward fwd(dm, c, max_ctx);
     fwd.prof = profile ? &prof : nullptr;
+    const int pass_now = p / num_prompts;
     fwd.ensure_experts = [&](uint32_t layer, const int* rids, uint32_t n) {
+      // 1) Reactive: make the live route resident (this is the exact path;
+      //    prediction below never touches it).
       std::string e2;
       uint64_t up = 0, ev = 0;
       uint32_t evn = dm.ensure_bounded(m, man, host_base, layer, rids, n, &e2,
@@ -305,6 +462,70 @@ int main(int argc, char** argv) {
       evictions_total += evn;
       if (!e2.empty())
         std::fprintf(stderr, "[prompt %d] ensure_bounded: %s\n", p, e2.c_str());
+
+      // 2) New token starts at layer 0: clear this token's predicted masks.
+      if (layer == 0) {
+        std::fill(pmask1.begin(), pmask1.end(), 0);
+        std::fill(pmask2.begin(), pmask2.end(), 0);
+        std::fill(smask.begin(), smask.end(), 0);
+      }
+
+      // 3) Score last layer's predictions against the live route (recall@M),
+      //    and count speculative uploads that got used by this very layer.
+      for (uint32_t j = 0; j < n; ++j) {
+        int e = rids[j];
+        if (e < 0) continue;
+        if (pmask1[(size_t)layer * 2] | pmask1[(size_t)layer * 2 + 1]) {
+          r1_den[pass_now] += 1;
+          if (mask_has(pmask1, layer, e)) r1_hit[pass_now] += 1;
+        }
+        if (pmask2[(size_t)layer * 2] | pmask2[(size_t)layer * 2 + 1]) {
+          r2_den[pass_now] += 1;
+          if (mask_has(pmask2, layer, e)) r2_hit[pass_now] += 1;
+        }
+        if (mask_has(smask, layer, e)) spec_used[pass_now] += 1;
+      }
+
+      // 4) Online learning from the live route (current token rows 0..layer
+      //    of route_buf are valid at this point).
+      const int* cur = &route_buf[(size_t)layer * c.n_experts_used];
+      pred.upd_co(layer, cur);
+      if (layer >= 1)
+        pred.upd_t1(layer - 1, &route_buf[(size_t)(layer - 1) * c.n_experts_used], cur);
+      if (layer >= 2)
+        pred.upd_t2(layer - 2, &route_buf[(size_t)(layer - 2) * c.n_experts_used], cur);
+
+      // 5) Predict N+1 / N+2 from the live route and prefetch on the copy
+      //    stream (overlaps this layer's compute).
+      auto spec = [&](int delta, uint32_t M, uint32_t cap,
+                      std::vector<uint64_t>& pm) {
+        uint32_t lt = layer + (uint32_t)delta;
+        if (lt >= c.n_layers) return;
+        auto cand = pred.predict(layer, delta, cur, M);
+        if (cand.empty()) return;
+        // Accuracy is scored on the full top-M prediction; UPLOADS are
+        // confidence-gated to the candidates with score >= best/4 (design
+        // doc B4: runner-up floods hurt more than they help).
+        std::vector<int> up_ids;
+        up_ids.reserve(cand.size());
+        const uint64_t floor_score = cand[0].second / 4;
+        for (auto& ce : cand) {
+          mask_set(pm, lt, ce.first);
+          if (ce.second >= floor_score && ce.second > 0)
+            up_ids.push_back(ce.first);
+        }
+        if (up_ids.empty() || cap == 0) return;
+        uint8_t flags[64] = {0};
+        std::string e3;
+        uint32_t nup = dm.prefetch_async(man, host_base, lt, up_ids.data(),
+                                         (uint32_t)up_ids.size(), cap,
+                                         &spec_bytes[pass_now], &e3, flags);
+        spec_up[pass_now] += nup;
+        for (size_t k = 0; k < up_ids.size(); ++k)
+          if (flags[k]) mask_set(smask, lt, up_ids[k]);
+      };
+      spec(1, M1, UP1, pmask1);
+      spec(2, M2, UP2, pmask2);
     };
 
     auto log_route = [&](const char* phase, int pos,
@@ -326,9 +547,6 @@ int main(int argc, char** argv) {
         std::fprintf(route_f, "]}\n");
       }
     };
-
-    std::vector<int> route_buf((size_t)c.n_layers * c.n_experts_used, -1);
-    std::vector<float> weight_buf((size_t)c.n_layers * c.n_experts_used, 0.f);
 
     auto bump_hist = [&]() {
       for (uint32_t l = 0; l < c.n_layers; ++l)
@@ -404,15 +622,37 @@ int main(int argc, char** argv) {
         }
         std::sort(ranked.begin(), ranked.end(),
                   [](const auto& a, const auto& b) { return a.first > b.first; });
-        uint32_t take = (uint32_t)std::min((size_t)pin_top_k, ranked.size());
 
+        // Cluster-aware pin set (checklist G): a frequency CORE plus
+        // co-occurrence MATES — experts that travel with the core even if
+        // they aren't individually top-K ("mid-frequency but locked
+        // together"). Core = top (pin_top_k - 5); mates = 5 highest
+        // sum-of-co-occurrence-with-core among the rest.
+        const uint32_t n_mates = pin_top_k > 5 ? 5 : 0;
+        uint32_t n_core = (uint32_t)std::min((size_t)(pin_top_k - n_mates), ranked.size());
         std::vector<int> pin_ids;
-        pin_ids.reserve(take);
-        for (uint32_t i = 0; i < take; ++i) {
-          uint32_t e = ranked[i].second;
-          dm.pin(l, e, true);
-          current_pins[l].push_back(e);
-          pin_ids.push_back((int)e);
+        pin_ids.reserve(pin_top_k);
+        std::vector<bool> in_set(c.n_experts, false);
+        for (uint32_t i = 0; i < n_core; ++i) {
+          in_set[ranked[i].second] = true;
+          pin_ids.push_back((int)ranked[i].second);
+        }
+        for (uint32_t mi = 0; mi < n_mates; ++mi) {
+          uint64_t best = 0;
+          int best_e = -1;
+          for (uint32_t e = 0; e < c.n_experts; ++e) {
+            if (in_set[e] || tool_hist[(size_t)l * c.n_experts + e] == 0) continue;
+            uint64_t s = 0;
+            for (int ce : pin_ids) s += pred.co[pred.at(l, ce, (int)e)];
+            if ((int64_t)s > (int64_t)best) { best = s; best_e = (int)e; }
+          }
+          if (best_e < 0) break;
+          in_set[best_e] = true;
+          pin_ids.push_back(best_e);
+        }
+        for (int e : pin_ids) {
+          dm.pin(l, (uint32_t)e, true);
+          current_pins[l].push_back((uint32_t)e);
         }
         if (!pin_ids.empty()) {
           std::string e2;
@@ -591,6 +831,18 @@ int main(int argc, char** argv) {
       std::printf("pass %d (prompts %zu..%zu): hit rate %.1f%%  mean decode %.2f tok/s\n",
                   ps, lo, hi - 1, a.first, a.second);
     }
+  }
+
+  std::printf("\n=== PREDICTOR (N+1 / N+2 cross-layer transition + prefetch) ===\n");
+  std::printf("candidates: M1=%u M2=%u  upload caps: %u/%u per layer\n", M1, M2, UP1, UP2);
+  for (int ps = 0; ps < passes; ++ps) {
+    double rec1 = r1_den[ps] ? 100.0 * r1_hit[ps] / r1_den[ps] : 0.0;
+    double rec2 = r2_den[ps] ? 100.0 * r2_hit[ps] / r2_den[ps] : 0.0;
+    double prec = spec_up[ps] ? 100.0 * spec_used[ps] / spec_up[ps] : 0.0;
+    std::printf("pass %d: N+1 recall@%u %.1f%% (%ld/%ld)  N+2 recall@%u %.1f%% (%ld/%ld)\n",
+                ps, M1, rec1, r1_hit[ps], r1_den[ps], M2, rec2, r2_hit[ps], r2_den[ps]);
+    std::printf("        spec uploads %ld (%.1f MiB), used-same-token %ld (precision %.1f%%)\n",
+                spec_up[ps], spec_bytes[ps] / 1048576.0, spec_used[ps], prec);
   }
 
   std::printf("\nwrote build/bench50/route_trace.jsonl, per_token.csv, pins_log.jsonl, summary.json\n");

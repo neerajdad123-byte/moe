@@ -16,6 +16,9 @@ DeviceModel::~DeviceModel() {
     // All expert dptrs point inside the single arena allocation.
     cudaDeviceSynchronize();  // let in-flight staging copies drain first
     for (auto& e : seg_ev_) cudaEventDestroy(e);
+    for (auto& e : batch_ev_) cudaEventDestroy(e);
+    for (auto& e : fence_ev_) cudaEventDestroy(e);
+    if (copy_stream_) cudaStreamDestroy(copy_stream_);
     if (pin_buf_) cudaFreeHost(pin_buf_);
     if (arena_) cudaFree(arena_);
   } else {
@@ -205,6 +208,11 @@ uint32_t DeviceModel::init_arena(const Manifest& man, uint32_t capacity,
   seg_ev_.resize(n_segs_);
   seg_ev_valid_.assign(n_segs_, false);
   for (auto& e : seg_ev_) cudaEventCreateWithFlags(&e, cudaEventDisableTiming);
+  cudaStreamCreateWithFlags(&copy_stream_, cudaStreamNonBlocking);
+  batch_ev_.resize(kNBatchEv);
+  fence_ev_.resize(kNBatchEv);
+  for (auto& e : batch_ev_) cudaEventCreateWithFlags(&e, cudaEventDisableTiming);
+  for (auto& e : fence_ev_) cudaEventCreateWithFlags(&e, cudaEventDisableTiming);
 
   slot_of_.assign(experts_.size(), -1);
   free_slots_.clear();
@@ -222,12 +230,19 @@ void DeviceModel::pin(uint32_t layer, uint32_t expert, bool value) {
   experts_[static_cast<size_t>(layer) * n_experts_ + expert].pinned = value;
 }
 
-bool DeviceModel::evict_one_(uint64_t* bytes_freed, int64_t* freed_slot) {
+bool DeviceModel::evict_one_(uint64_t* bytes_freed, int64_t* freed_slot,
+                             uint64_t min_age) {
   int64_t best_idx = -1;
   uint64_t best_used = 0;
   for (size_t i = 0; i < experts_.size(); ++i) {
-    const DeviceExpert& de = experts_[i];
+    DeviceExpert& de = experts_[i];
     if (!de.resident || de.pinned) continue;
+    if (min_age > 0 && de.last_used + min_age > tick_) continue;  // too fresh
+    if (de.inflight_ev >= 0) {
+      // Never reuse a slot whose speculative copy may still be writing it.
+      if (cudaEventQuery(batch_ev_[de.inflight_ev]) != cudaSuccess) continue;
+      de.inflight_ev = -1;  // copy done; normal candidate from here on
+    }
     if (best_idx < 0 || de.last_used < best_used) {
       best_idx = (int64_t)i;
       best_used = de.last_used;
@@ -258,6 +273,97 @@ bool DeviceModel::evict_one_(uint64_t* bytes_freed, int64_t* freed_slot) {
   return true;
 }
 
+void DeviceModel::stage_upload_(const ExpertBundle& b, const uint8_t* host_base,
+                                DeviceExpert& de, size_t flat, int64_t slot,
+                                cudaStream_t stream) {
+  // mmap -> pinned segment (CPU) -> one async H2D into the slot, on `stream`
+  // (nullptr = default/compute stream for reactive, copy_stream_ for prefetch).
+  const uint32_t si = (uint32_t)(seg_next_ % n_segs_);
+  ++seg_next_;
+  if (seg_ev_valid_[si]) cudaEventSynchronize(seg_ev_[si]);
+  uint8_t* seg = pin_buf_ + (uint64_t)si * slot_stride_;
+  std::memcpy(seg + gate_off_, host_base + b.gate.file_offset, b.gate.nbytes);
+  std::memcpy(seg + up_off_, host_base + b.up.file_offset, b.up.nbytes);
+  std::memcpy(seg + down_off_, host_base + b.down.file_offset, b.down.nbytes);
+  uint8_t* dst = (uint8_t*)arena_ + (uint64_t)slot * slot_stride_;
+  MOEX_CUDA(cudaMemcpyAsync(dst, seg, down_off_ + b.down.nbytes,
+                            cudaMemcpyHostToDevice, stream));
+  MOEX_CUDA(cudaEventRecord(seg_ev_[si], stream));
+  seg_ev_valid_[si] = true;
+
+  auto mk = [&](const ByteSlice& s, uint64_t off) {
+    DeviceTensor dt;
+    dt.dptr = dst + off;
+    dt.nbytes = s.nbytes;
+    dt.type = s.type;
+    dt.rows = s.rows;
+    dt.cols = s.cols;
+    return dt;
+  };
+  de.gate = mk(b.gate, gate_off_);
+  de.up = mk(b.up, up_off_);
+  de.down = mk(b.down, down_off_);
+  slot_of_[flat] = (int32_t)slot;
+}
+
+uint32_t DeviceModel::prefetch_async(const Manifest& man, const uint8_t* host_base,
+                                     uint32_t layer, const int* ids, uint32_t n,
+                                     uint32_t max_uploads, uint64_t* bytes,
+                                     std::string* err, uint8_t* uploaded_flags) {
+  if (!arena_mode_) return 0;
+  const ModelConfig& c = man.config();
+  if (uploaded_flags) std::memset(uploaded_flags, 0, n);
+  uint32_t issued = 0;
+  const uint32_t bev = (uint32_t)(batch_next_ % kNBatchEv);
+  bool fenced = false;
+  ++tick_;
+  try {
+    for (uint32_t j = 0; j < n && issued < max_uploads; ++j) {
+      int e = ids[j];
+      if (e < 0 || e >= (int)c.n_experts || layer >= c.n_layers) continue;
+      const size_t flat = (size_t)layer * c.n_experts + (uint32_t)e;
+      DeviceExpert& de = experts_[flat];
+      if (de.resident) continue;  // already there (or in flight) — free win
+
+      int64_t slot = -1;
+      if (!free_slots_.empty()) {
+        slot = free_slots_.back();
+        free_slots_.pop_back();
+      } else {
+        // Anti-thrash: a speculative upload may only claim a slot whose
+        // occupant hasn't been routed for ~2 tokens' worth of ticks. If no
+        // such victim exists the cache is fully hot — stop speculating.
+        if (!evict_one_(nullptr, &slot, /*min_age=*/300)) break;
+      }
+      if (!fenced) {
+        // One fence per batch: everything already enqueued on the compute
+        // stream (which may read victim slots) must finish before the copy
+        // stream writes any reused slot.
+        MOEX_CUDA(cudaEventRecord(fence_ev_[bev], nullptr));
+        MOEX_CUDA(cudaStreamWaitEvent(copy_stream_, fence_ev_[bev], 0));
+        fenced = true;
+      }
+      const ExpertBundle& b = man.expert(layer, (uint32_t)e);
+      stage_upload_(b, host_base, de, flat, slot, copy_stream_);
+      de.resident = true;
+      de.pinned = false;
+      de.last_used = tick_;
+      de.inflight_ev = (int)bev;
+      ++resident_count_;
+      ++issued;
+      if (bytes) *bytes += b.total_bytes();
+      if (uploaded_flags) uploaded_flags[j] = 1;
+    }
+    if (issued > 0) {
+      MOEX_CUDA(cudaEventRecord(batch_ev_[bev], copy_stream_));
+      ++batch_next_;
+    }
+  } catch (const std::exception& ex) {
+    if (err) *err = ex.what();
+  }
+  return issued;
+}
+
 uint32_t DeviceModel::ensure_bounded(const gguf::Model& gguf, const Manifest& man,
                                      const uint8_t* host_base, uint32_t layer,
                                      const int* ids, uint32_t n, std::string* err,
@@ -276,7 +382,16 @@ uint32_t DeviceModel::ensure_bounded(const gguf::Model& gguf, const Manifest& ma
       const size_t flat = (size_t)layer * c.n_experts + (uint32_t)e;
       DeviceExpert& de = experts_[flat];
       de.last_used = tick_;
-      if (de.resident) continue;  // hit — recency updated above, nothing to load
+      if (de.resident) {
+        // Hit. If a speculative copy for it may still be in flight, make the
+        // compute stream wait on its batch event (device-side; host doesn't
+        // block) before any kernel dereferences the slot.
+        if (de.inflight_ev >= 0) {
+          cudaStreamWaitEvent(nullptr, batch_ev_[de.inflight_ev], 0);
+          de.inflight_ev = -1;
+        }
+        continue;
+      }
 
       int64_t slot = -1;
       if (arena_mode_ && !free_slots_.empty()) {
@@ -292,33 +407,7 @@ uint32_t DeviceModel::ensure_bounded(const gguf::Model& gguf, const Manifest& ma
 
       const ExpertBundle& b = man.expert(layer, (uint32_t)e);
       if (arena_mode_) {
-        // mmap -> pinned segment (CPU) -> one async H2D into the slot.
-        const uint32_t si = (uint32_t)(seg_next_ % n_segs_);
-        ++seg_next_;
-        if (seg_ev_valid_[si]) cudaEventSynchronize(seg_ev_[si]);
-        uint8_t* seg = pin_buf_ + (uint64_t)si * slot_stride_;
-        std::memcpy(seg + gate_off_, host_base + b.gate.file_offset, b.gate.nbytes);
-        std::memcpy(seg + up_off_, host_base + b.up.file_offset, b.up.nbytes);
-        std::memcpy(seg + down_off_, host_base + b.down.file_offset, b.down.nbytes);
-        uint8_t* dst = (uint8_t*)arena_ + (uint64_t)slot * slot_stride_;
-        MOEX_CUDA(cudaMemcpyAsync(dst, seg, down_off_ + b.down.nbytes,
-                                  cudaMemcpyHostToDevice));
-        MOEX_CUDA(cudaEventRecord(seg_ev_[si]));
-        seg_ev_valid_[si] = true;
-
-        auto mk = [&](const ByteSlice& s, uint64_t off) {
-          DeviceTensor dt;
-          dt.dptr = dst + off;
-          dt.nbytes = s.nbytes;
-          dt.type = s.type;
-          dt.rows = s.rows;
-          dt.cols = s.cols;
-          return dt;
-        };
-        de.gate = mk(b.gate, gate_off_);
-        de.up = mk(b.up, up_off_);
-        de.down = mk(b.down, down_off_);
-        slot_of_[flat] = (int32_t)slot;
+        stage_upload_(b, host_base, de, flat, slot, /*stream=*/nullptr);
       } else {
         de.gate = upload_slice_untracked_(b.gate, host_base);
         de.up = upload_slice_untracked_(b.up, host_base);

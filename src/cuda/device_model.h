@@ -36,6 +36,10 @@ struct DeviceExpert {
   bool resident = false;
   bool pinned = false;    // protected from ensure_bounded()'s LRU eviction
   uint64_t last_used = 0;  // tick_ snapshot, for LRU victim selection
+  // >= 0 while a speculative copy-stream upload may still be in flight:
+  // index into the batch-event ring. Cleared when a consumer attaches (via
+  // cudaStreamWaitEvent) or eviction confirms the copy completed.
+  int inflight_ev = -1;
 };
 
 // Per-layer resident static tensors.
@@ -103,6 +107,24 @@ class DeviceModel {
                           uint64_t* bytes_evicted = nullptr,
                           uint32_t* n_uploaded = nullptr);
 
+  // Speculative prefetch (slot-pool mode only): upload up to `max_uploads`
+  // missing experts of `layer` on the internal COPY stream so the DMA engine
+  // overlaps compute on the default stream. Correctness:
+  //  * before any slot is (re)written, the copy stream waits on a fence
+  //    event recorded on the default stream NOW — so kernels already
+  //    enqueued that might read a victim slot finish first;
+  //  * a later ensure_bounded() that routes to a still-in-flight expert
+  //    attaches a device-side cudaStreamWaitEvent instead of re-uploading;
+  //  * eviction refuses experts whose in-flight copy hasn't completed.
+  // Returns number of uploads issued; adds bytes to *bytes if given.
+  // `uploaded_flags`, if given (size n), is set to 1 for ids actually
+  // uploaded by this call (0 = was already resident / skipped / no room),
+  // so callers can measure speculative precision.
+  uint32_t prefetch_async(const Manifest& man, const uint8_t* host_base,
+                          uint32_t layer, const int* ids, uint32_t n,
+                          uint32_t max_uploads, uint64_t* bytes,
+                          std::string* err, uint8_t* uploaded_flags = nullptr);
+
   const DeviceLayer& layer(uint32_t l) const { return layers_[l]; }
   const DeviceExpert& expert(uint32_t l, uint32_t e) const {
     return experts_[static_cast<size_t>(l) * n_experts_ + e];
@@ -127,7 +149,11 @@ class DeviceModel {
   // Evict the LRU unpinned resident expert. Returns false if none evictable.
   // In slot-pool mode `freed_slot` receives the vacated slot index and no
   // CUDA allocator call is made; otherwise the dptrs are cudaFree'd.
-  bool evict_one_(uint64_t* bytes_freed, int64_t* freed_slot = nullptr);
+  // `min_age` > 0 additionally requires the victim to be at least that many
+  // ticks stale — speculative callers use it so prefetch can never thrash
+  // out an expert the live route touched in the last couple of tokens.
+  bool evict_one_(uint64_t* bytes_freed, int64_t* freed_slot = nullptr,
+                  uint64_t min_age = 0);
 
   std::vector<DeviceLayer> layers_;
   std::vector<DeviceExpert> experts_;
@@ -153,6 +179,16 @@ class DeviceModel {
   uint64_t seg_next_ = 0;            // monotonic; segment = seg_next_ % n_segs_
   std::vector<cudaEvent_t> seg_ev_;
   std::vector<bool> seg_ev_valid_;
+  // speculative copy stream + batch/fence event rings
+  cudaStream_t copy_stream_ = nullptr;
+  static constexpr uint32_t kNBatchEv = 64;
+  std::vector<cudaEvent_t> batch_ev_;   // recorded on copy stream per batch
+  std::vector<cudaEvent_t> fence_ev_;   // recorded on default stream per batch
+  uint64_t batch_next_ = 0;
+  // one shared upload helper for both reactive (stream 0) and prefetch paths
+  void stage_upload_(const ExpertBundle& b, const uint8_t* host_base,
+                     DeviceExpert& de, size_t flat, int64_t slot,
+                     cudaStream_t stream);
 };
 
 }  // namespace moex
