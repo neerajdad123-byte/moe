@@ -237,65 +237,41 @@ int main(int argc, char** argv) {
     double prefill_ms = ms(t0, Clock::now());
 
     // Streaming decode: print each token's text the instant it's produced,
-    // and keep a live tok/s readout updating in place below it. The rate
-    // deliberately excludes the FIRST decode step (per_tok_ms[0]) -- its
-    // latency carries transition cost from prefill and isn't representative
-    // of steady-state speed; folding it in understates the real rate,
-    // especially on short replies.
+    // plain (no cursor tricks). Stats print once, after the reply finishes.
+    // The rate excludes the FIRST decode step -- its latency carries
+    // transition cost from prefill and isn't representative of steady-state
+    // speed, especially on short replies.
     std::printf("Bot: ");
     std::fflush(stdout);
 
     std::vector<double> per_tok_ms;  // one entry per fwd.step() decode call
     int n_gen = 0;
-    bool printed_live_line = false;
     auto t1 = Clock::now();
     for (int g = 0; g < max_new_tok; ++g) {
       if (tok == eos) break;
       std::string piece = detok.decode_id(tok);
       std::fwrite(piece.data(), 1, piece.size(), stdout);
+      std::fflush(stdout);
 
       auto ta = Clock::now();
       tok = fwd.step(tok, pos, &route_buf, nullptr);
       ++pos;
-      auto tb = Clock::now();
-      per_tok_ms.push_back(ms(ta, tb));
+      per_tok_ms.push_back(ms(ta, Clock::now()));
       ++n_gen;
-
-      if (per_tok_ms.size() >= 2) {
-        double sum_ms = 0;
-        for (size_t k = 1; k < per_tok_ms.size(); ++k) sum_ms += per_tok_ms[k];
-        double live_tok_s = (double)(per_tok_ms.size() - 1) / (sum_ms / 1000.0);
-        std::printf("\x1b[s\n\x1b[2K  [%d tok so far, %.2f tok/s (first tok excluded)]\x1b[u",
-                    n_gen, live_tok_s);
-        printed_live_line = true;
-      }
-      std::fflush(stdout);
     }
     double decode_ms = ms(t1, Clock::now());
     double sum_ms_excl_first = 0;
     for (size_t k = 1; k < per_tok_ms.size(); ++k) sum_ms_excl_first += per_tok_ms[k];
     double tok_s = per_tok_ms.size() >= 2
                        ? (double)(per_tok_ms.size() - 1) / (sum_ms_excl_first / 1000.0)
-                       : 0.0;
+                       : (n_gen > 0 ? n_gen / (decode_ms / 1000.0) : 0.0);
 
     long sel = turn_hits + turn_miss;
-    if (printed_live_line) {
-      // Overwrite the last live line with the complete final stats (no
-      // restore this time -- settle here instead of jumping back).
-      std::printf(
-          "\x1b[s\n\x1b[2K  [%d tok in %.0fms -> %.2f tok/s (first tok excluded) | "
-          "prefill %.0fms | hit %ld/%ld (%.1f%%) | +%.2f MiB H2D]\n\n",
-          n_gen, decode_ms, tok_s, prefill_ms, turn_hits, sel,
-          sel ? 100.0 * turn_hits / sel : 0.0,
-          (reactive_up_bytes - up_before) / 1048576.0);
-    } else {
-      std::printf(
-          "\n  [%d tok in %.0fms -> %.2f tok/s (too short to exclude first tok) | "
-          "prefill %.0fms | hit %ld/%ld (%.1f%%) | +%.2f MiB H2D]\n\n",
-          n_gen, decode_ms, n_gen > 0 ? n_gen / (decode_ms / 1000.0) : 0.0, prefill_ms,
-          turn_hits, sel, sel ? 100.0 * turn_hits / sel : 0.0,
-          (reactive_up_bytes - up_before) / 1048576.0);
-    }
+    std::printf(
+        "\n  [%d tok in %.0fms -> %.2f tok/s%s | prefill %.0fms | hit %ld/%ld (%.1f%%) | +%.2f MiB H2D]\n\n",
+        n_gen, decode_ms, tok_s, per_tok_ms.size() >= 2 ? " (first tok excluded)" : "",
+        prefill_ms, turn_hits, sel, sel ? 100.0 * turn_hits / sel : 0.0,
+        (reactive_up_bytes - up_before) / 1048576.0);
   }
 
   std::printf("session end. total reactive H2D: %.2f MiB in %d calls, arena %u/%u resident\n",

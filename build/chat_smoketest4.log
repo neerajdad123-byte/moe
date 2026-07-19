@@ -1,0 +1,11 @@
+=== MoEx chat === loading model...
+arena: 1043 slots (2.97 GiB) -- LRU only, no pinning (see file header)
+warm-started 288 experts (784.69 MiB) from historical Python usage
+
+ready. type a message ('exit' to quit).
+context is 2048 tokens (multi-turn; carries across messages in this session)
+
+You: Bot:  The function should not use any built-in string reversal functions or methods. Additionally, the function should handle Unicode characters correctly. For example, if the input is "hello", the output should be "olle
+  [40 tok in 20305ms -> 2.03 tok/s (first tok excluded) | prefill 13649ms | hit 11236/19200 (58.5%) | +21830.48 MiB H2D]
+
+You: session end. total reactive H2D: 21830.48 MiB in 2290 calls, arena 1043/1043 resident
