@@ -17,7 +17,15 @@
 // Multi-turn: one Forward instance (and its KV cache) lives for the whole
 // session, so context carries across turns like a real chat.
 //
-// Usage: moex_chat [gguf] [capacity=0(auto)] [warm_top_k=20] [max_new_tok=200]
+// Streaming: each token's text prints the instant it's generated, plus a
+// live tok/s readout that updates in place (ANSI cursor save/restore) after
+// every token, so you see speed react in real time instead of only at the
+// end of a turn. Rate excludes the FIRST decode step deliberately -- its
+// latency includes carryover from the prefill/decode transition and isn't
+// representative of steady-state speed; including it drags the average down
+// misleadingly on short turns.
+//
+// Usage: moex_chat [gguf] [capacity=0(auto)] [warm_top_k=6] [max_new_tok=200]
 #include <direct.h>
 
 #include <algorithm>
@@ -28,6 +36,19 @@
 #include <iostream>
 #include <string>
 #include <vector>
+
+#ifdef _WIN32
+#include <windows.h>
+static void setup_console() {
+  HANDLE hOut = GetStdHandle(STD_OUTPUT_HANDLE);
+  DWORD mode = 0;
+  if (GetConsoleMode(hOut, &mode))
+    SetConsoleMode(hOut, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING);
+  SetConsoleOutputCP(CP_UTF8);
+}
+#else
+static void setup_console() {}
+#endif
 
 #include "cuda/cuda_common.h"
 #include "cuda/device_model.h"
@@ -72,6 +93,7 @@ static std::vector<long> load_histogram(const char* path, uint32_t n_layers,
 }
 
 int main(int argc, char** argv) {
+  setup_console();
   const char* path =
       argc > 1 ? argv[1] : "C:/models/Qwen_Qwen3-30B-A3B-Q4_K_M.gguf";
   uint32_t capacity = argc > 2 ? (uint32_t)std::atoi(argv[2]) : 0;
@@ -214,28 +236,66 @@ int main(int argc, char** argv) {
     }
     double prefill_ms = ms(t0, Clock::now());
 
-    std::vector<int> generated;
+    // Streaming decode: print each token's text the instant it's produced,
+    // and keep a live tok/s readout updating in place below it. The rate
+    // deliberately excludes the FIRST decode step (per_tok_ms[0]) -- its
+    // latency carries transition cost from prefill and isn't representative
+    // of steady-state speed; folding it in understates the real rate,
+    // especially on short replies.
+    std::printf("Bot: ");
+    std::fflush(stdout);
+
+    std::vector<double> per_tok_ms;  // one entry per fwd.step() decode call
     int n_gen = 0;
+    bool printed_live_line = false;
     auto t1 = Clock::now();
     for (int g = 0; g < max_new_tok; ++g) {
-      generated.push_back(tok);
       if (tok == eos) break;
+      std::string piece = detok.decode_id(tok);
+      std::fwrite(piece.data(), 1, piece.size(), stdout);
+
+      auto ta = Clock::now();
       tok = fwd.step(tok, pos, &route_buf, nullptr);
       ++pos;
+      auto tb = Clock::now();
+      per_tok_ms.push_back(ms(ta, tb));
       ++n_gen;
+
+      if (per_tok_ms.size() >= 2) {
+        double sum_ms = 0;
+        for (size_t k = 1; k < per_tok_ms.size(); ++k) sum_ms += per_tok_ms[k];
+        double live_tok_s = (double)(per_tok_ms.size() - 1) / (sum_ms / 1000.0);
+        std::printf("\x1b[s\n\x1b[2K  [%d tok so far, %.2f tok/s (first tok excluded)]\x1b[u",
+                    n_gen, live_tok_s);
+        printed_live_line = true;
+      }
+      std::fflush(stdout);
     }
     double decode_ms = ms(t1, Clock::now());
-    double tok_s = n_gen > 0 ? n_gen / (decode_ms / 1000.0) : 0.0;
+    double sum_ms_excl_first = 0;
+    for (size_t k = 1; k < per_tok_ms.size(); ++k) sum_ms_excl_first += per_tok_ms[k];
+    double tok_s = per_tok_ms.size() >= 2
+                       ? (double)(per_tok_ms.size() - 1) / (sum_ms_excl_first / 1000.0)
+                       : 0.0;
 
-    if (!generated.empty() && generated.back() == eos) generated.pop_back();
-    std::string reply = detok.decode(generated);
-
-    std::printf("Bot: %s\n", reply.c_str());
     long sel = turn_hits + turn_miss;
-    std::printf("  [%d tok in %.0fms -> %.2f tok/s | prefill %.0fms | hit %ld/%ld (%.1f%%) | +%.2f MiB H2D]\n\n",
-                n_gen, decode_ms, tok_s, prefill_ms, turn_hits, sel,
-                sel ? 100.0 * turn_hits / sel : 0.0,
-                (reactive_up_bytes - up_before) / 1048576.0);
+    if (printed_live_line) {
+      // Overwrite the last live line with the complete final stats (no
+      // restore this time -- settle here instead of jumping back).
+      std::printf(
+          "\x1b[s\n\x1b[2K  [%d tok in %.0fms -> %.2f tok/s (first tok excluded) | "
+          "prefill %.0fms | hit %ld/%ld (%.1f%%) | +%.2f MiB H2D]\n\n",
+          n_gen, decode_ms, tok_s, prefill_ms, turn_hits, sel,
+          sel ? 100.0 * turn_hits / sel : 0.0,
+          (reactive_up_bytes - up_before) / 1048576.0);
+    } else {
+      std::printf(
+          "\n  [%d tok in %.0fms -> %.2f tok/s (too short to exclude first tok) | "
+          "prefill %.0fms | hit %ld/%ld (%.1f%%) | +%.2f MiB H2D]\n\n",
+          n_gen, decode_ms, n_gen > 0 ? n_gen / (decode_ms / 1000.0) : 0.0, prefill_ms,
+          turn_hits, sel, sel ? 100.0 * turn_hits / sel : 0.0,
+          (reactive_up_bytes - up_before) / 1048576.0);
+    }
   }
 
   std::printf("session end. total reactive H2D: %.2f MiB in %d calls, arena %u/%u resident\n",

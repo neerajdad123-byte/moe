@@ -1,0 +1,50 @@
+=== MoEx chat === loading model...
+arena: 1043 slots (2.97 GiB) -- LRU only, no pinning (see file header)
+warm-started 288 experts (784.69 MiB) from historical Python usage
+
+ready. type a message ('exit' to quit).
+context is 2048 tokens (multi-turn; carries across messages in this session)
+
+You: Bot:  The function[s
+[2K  [2 tok so far, 1.36 tok/s (first tok excluded)][u should[s
+[2K  [3 tok so far, 1.60 tok/s (first tok excluded)][u not[s
+[2K  [4 tok so far, 1.87 tok/s (first tok excluded)][u use[s
+[2K  [5 tok so far, 2.05 tok/s (first tok excluded)][u any[s
+[2K  [6 tok so far, 2.15 tok/s (first tok excluded)][u built[s
+[2K  [7 tok so far, 2.12 tok/s (first tok excluded)][u-in[s
+[2K  [8 tok so far, 2.19 tok/s (first tok excluded)][u string[s
+[2K  [9 tok so far, 2.22 tok/s (first tok excluded)][u reversal[s
+[2K  [10 tok so far, 2.30 tok/s (first tok excluded)][u functions[s
+[2K  [11 tok so far, 2.34 tok/s (first tok excluded)][u or[s
+[2K  [12 tok so far, 2.23 tok/s (first tok excluded)][u methods[s
+[2K  [13 tok so far, 2.33 tok/s (first tok excluded)][u.[s
+[2K  [14 tok so far, 2.37 tok/s (first tok excluded)][u Additionally[s
+[2K  [15 tok so far, 2.40 tok/s (first tok excluded)][u,[s
+[2K  [16 tok so far, 2.43 tok/s (first tok excluded)][u the[s
+[2K  [17 tok so far, 2.47 tok/s (first tok excluded)][u function[s
+[2K  [18 tok so far, 2.51 tok/s (first tok excluded)][u should[s
+[2K  [19 tok so far, 2.57 tok/s (first tok excluded)][u handle[s
+[2K  [20 tok so far, 2.62 tok/s (first tok excluded)][u Unicode[s
+[2K  [21 tok so far, 2.62 tok/s (first tok excluded)][u characters[s
+[2K  [22 tok so far, 2.68 tok/s (first tok excluded)][u correctly[s
+[2K  [23 tok so far, 2.68 tok/s (first tok excluded)][u.[s
+[2K  [24 tok so far, 2.70 tok/s (first tok excluded)][u For[s
+[2K  [25 tok so far, 2.70 tok/s (first tok excluded)][u example[s
+[2K  [26 tok so far, 2.71 tok/s (first tok excluded)][u,[s
+[2K  [27 tok so far, 2.74 tok/s (first tok excluded)][u if[s
+[2K  [28 tok so far, 2.78 tok/s (first tok excluded)][u the[s
+[2K  [29 tok so far, 2.80 tok/s (first tok excluded)][u input[s
+[2K  [30 tok so far, 2.83 tok/s (first tok excluded)][u is[s
+[2K  [31 tok so far, 2.84 tok/s (first tok excluded)][u "[s
+[2K  [32 tok so far, 2.73 tok/s (first tok excluded)][uhello[s
+[2K  [33 tok so far, 2.64 tok/s (first tok excluded)][u",[s
+[2K  [34 tok so far, 2.62 tok/s (first tok excluded)][u the[s
+[2K  [35 tok so far, 2.63 tok/s (first tok excluded)][u output[s
+[2K  [36 tok so far, 2.63 tok/s (first tok excluded)][u should[s
+[2K  [37 tok so far, 2.65 tok/s (first tok excluded)][u be[s
+[2K  [38 tok so far, 2.66 tok/s (first tok excluded)][u "[s
+[2K  [39 tok so far, 2.64 tok/s (first tok excluded)][uolle[s
+[2K  [40 tok so far, 2.58 tok/s (first tok excluded)][u[s
+[2K  [40 tok in 16039ms -> 2.58 tok/s (first tok excluded) | prefill 9279ms | hit 11236/19200 (58.5%) | +21830.48 MiB H2D]
+
+You: session end. total reactive H2D: 21830.48 MiB in 2290 calls, arena 1043/1043 resident
