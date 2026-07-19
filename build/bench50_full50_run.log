@@ -1,0 +1,1093 @@
+=== MoEx bench50: 50 prompts x 200 decode tok x 1 pass(es), corpus=python50, capacity=0, pin top-17/layer every 5 ===
+model:  C:/models/Qwen_Qwen3-30B-A3B-Q4_K_M.gguf
+config: layers=48 experts=128 top_k=8 d_model=2048
+GPU:    5080 / 6140 MiB free before load
+static resident: 1023.342 MiB
+expert arena:    1112 slots x 2.92 MiB (3.169 GiB), pinned ring 32 x 2.92 MiB
+
+--- pass 0, prompt 1/50 (iter 1/50) ---
+  in:  Respond with only a single Python markdown code block containing a function that sorts a list using quicksort. Do not include any text before or after the code block. Do not include comments inside the code.
+  out:  The function must be named `quicksort` and take a single parameter `arr`. The function must not modify the input list. The function must return a new list that is sorted. The function must not use any built-in sorting functions. The function must be written in Python 3.
+
+```python
+def quicksort(arr):
+    if len(arr) <= 1:
+        return arr
+    pivot = arr[len(arr) // 2]
+    left = [x for x in arr if x < pivot]
+    middle = [x for x in arr if x == pivot]
+    right = [x for x in arr if x > pivot]
+    return quicksort(left) + middle + quicksort(right)
+``` 
+
+```python
+def quicksort(arr):
+    if len(arr) <= 1:
+        return arr
+    pivot = arr[len(arr) // 2]
+    left = [x for x in arr if x < pivot]
+    middle = [x for
+  ttft 18655.7ms  prefill 2.14 tok/s  decode 4.50 tok/s  hit 65797/92160 (71.4%)
+
+--- pass 0, prompt 2/50 (iter 2/50) ---
+  in:  Respond with only a single Python markdown code block containing a function that reverses a singly linked list. Do not include any text before or after the code block. Do not include comments inside the code.
+  out:  The function should be named reverse_linked_list and take a single parameter head which is the head of the linked list. The function should return the new head of the reversed linked list. The linked list nodes are defined as follows:
+
+class Node:
+    def __init__(self, value):
+        self.value = value
+        self.next = None
+
+Your code should not use any built-in functions or data structures. You must implement the reversal manually.
+
+```python
+class Node:
+    def __init__(self, value):
+        self.value = value
+        self.next = None
+
+def reverse_linked_list(head):
+    prev = None
+    current = head
+    while current:
+        next_node = current.next
+        current.next = prev
+        prev = current
+        current = next_node
+    return prev
+``` ```python
+class Node:
+    def __init__(self, value):
+        self.value = value
+        self.next = None
+
+def reverse_linked_list(head):
+    prev
+  ttft 6954.2ms  prefill 5.75 tok/s  decode 5.87 tok/s  hit 69338/92160 (75.2%)
+
+--- pass 0, prompt 3/50 (iter 3/50) ---
+  in:  Respond with only a single Python markdown code block containing a function that checks whether a string is a palindrome. Do not include any text before or after the code block. Do not include comments inside the code.
+  out:  The function should be named is_palindrome and take a single string argument. The function should return a boolean value. The function should be written in Python 3. The function should not use any built-in functions for reversing the string. The function should not use any loops. The function should not use any recursion. The function should not use any external libraries. The function should not use any list comprehensions. The function should not use any other advanced features. The function should be written in a single line. The function should be written in a way that is readable and maintainable. The function should be written in a way that is efficient and correct. The function should be written in a way that is compatible with Python 3. The function should be written in a way that is compatible with the latest version of Python 3. The function should be written in a way that is compatible with the latest version of Python 3. The function should be written in a way that is compatible with the
+  ttft 5663.7ms  prefill 7.24 tok/s  decode 6.30 tok/s  hit 71029/92544 (76.8%)
+
+--- pass 0, prompt 4/50 (iter 4/50) ---
+  in:  Respond with only a single Python markdown code block containing a function that computes the nth Fibonacci number iteratively. Do not include any text before or after the code block. Do not include comments inside the code.
+  out:  The function must be named `fibonacci` and take a single argument `n`. The function must not use recursion. The function must not use any external libraries. The function must not use any floating point operations. The function must not use any floating point numbers. The function must not use any floating point variables. The function must not use any floating point arithmetic. The function must not use any floating point comparisons. The function must not use any floating point literals. The function must not use any floating point functions. The function must not use any floating point types. The function must not use any floating point operators. The function must not use any floating point expressions. The function must not use any floating point assignments. The function must not use any floating point returns. The function must not use any floating point returns. The function must not use any floating point returns. The function must not use any floating point returns. The function must not use any floating point returns. The function must not use any floating
+  ttft 6241.8ms  prefill 6.57 tok/s  decode 6.44 tok/s  hit 70915/92544 (76.6%)
+
+--- pass 0, prompt 5/50 (iter 5/50) ---
+  in:  Respond with only a single Python markdown code block containing a stack class implemented using a list. Do not include any text before or after the code block. Do not include comments inside the code.
+  out:  The stack class must have the following methods: __init__, push, pop, peek, is_empty, size. The stack should be implemented using a list, and the list should be a private variable. The stack should have a maximum capacity, and when the stack is full, pushing should raise an exception. The exception should be a custom exception called StackFullError. The stack should have a default capacity of 10 if not specified. The stack should have a method called clear that removes all elements from the stack. The stack should have a method called __str__ that returns a string representation of the stack. The stack should have a method called __len__ that returns the number of elements in the stack. The stack should have a method called __iter__ that allows iteration over the stack. The stack should have a method called __contains__ that allows checking if an element is in the stack. The stack should have a method called __eq__ that checks if two stacks are equal.
+  ttft 5519.5ms  prefill 6.88 tok/s  decode 6.44 tok/s  hit 70035/91392 (76.6%)
+  [pin refresh after prompt 5: top-17/layer, +1159.10 MiB uploaded, -1162.97 MiB evicted]
+
+--- pass 0, prompt 6/50 (iter 6/50) ---
+  in:  Respond with only a single Python markdown code block containing a function that performs breadth first search on a graph given as an adjacency list. Do not include any text before or after the code block. Do not include comments inside the code.
+  out:  The function should take two arguments: the graph and the start node. The function should return the order of visited nodes.
+
+```python
+def bfs(graph, start):
+    visited = []
+    queue = [start]
+    while queue:
+        node = queue.pop(0)
+        if node not in visited:
+            visited.append(node)
+            queue.extend(graph[node])
+    return visited
+```
+
+```python
+def bfs(graph, start):
+    visited = []
+    queue = [start]
+    while queue:
+        node = queue.pop(0)
+        if node not in visited:
+            visited.append(node)
+            queue.extend(graph[node])
+    return visited
+``` ```python
+def bfs(graph, start):
+    visited = []
+    queue = [start]
+    while queue:
+        node = queue.pop(0)
+        if node not in visited:
+            visited.append(node)
+            queue.extend(graph[node])
+    return visited
+``` ```python
+def bfs(graph, start):
+    visited = []
+
+  ttft 5640.4ms  prefill 8.16 tok/s  decode 5.39 tok/s  hit 46048/94464 (48.7%)
+
+--- pass 0, prompt 7/50 (iter 7/50) ---
+  in:  Respond with only a single Python markdown code block containing a simple LRU cache class with get and put methods. Do not include any text before or after the code block. Do not include comments inside the code.
+  out:  The LRU cache should have a maximum size of 100, and the get method should return -1 if the key is not present. The put method should add or update the value, and if the cache is full, it should remove the least recently used item. The class should be named LRUCache. The code should be compatible with Python 3.8.
+
+```python
+class LRUCache:
+    def __init__(self):
+        self.cache = {}
+        self.order = []
+        self.max_size = 100
+
+    def get(self, key):
+        if key in self.cache:
+            self.order.remove(key)
+            self.order.append(key)
+            return self.cache[key]
+        return -1
+
+    def put(self, key, value):
+        if key in self.cache:
+            self.order.remove(key)
+        elif len(self.cache) >= self.max_size:
+            oldest = self.order.pop(0)
+            del self.cache[oldest]
+       
+  ttft 5282.5ms  prefill 7.95 tok/s  decode 6.35 tok/s  hit 52961/92928 (57.0%)
+
+--- pass 0, prompt 8/50 (iter 8/50) ---
+  in:  Respond with only a single Python markdown code block containing a function that performs binary search on a sorted list. Do not include any text before or after the code block. Do not include comments inside the code.
+  out:  The function should take two arguments: a sorted list and a target value. The function should return the index of the target in the list, or -1 if not found.
+
+```python
+def binary_search(sorted_list, target):
+    left = 0
+    right = len(sorted_list) - 1
+    while left <= right:
+        mid = (left + right) // 2
+        if sorted_list[mid] == target:
+            return mid
+        elif sorted_list[mid] < target:
+            left = mid + 1
+        else:
+            right = mid - 1
+    return -1
+``` 
+
+```python
+def binary_search(sorted_list, target):
+    left = 0
+    right = len(sorted_list) - 1
+    while left <= right:
+        mid = (left + right) // 2
+        if sorted_list[mid] == target:
+            return mid
+        elif sorted_list[mid] < target:
+            left =
+  ttft 5073.9ms  prefill 8.08 tok/s  decode 5.17 tok/s  hit 41370/92544 (44.7%)
+
+--- pass 0, prompt 9/50 (iter 9/50) ---
+  in:  Respond with only a single Python markdown code block containing a function that implements merge sort on a list of integers. Do not include any text before or after the code block. Do not include comments inside the code.
+  out:  Do not use any built-in functions except for the ones necessary for the algorithm. The function should be named `merge_sort`. The function should take a single parameter, `arr`, which is a list of integers. The function should return a new list that is a sorted version of the input list. The function should not modify the input list. The function should be implemented recursively. The function should not use any loops (for or while). The function should not use list comprehensions. The function should not use any external libraries. The function should not use the `sorted()` function. The function should not use the `list.sort()` method. The function should not use the `+` operator for list concatenation. The function should not use the `extend()` method. The function should not use the `insert()` method. The function should not use the `pop()` method. The function should not use the `del` statement. The function should not use the `append()` method. The
+  ttft 5443.7ms  prefill 7.72 tok/s  decode 8.21 tok/s  hit 64865/92928 (69.8%)
+
+--- pass 0, prompt 10/50 (iter 10/50) ---
+  in:  Respond with only a single Python markdown code block containing a function that implements bubble sort on a list. Do not include any text before or after the code block. Do not include comments inside the code.
+  out:  The function should be named `bubble_sort` and take a single parameter `arr`. The function should return the sorted list.
+
+```python
+def bubble_sort(arr):
+    n = len(arr)
+    for i in range(n):
+        for j in range(0, n-i-1):
+            if arr[j] > arr[j+1]:
+                arr[j], arr[j+1] = arr[j+1], arr[j]
+    return arr
+``` ```python
+def bubble_sort(arr):
+    n = len(arr)
+    for i in range(n):
+        for j in range(0, n-i-1):
+            if arr[j] > arr[j+1]:
+                arr[j], arr[j+1] = arr[j+1], arr[j]
+    return arr
+``` ```python
+def bubble_sort(arr):
+    n = len(arr)
+    for i in range(n):
+        for j in range(0, n-i-1):
+            if arr[j]
+  ttft 4671.7ms  prefill 8.56 tok/s  decode 5.26 tok/s  hit 39545/92160 (42.9%)
+  [pin refresh after prompt 10: top-17/layer, +405.35 MiB uploaded, -404.58 MiB evicted]
+
+--- pass 0, prompt 11/50 (iter 11/50) ---
+  in:  Respond with only a single Python markdown code block containing a function that performs depth first search on a graph given as an adjacency list. Do not include any text before or after the code block. Do not include comments inside the code.
+  out:  The function should take two arguments: the graph and the starting node. The function should return a list of visited nodes in the order they were visited.
+
+```python
+def dfs(graph, start):
+    visited = []
+    stack = [start]
+    while stack:
+        node = stack.pop()
+        if node not in visited:
+            visited.append(node)
+            stack.extend(graph[node])
+    return visited
+```
+
+Okay, I need to write a Python function for depth-first search (DFS) on a graph represented as an adjacency list. Let me think about how DFS works. 
+
+So, DFS starts at a given node and explores as far as possible along each branch before backtracking. The standard approach uses a stack to keep track of the nodes. Oh right, the function needs to return the order in which nodes are visited.
+
+The function should take two arguments: the graph (which is an adjacency list, so a dictionary where each key is a node and the value is a list of adjacent
+  ttft 5987.9ms  prefill 7.68 tok/s  decode 7.01 tok/s  hit 55972/94464 (59.3%)
+
+--- pass 0, prompt 12/50 (iter 12/50) ---
+  in:  Respond with only a single Python markdown code block containing a function that implements selection sort on a list. Do not include any text before or after the code block. Do not include comments inside the code.
+  out:  The function must be named `selection_sort` and take a single parameter `arr`. The function must return the sorted list. The function must not modify the original list. The function must not use any built-in sorting functions or libraries. The function must not use list comprehensions. The function must not use the `sorted()` function. The function must not use the `copy` module. The function must not use the `list.sort()` method. The function must not use the `del` statement. The function must not use the `pop()` method. The function must not use the `remove()` method. The function must not use the `insert()` method. The function must not use the `append()` method. The function must not use the `extend()` method. The function must not use the `+` operator for list concatenation. The function must not use the `*` operator for list repetition. The function must not use the `itertools` module. The function must
+  ttft 4981.6ms  prefill 8.03 tok/s  decode 7.97 tok/s  hit 61492/92160 (66.7%)
+
+--- pass 0, prompt 13/50 (iter 13/50) ---
+  in:  Respond with only a single Python markdown code block containing a function that implements insertion sort on a list. Do not include any text before or after the code block. Do not include comments inside the code.
+  out:  The function should be named `insertion_sort` and take a single parameter `arr`. The function should return the sorted list.
+
+```python
+def insertion_sort(arr):
+    for i in range(1, len(arr)):
+        key = arr[i]
+        j = i-1
+        while j >= 0 and key < arr[j]:
+            arr[j + 1] = arr[j]
+            j -= 1
+        arr[j + 1] = key
+    return arr
+``` 
+
+Wait, I need to make sure that the code is correct. Let me check. The function is named insertion_sort and takes a single parameter arr. The code loops from 1 to len(arr), which is correct. The key is set to arr[i], and j is i-1. Then, while j >=0 and key < arr[j], it shifts elements. Then inserts key. Returns arr. Yes, this is correct.
+```python
+def insertion_sort(arr):
+   
+  ttft 5094.6ms  prefill 7.85 tok/s  decode 6.89 tok/s  hit 52993/92160 (57.5%)
+
+--- pass 0, prompt 14/50 (iter 14/50) ---
+  in:  Respond with only a single Python markdown code block containing a function that checks whether a number is prime. Do not include any text before or after the code block. Do not include comments inside the code.
+  out:  The function should be named is_prime and take a single integer argument. The function should return a boolean. The function should not use any external libraries. The function should handle edge cases such as numbers less than 2 correctly. The function should be efficient for large numbers.
+
+```python
+def is_prime(n):
+    if n <= 1:
+        return False
+    if n <= 3:
+        return True
+    if n % 2 == 0 or n % 3 == 0:
+        return False
+    i = 5
+    while i * i <= n:
+        if n % i == 0 or n % (i + 2) == 0:
+            return False
+        i += 6
+    return True
+```
+
+```python
+def is_prime(n):
+    if n <= 1:
+        return False
+    if n <= 3:
+        return True
+    if n % 2 == 0 or n % 
+  ttft 4965.2ms  prefill 8.06 tok/s  decode 6.57 tok/s  hit 51596/92160 (56.0%)
+
+--- pass 0, prompt 15/50 (iter 15/50) ---
+  in:  Respond with only a single Python markdown code block containing a function that computes the greatest common divisor of two integers. Do not include any text before or after the code block. Do not include comments inside the code.
+  out:  The function must be named `gcd` and take two parameters, `a` and `b`. The function must not use any built-in functions for computing the GCD. The function must not use any loops. The function must use recursion. The function must not use any `import` statements. The function must not use any `math` functions. The function must not use any `while` or `for` loops. The function must not use any `if` statements. The function must not use any `else` statements. The function must not use any `elif` statements. The function must not use any `try` or `except` blocks. The function must not use any `return` statements. The function must not use any `print` statements. The function must not use any `assert` statements. The function must not use any `lambda` functions. The function must not use any `and`, `or`, `not` operators. The function must not use
+  ttft 5289.3ms  prefill 7.94 tok/s  decode 7.99 tok/s  hit 61522/92928 (66.2%)
+  [pin refresh after prompt 15: top-17/layer, +120.87 MiB uploaded, -120.48 MiB evicted]
+
+--- pass 0, prompt 16/50 (iter 16/50) ---
+  in:  Respond with only a single Python markdown code block containing a function that computes the least common multiple of two integers. Do not include any text before or after the code block. Do not include comments inside the code.
+  out:  The function must be named `lcm` and take two parameters, `a` and `b`. The function must not use any external libraries. The function must be written in Python 3.
+
+```python
+def lcm(a,b):
+    def gcd(x,y):
+        while y:
+            x,y=y,x%y
+        return x
+    return a*b//gcd(a,b)
+``` ```python
+def lcm(a,b):
+    def gcd(x,y):
+        while y:
+            x,y=y,x%y
+        return x
+    return a*b//gcd(a,b)
+``` ```python
+def lcm(a,b):
+    def gcd(x,y):
+        while y:
+            x,y=y,x%y
+        return x
+    return a*b//gcd(a,b)
+``` ```python
+def lcm(a,b):
+    def gcd(x,y):
+        while y:
+            x,y=y,x%y
+        return x
+    return a*b//gcd(a,b)
+```
+  ttft 5306.6ms  prefill 7.91 tok/s  decode 6.59 tok/s  hit 52997/92928 (57.0%)
+
+--- pass 0, prompt 17/50 (iter 17/50) ---
+  in:  Respond with only a single Python markdown code block containing a function that counts the vowels in a string. Do not include any text before or after the code block. Do not include comments inside the code.
+  out:  The function must be named count_vowels and take a single parameter called s. The function must return an integer. The vowels are a, e, i, o, u, and y. The function must be written in Python 3. The function must not use any external libraries. The function must not use any loops. The function must not use any list comprehensions. The function must not use any built-in functions like len(), sum(), etc. The function must not use any recursion. The function must not use any classes. The function must not use any global variables. The function must not use any regular expressions. The function must not use any other functions except for the ones allowed. The function must not use any conditional statements. The function must not use any bitwise operators. The function must not use any other operators except for +, -, *, /, and %.
+
+Okay, I need to write a Python function called count_vowels that takes a string s and returns the
+  ttft 4822.0ms  prefill 8.30 tok/s  decode 7.98 tok/s  hit 61974/92160 (67.2%)
+
+--- pass 0, prompt 18/50 (iter 18/50) ---
+  in:  Respond with only a single Python markdown code block containing a function that reverses a string in place. Do not include any text before or after the code block. Do not include comments inside the code.
+  out:  The function must not use any built-in string reversal functions or methods (e.g., [::-1], reversed(), etc.). The function must not use any additional data structures (e.g., lists, arrays, etc.). The function must not use any loops (e.g., for, while). The function must not use recursion. The function must not use any built-in functions or methods except for basic operations like len(), and the function must not use any other functions or methods. The function must not use any other libraries or modules. The function must not use any other code except for the function itself. The function must not use any other code except for the function itself. The function must not use any other code except for the function itself. The function must not use any other code except for the function itself. The function must not use any other code except for the function itself. The function must not use any other code except for the function itself. The function must not use any other code except
+  ttft 4918.3ms  prefill 8.13 tok/s  decode 7.67 tok/s  hit 60855/92160 (66.0%)
+
+--- pass 0, prompt 19/50 (iter 19/50) ---
+  in:  Respond with only a single Python markdown code block containing a function that checks whether two strings are anagrams. Do not include any text before or after the code block. Do not include comments inside the code.
+  out:  The function should be named `are_anagrams` and take two parameters, `s1` and `s2`. The function should return a boolean. The function should not be case-sensitive. The function should ignore spaces and punctuation. The function should not use any built-in functions for checking anagrams. The function should not use any external libraries. The function should not use any sorting. The function should not use any dictionaries. The function should not use any sets. The function should not use any list comprehensions. The function should not use any loops. The function should not use any recursion. The function should not use any other functions except for the built-in functions `len`, `str.lower`, `str.isalpha`, and `str.strip`. The function should not use any other functions except for the built-in functions `len`, `str.lower`, `str.isalpha`, and `str.strip`. The function should not use any other functions except for the built-in functions `len`, `
+  ttft 5293.0ms  prefill 7.75 tok/s  decode 7.59 tok/s  hit 62240/92544 (67.3%)
+
+--- pass 0, prompt 20/50 (iter 20/50) ---
+  in:  Respond with only a single Python markdown code block containing a function that finds the longest common prefix among a list of strings. Do not include any text before or after the code block. Do not include comments inside the code.
+  out:  The function must be named `longest_common_prefix` and take a single parameter `strs` which is a list of strings. The function must return the longest common prefix. If there is no common prefix, return an empty string.
+
+```python
+def longest_common_prefix(strs):
+    if not strs:
+        return ""
+    prefix = strs[0]
+    for s in strs[1:]:
+        while not s.startswith(prefix):
+            prefix = prefix[:-1]
+            if not prefix:
+                return ""
+    return prefix
+```
+
+```python
+def longest_common_prefix(strs):
+    if not strs:
+        return ""
+    prefix = strs[0]
+    for s in strs[1:]:
+        while not s.startswith(prefix):
+            prefix = prefix[:-1]
+            if not prefix:
+                return ""
+    return prefix
+``` ```python
+def longest_common_prefix(strs):
+    if not strs:
+        return ""
+    prefix = strs[0]
+    for s in strs[
+  ttft 5282.7ms  prefill 8.33 tok/s  decode 7.08 tok/s  hit 56061/93696 (59.8%)
+  [pin refresh after prompt 20: top-17/layer, +121.82 MiB uploaded, -122.20 MiB evicted]
+
+--- pass 0, prompt 21/50 (iter 21/50) ---
+  in:  Respond with only a single Python markdown code block containing a function that removes duplicates from a sorted list. Do not include any text before or after the code block. Do not include comments inside the code.
+  out:  The function should be named `remove_duplicates` and take a single parameter `nums` which is a list of integers. The function should modify the list in-place and return the new length of the list. The list is sorted in non-decreasing order. The function should not use any built-in functions for removing duplicates. The function should not use any additional data structures. The function should not use any other methods except for the ones allowed. The function should not use any other functions except for the ones allowed. The function should not use any other functions except for the ones allowed. The function should not use any other functions except for the ones allowed. The function should not use any other functions except for the ones allowed. The function should not use any other functions except for the ones allowed. The function should not use any other functions except for the ones allowed. The function should not use any other functions except for the ones allowed. The function should not use any other functions except for the ones allowed.
+  ttft 4849.7ms  prefill 8.25 tok/s  decode 7.56 tok/s  hit 59899/92160 (65.0%)
+
+--- pass 0, prompt 22/50 (iter 22/50) ---
+  in:  Respond with only a single Python markdown code block containing a function that finds the maximum subarray sum using Kadane's algorithm. Do not include any text before or after the code block. Do not include comments inside the code.
+  out:  Do not use any external libraries. The function should take a list of integers as input and return the maximum subarray sum.
+
+```python
+def max_subarray_sum(arr):
+    max_current = max_global = arr[0]
+    for num in arr[1:]:
+        max_current = max(num, max_current + num)
+        if max_current > max_global:
+            max_global = max_current
+    return max_global
+```
+
+Wait, I need to handle the case when all numbers are negative. Let me adjust the code.
+
+```python
+def max_subarray_sum(arr):
+    max_current = max_global = arr[0]
+    for num in arr[1:]:
+        max_current = max(num, max_current + num)
+        max_global = max(max_global, max_current)
+    return max_global
+```
+
+But the initial code may not handle empty arrays. Let me fix that.
+
+```python
+def max_subarray_sum(arr):
+    if not arr:
+        return 
+  ttft 5811.3ms  prefill 7.74 tok/s  decode 6.63 tok/s  hit 54560/94080 (58.0%)
+
+--- pass 0, prompt 23/50 (iter 23/50) ---
+  in:  Respond with only a single Python markdown code block containing a queue class implemented using two stacks. Do not include any text before or after the code block. Do not include comments inside the code.
+  out:  Do not use any external libraries. Do not use the `queue` module. Do not use the `list` as a stack. Use a class-based approach. The queue should support the following operations: enqueue, dequeue, peek, and is_empty. The implementation should be efficient, with amortized O(1) time complexity for enqueue and dequeue operations.
+
+```python
+class Queue:
+    def __init__(self):
+        self.stack1 = []
+        self.stack2 = []
+    
+    def enqueue(self, item):
+        self.stack1.append(item)
+    
+    def dequeue(self):
+        if not self.stack2:
+            while self.stack1:
+                self.stack2.append(self.stack1.pop())
+        return self.stack2.pop()
+    
+    def peek(self):
+        if not self.stack2:
+            while self.stack1:
+                self.stack2.append(self.stack1.pop())
+        return self.stack2[-1]
+    
+    def is_empty(self):
+        return not self.stack1 and not
+  ttft 4934.9ms  prefill 7.70 tok/s  decode 6.70 tok/s  hit 54114/91392 (59.2%)
+
+--- pass 0, prompt 24/50 (iter 24/50) ---
+  in:  Respond with only a single Python markdown code block containing a function that performs inorder traversal of a binary tree. Do not include any text before or after the code block. Do not include comments inside the code.
+  out:  The function should be named `inorder_traversal` and take a single parameter `root` which is the root node of the binary tree. The function should return a list of the values in the tree in the order they are visited during the inorder traversal.
+
+The node class is defined as follows:
+
+```python
+class Node:
+    def __init__(self, val, left=None, right=None):
+        self.val = val
+        self.left = left
+        self.right = right
+```
+
+Your function should not use any global variables and should not use any classes other than the provided Node class.
+
+```python
+class Node:
+    def __init__(self, val, left=None, right=None):
+        self.val = val
+        self.left = left
+        self.right = right
+
+def inorder_traversal(root):
+    pass
+```
+
+```python
+def inorder_traversal(root):
+    result = []
+    def traverse(node):
+        if not node:
+            return
+        traverse
+  ttft 4958.6ms  prefill 8.27 tok/s  decode 7.19 tok/s  hit 56175/92544 (60.7%)
+
+--- pass 0, prompt 25/50 (iter 25/50) ---
+  in:  Respond with only a single Python markdown code block containing a function that detects a cycle in a singly linked list. Do not include any text before or after the code block. Do not include comments inside the code.
+  out:  The function should be named `has_cycle` and take a single argument `head` which is the head node of the linked list. The function should return `True` if there is a cycle, otherwise `False`.
+
+```python
+class ListNode:
+    def __init__(self, val=0, next=None):
+        self.val = val
+        self.next = next
+
+def has_cycle(head):
+    if not head:
+        return False
+    slow = head
+    fast = head
+    while fast and fast.next:
+        slow = slow.next
+        fast = fast.next.next
+        if slow == fast:
+            return True
+    return False
+```
+
+```python
+class ListNode:
+    def __init__(self, val=0, next=None):
+        self.val = val
+        self.next = next
+
+def has_cycle(head):
+    if not head:
+        return False
+    slow = head
+    fast = head
+    while fast and fast.next:
+       
+  ttft 5073.6ms  prefill 8.28 tok/s  decode 6.70 tok/s  hit 52057/92928 (56.0%)
+  [pin refresh after prompt 25: top-17/layer, +96.33 MiB uploaded, -96.33 MiB evicted]
+
+--- pass 0, prompt 26/50 (iter 26/50) ---
+  in:  Respond with only a single Python markdown code block containing a min-heap class with push and pop methods. Do not include any text before or after the code block. Do not include comments inside the code.
+  out:  Do not use any external libraries. class MinHeap:
+    def __init__(self):
+        self.heap = []
+    
+    def push(self, val):
+        self.heap.append(val)
+        self._bubble_up(len(self.heap) - 1)
+    
+    def pop(self):
+        if not self.heap:
+            return None
+        if len(self.heap) == 1:
+            return self.heap.pop()
+        val = self.heap[0]
+        self.heap[0] = self.heap.pop()
+        self._bubble_down(0)
+        return val
+    
+    def _bubble_up(self, index):
+        while index > 0:
+            parent = (index - 1) // 2
+            if self.heap[index] >= self.heap[parent]:
+                break
+            self.heap[index], self.heap[parent] = self.heap[parent], self.heap[index]
+            index = parent
+    
+    def _bubble_down(self, index):
+        while True:
+            left = 2 * index +
+  ttft 5142.4ms  prefill 7.97 tok/s  decode 6.71 tok/s  hit 53019/92544 (57.3%)
+
+--- pass 0, prompt 27/50 (iter 27/50) ---
+  in:  Respond with only a single Python markdown code block containing a function that flattens a nested list. Do not include any text before or after the code block. Do not include comments inside the code.
+  out:  The function should be named `flatten` and take a single argument `nested_list`. The function should return a new list with all elements from the nested list, but in a single level.
+
+For example, `flatten([[1, 2], [3, 4]])` should return `[1, 2, 3, 4]`.
+
+Another example: `flatten([1, [2, [3, 4]]])` should return `[1, 2, 3, 4]`.
+
+Another example: `flatten([1, 2, 3])` should return `[1, 2, 3]`.
+
+Another example: `flatten([])` should return `[]`.
+
+Another example: `flatten([[[[[[[[1]]]]]]]])` should return `[1]`.
+
+Okay, I need to write a Python function called flatten that takes a nested list and returns a single-level list. Hmm, how to approach this. Let's think about
+  ttft 4698.1ms  prefill 8.30 tok/s  decode 6.83 tok/s  hit 52707/91776 (57.4%)
+
+--- pass 0, prompt 28/50 (iter 28/50) ---
+  in:  Respond with only a single Python markdown code block containing a function that converts a decimal integer to its binary string representation. Do not include any text before or after the code block. Do not include comments inside the code.
+  out:  The function must not use any built-in functions for converting to binary, such as bin(), format(), or any other similar functions. The function must not use any libraries or modules. The function must not use any loops. The function must not use any recursion. The function must not use any bitwise operators. The function must not use any string methods. The function must not use any list comprehensions. The function must not use any other functions except for the ones defined in the code. The function must not use any other data structures except for the ones defined in the code. The function must not use any other variables except for the ones defined in the code. The function must not use any other operations except for the ones defined in the code. The function must not use any other expressions except for the ones defined in the code. The function must not use any other statements except for the ones defined in the code. The function must not use any other code except for the ones defined in the code.
+  ttft 5167.1ms  prefill 8.32 tok/s  decode 8.14 tok/s  hit 62727/93312 (67.2%)
+
+--- pass 0, prompt 29/50 (iter 29/50) ---
+  in:  Respond with only a single Python markdown code block containing a function that sorts a list containing only 0s 1s and 2s in place. Do not include any text before or after the code block. Do not include comments inside the code.
+  out:  The function should be named 'sort_colors' and take a single parameter 'nums' which is a list of integers. The function should not return anything, it should sort the list in place.
+
+```python
+def sort_colors(nums):
+    left, mid, right = 0, 0, len(nums)-1
+    while mid <= right:
+        if nums[mid] == 0:
+            nums[left], nums[mid] = nums[mid], nums[left]
+            left += 1
+            mid += 1
+        elif nums[mid] == 1:
+            mid += 1
+        else:
+            nums[right], nums[mid] = nums[mid], nums[right]
+            right -= 1
+``` 
+
+```python
+def sort_colors(nums):
+    left, mid, right = 0, 0, len(nums)-1
+    while mid <= right:
+        if nums[mid] == 0:
+            nums[left], nums[mid] = nums[mid], nums[left
+  ttft 6330.2ms  prefill 8.06 tok/s  decode 6.29 tok/s  hit 52254/96384 (54.2%)
+
+--- pass 0, prompt 30/50 (iter 30/50) ---
+  in:  Respond with only a single Python markdown code block containing a function that finds the missing number in a list containing n distinct numbers from 0 to n. Do not include any text before or after the code block. Do not include comments inside the code.
+  out:  The function should be named find_missing and take a list of integers as input.
+
+```python
+def find_missing(nums):
+    n = len(nums)
+    expected_sum = n * (n + 1) // 2
+    actual_sum = sum(nums)
+    return expected_sum - actual_sum
+```
+
+Okay, I need to find the missing number in a list of distinct integers from 0 to n. The list should have n numbers, but since one is missing, the length is n-1? Wait, wait. Wait, the problem says the list contains n distinct numbers from 0 to n. Wait, that can't be right. Because 0 to n inclusive is n+1 numbers. So if the list is supposed to have n distinct numbers, then one is missing. So the length of the list is n. For example, if n is 3, the numbers should be 0,1,2,3 (four numbers), but the list has
+  ttft 6418.0ms  prefill 7.79 tok/s  decode 5.87 tok/s  hit 48037/96000 (50.0%)
+  [pin refresh after prompt 30: top-17/layer, +94.39 MiB uploaded, -95.94 MiB evicted]
+
+--- pass 0, prompt 31/50 (iter 31/50) ---
+  in:  Respond with only a single Python markdown code block containing a function that rotates a list by k positions. Do not include any text before or after the code block. Do not include comments inside the code.
+  out:  The function should be named rotate_list and take two parameters: the list and the number of positions to rotate. The rotation should be in-place. The function should return the rotated list.
+
+```python
+def rotate_list(lst, k):
+    n = len(lst)
+    k = k % n
+    return lst[-k:] + lst[:-k]
+```
+
+```python
+def rotate_list(lst, k):
+    n = len(lst)
+    k = k % n
+    return lst[-k:] + lst[:-k]
+``` ```python
+def rotate_list(lst, k):
+    n = len(lst)
+    k = k % n
+    return lst[-k:] + lst[:-k]
+``` ```python
+def rotate_list(lst, k):
+    n = len(lst)
+    k = k % n
+    return lst[-k:] + lst[:-k]
+``` ```python
+def rotate_list(lst, k):
+    n = len(lst)
+    k = k % n
+  ttft 4983.5ms  prefill 8.03 tok/s  decode 6.72 tok/s  hit 52947/92160 (57.5%)
+
+--- pass 0, prompt 32/50 (iter 32/50) ---
+  in:  Respond with only a single Python markdown code block containing a trie class with insert and search methods. Do not include any text before or after the code block. Do not include comments inside the code.
+  out:  The trie should be implemented using dictionaries. The insert method should take a word as input and add it to the trie. The search method should take a word as input and return True if the word is present in the trie, False otherwise. The trie should be initialized with an empty dictionary. The insert and search methods should be part of the Trie class. The code should be valid and syntactically correct.
+
+```python
+class Trie:
+    def __init__(self):
+        self.root = {}
+    def insert(self, word):
+        node = self.root
+        for c in word:
+            if c not in node:
+                node[c] = {}
+            node = node[c]
+        node['#'] = True
+    def search(self, word):
+        node = self.root
+        for c in word:
+            if c not in node:
+                return False
+            node = node[c]
+        return '#' in node
+``` 
+
+```python
+class Trie:
+    def __init
+  ttft 5238.7ms  prefill 7.44 tok/s  decode 6.83 tok/s  hit 55088/91776 (60.0%)
+
+--- pass 0, prompt 33/50 (iter 33/50) ---
+  in:  Respond with only a single Python markdown code block containing a function that validates balanced parentheses in a string. Do not include any text before or after the code block. Do not include comments inside the code.
+  out:  The function must be named `validate_parentheses` and take a single argument `s` which is the string to check. The function must return a boolean indicating whether the parentheses are balanced.
+
+```python
+def validate_parentheses(s):
+    stack = []
+    for char in s:
+        if char == '(':
+            stack.append(char)
+        elif char == ')':
+            if not stack:
+                return False
+            stack.pop()
+    return not stack
+```
+
+```python
+def validate_parentheses(s):
+    stack = []
+    for char in s:
+        if char == '(':
+            stack.append(char)
+        elif char == ')':
+            if not stack:
+                return False
+            stack.pop()
+    return not stack
+``` ```python
+def validate_parentheses(s):
+    stack = []
+    for char in s:
+        if char == '(':
+            stack.append(char)
+        elif char == ')':
+            if not stack:
+                return False
+            stack
+  ttft 5301.1ms  prefill 7.55 tok/s  decode 6.88 tok/s  hit 54162/92160 (58.8%)
+
+--- pass 0, prompt 34/50 (iter 34/50) ---
+  in:  Respond with only a single Python markdown code block containing a function that computes the nth Catalan number. Do not include any text before or after the code block. Do not include comments inside the code.
+  out:  Do not use any external libraries. The function must be named `catalan_number` and take a single argument `n`. The function must not use recursion. The function must use a formula that is not the recursive formula. The function must not use any loops. The function must not use any external libraries. The function must not use any built-in functions like `math.factorial`. The function must not use any built-in functions like `math.comb`. The function must not use any built-in functions like `math.pow`. The function must not use any built-in functions like `math.sqrt`. The function must not use any built-in functions like `math.log`. The function must not use any built-in functions like `math.exp`. The function must not use any built-in functions like `math.gcd`. The function must not use any built-in functions like `math.lcm`. The function must not use any built-in functions like `math.isqrt`. The function must not use any
+  ttft 5007.7ms  prefill 7.79 tok/s  decode 7.57 tok/s  hit 58768/91776 (64.0%)
+
+--- pass 0, prompt 35/50 (iter 35/50) ---
+  in:  Respond with only a single Python markdown code block containing a function that finds the kth largest element in an unsorted list. Do not include any text before or after the code block. Do not include comments inside the code.
+  out:  Do not use any built-in functions for sorting or finding the kth largest element. The function should be named find_kth_largest and take two parameters: nums (a list of integers) and k (an integer). The function should return the kth largest element.
+
+```python
+def find_kth_largest(nums, k):
+    def partition(left, right, pivot_index):
+        pivot = nums[pivot_index]
+        nums[pivot_index], nums[right] = nums[right], nums[pivot_index]
+        store_index = left
+        for i in range(left, right):
+            if nums[i] < pivot:
+                nums[store_index], nums[i] = nums[i], nums[store_index]
+                store_index += 1
+        nums[right], nums[store_index] = nums[store_index], nums[right]
+        return store_index
+
+    def quickselect(left, right, k_smallest):
+        if left == right:
+            return nums[left]
+        pivot
+  ttft 5690.1ms  prefill 7.91 tok/s  decode 6.93 tok/s  hit 54651/94080 (58.1%)
+  [pin refresh after prompt 35: top-17/layer, +50.20 MiB uploaded, -50.20 MiB evicted]
+
+--- pass 0, prompt 36/50 (iter 36/50) ---
+  in:  Respond with only a single Python markdown code block containing a function that implements Dijkstra's shortest path algorithm on a weighted graph. Do not include any text before or after the code block. Do not include comments inside the code.
+  out:  The function should take a graph represented as a dictionary of dictionaries, a start node, and an end node, and return the shortest path as a list of nodes. The graph is represented as a dictionary where each key is a node, and the value is another dictionary of adjacent nodes and their corresponding weights. The function should return the shortest path as a list of nodes from start to end. The function should not use any external libraries. The function should not use any classes. The function should not use any priority queues. The function should not use any recursion. The function should not use any built-in functions for priority queues. The function should not use any built-in functions for graphs. The function should not use any built-in functions for shortest path algorithms. The function should not use any built-in functions for sorting. The function should not use any built-in functions for sets. The function should not use any built-in functions for lists. The function should not use any built-in functions for dictionaries. The
+  ttft 5867.3ms  prefill 7.67 tok/s  decode 7.56 tok/s  hit 60267/94080 (64.1%)
+
+--- pass 0, prompt 37/50 (iter 37/50) ---
+  in:  Respond with only a single Python markdown code block containing a function that performs topological sort on a directed acyclic graph. Do not include any text before or after the code block. Do not include comments inside the code.
+  out:  The function should take a dictionary representing the graph as input, where the keys are the nodes and the values are lists of nodes that the key node points to. The function should return a list of nodes in topological order. The function should not modify the input graph. The function should handle cycles in the graph by raising a ValueError with the message "Input graph has a cycle".
+
+```python
+def topological_sort(graph):
+    in_degree = {node: 0 for node in graph}
+    for node in graph:
+        for neighbor in graph[node]:
+            in_degree[neighbor] += 1
+    queue = [node for node in in_degree if in_degree[node] == 0]
+    result = []
+    while queue:
+        current = queue.pop(0)
+        result.append(current)
+        for neighbor in graph[current]:
+            in_degree[neighbor] -= 1
+            if in_degree[neighbor] == 0:
+                queue.append(neighbor)
+    if len(result
+  ttft 5701.4ms  prefill 7.72 tok/s  decode 6.98 tok/s  hit 55899/93696 (59.7%)
+
+--- pass 0, prompt 38/50 (iter 38/50) ---
+  in:  Respond with only a single Python markdown code block containing a circular buffer class with push and pop methods. Do not include any text before or after the code block. Do not include comments inside the code.
+  out:  The class should have a constructor that takes a capacity parameter. The buffer should be able to hold up to capacity elements. When the buffer is full, pushing a new element should overwrite the oldest element. The push method should return the element that was evicted, if any. The pop method should return the oldest element in the buffer, or None if the buffer is empty. The class should be named CircularBuffer.
+
+```python
+class CircularBuffer:
+    def __init__(self, capacity):
+        self.capacity = capacity
+        self.buffer = [None] * capacity
+        self.head = 0
+        self.tail = 0
+        self.size = 0
+
+    def push(self, item):
+        if self.size == self.capacity:
+            evicted = self.buffer[self.head]
+            self.buffer[self.head] = item
+            self.head = (self.head + 1) % self.capacity
+            self.tail = (self.tail + 1) % self.capacity
+           
+  ttft 5270.0ms  prefill 7.59 tok/s  decode 7.13 tok/s  hit 54917/92160 (59.6%)
+
+--- pass 0, prompt 39/50 (iter 39/50) ---
+  in:  Respond with only a single Python markdown code block containing a function that computes the edit distance between two strings. Do not include any text before or after the code block. Do not include comments inside the code.
+  out:  The function should be named `edit_distance` and take two parameters, `s1` and `s2`. The function should return the minimum number of operations (insert, delete, replace) required to convert `s1` into `s2`.
+
+```python
+def edit_distance(s1, s2):
+    m, n = len(s1), len(s2)
+    dp = [[0]*(n+1) for _ in range(m+1)]
+    for i in range(m+1):
+        dp[i][0] = i
+    for j in range(n+1):
+        dp[0][j] = j
+    for i in range(1, m+1):
+        for j in range(1, n+1):
+            if s1[i-1] == s2[j-1]:
+                dp[i][j] = dp[i-1][j-1]
+            else:
+                dp[i][j] = 1 + min
+  ttft 5251.9ms  prefill 7.81 tok/s  decode 6.48 tok/s  hit 51323/92544 (55.5%)
+
+--- pass 0, prompt 40/50 (iter 40/50) ---
+  in:  Respond with only a single Python markdown code block containing a singly linked list class with insert and delete methods. Do not include any text before or after the code block. Do not include comments inside the code.
+  out:  Do not use any external libraries. The insert method should insert a new node at the beginning of the list. The delete method should delete the first occurrence of a value in the list. The class should have a head attribute that points to the first node.
+
+```python
+class Node:
+    def __init__(self, data):
+        self.data = data
+        self.next = None
+
+class LinkedList:
+    def __init__(self):
+        self.head = None
+
+    def insert(self, data):
+        new_node = Node(data)
+        new_node.next = self.head
+        self.head = new_node
+
+    def delete(self, data):
+        if self.head is None:
+            return
+        if self.head.data == data:
+            self.head = self.head.next
+            return
+        current = self.head
+        while current.next:
+            if current.next.data == data:
+                current.next = current.next.next
+                return
+            current = current.next
+```
+
+```python
+
+  ttft 5136.3ms  prefill 7.98 tok/s  decode 7.25 tok/s  hit 55750/92544 (60.2%)
+  [pin refresh after prompt 40: top-17/layer, +100.62 MiB uploaded, -100.62 MiB evicted]
+
+--- pass 0, prompt 41/50 (iter 41/50) ---
+  in:  Respond with only a single Python markdown code block containing a function that counts the number of set bits in an integer. Do not include any text before or after the code block. Do not include comments inside the code.
+  out:  The function must be named `count_set_bits` and take a single argument `n`. The function must not use any built-in functions for counting bits. The function must be efficient and handle large integers.
+
+```python
+def count_set_bits(n):
+    count = 0
+    while n:
+        n &= n - 1
+        count += 1
+    return count
+```
+
+Okay, I need to write a Python function called count_set_bits that counts the number of set bits (1s) in an integer n. And I can't use any built-in functions for counting bits. Hmm, right.
+
+Wait, the user said the function must not use any built-in functions for counting bits. So things like bin(n).count('1') are out of the question. Right, because that's using a built-in method. So I need to find another way.
+
+What's an efficient way to count the set bits without using built-ins? Oh right, there's the
+  ttft 5419.0ms  prefill 7.93 tok/s  decode 6.57 tok/s  hit 51887/93312 (55.6%)
+
+--- pass 0, prompt 42/50 (iter 42/50) ---
+  in:  Respond with only a single Python markdown code block containing a function that generates all permutations of a string. Do not include any text before or after the code block. Do not include comments inside the code.
+  out:  The function must be named `generate_permutations` and must take a single parameter `s` which is the input string. The function must return a list of strings. The code must not use any external libraries. The code must not use recursion. The code must not use `itertools`. The code must not use `itertools.permutations`. The code must not use `itertools.product`. The code must not use `itertools.chain`. The code must not use `itertools.islice`. The code must not use `itertools.accumulate`. The code must not use `itertools.combinations`. The code must not use `itertools.combinations_with_replacement`. The code must not use `itertools.dropwhile`. The code must not use `itertools.filterfalse`. The code must not use `itertools.groupby`. The code must not use `itertools.islice`. The code must not use `itertools.tee`. The code must not use `itertools.zip
+  ttft 5135.8ms  prefill 7.79 tok/s  decode 7.31 tok/s  hit 56516/92160 (61.3%)
+
+--- pass 0, prompt 43/50 (iter 43/50) ---
+  in:  Respond with only a single Python markdown code block containing a basic calculator function that evaluates an expression with plus minus times and divide. Do not include any text before or after the code block. Do not include comments inside the code.
+  out:  The function should be called calculate and take a string as input. The function should return the result as a float. The calculator should handle operator precedence and parentheses. The code should not use any external libraries. The code should not use the built-in eval() function.
+
+Okay, I need to create a Python function called calculate that takes a string expression and evaluates it with +, -, *, /, handling operator precedence and parentheses without using eval() or external libraries. Hmm, how to approach this?
+
+First, I remember that parsing expressions with operator precedence usually involves converting the infix notation to postfix (Reverse Polish Notation) using the Shunting Yard algorithm. Then evaluating the postfix expression. But implementing that from scratch might be complex.
+
+Alternatively, maybe I can parse the expression step by step, handling parentheses first. But recursion might be needed for parentheses. Let me think.
+
+So the steps could be:
+
+1. Parse the expression, handling parentheses by recursively evaluating the innermost parentheses first.
+2. Once parentheses
+  ttft 6062.3ms  prefill 7.42 tok/s  decode 6.66 tok/s  hit 53493/94080 (56.9%)
+
+--- pass 0, prompt 44/50 (iter 44/50) ---
+  in:  Respond with only a single Python markdown code block containing a function that computes the sum of the digits of an integer. Do not include any text before or after the code block. Do not include comments inside the code.
+  out:  The function must be named `sum_digits` and take a single parameter `n`. The function must not use any string operations. The function must not use any loops. The function must not use any recursion. The function must not use any built-in functions for converting to a string. The function must not use any built-in functions for converting to a list. The function must not use any built-in functions for converting to a number. The function must not use any built-in functions for mathematical operations (e.g., `abs`, `divmod`, etc.). The function must not use any built-in functions for mathematical operations (e.g., `abs`, `divmod`, etc.). The function must not use any built-in functions for mathematical operations (e.g., `abs`, `divmod`, etc.). The function must not use any built-in functions for mathematical operations (e.g., `abs`, `divmod`, etc.). The function must not use any built-in functions for mathematical operations (
+  ttft 5494.2ms  prefill 7.83 tok/s  decode 7.11 tok/s  hit 57388/93312 (61.5%)
+
+--- pass 0, prompt 45/50 (iter 45/50) ---
+  in:  Respond with only a single Python markdown code block containing a doubly linked list class with insert and delete methods. Do not include any text before or after the code block. Do not include comments inside the code.
+  out:  Do not use any external libraries. Do not use any built-in data structures. Do not use any functions or methods other than the ones required for the doubly linked list.
+
+```python
+class Node:
+    def __init__(self, data):
+        self.data = data
+        self.prev = None
+        self.next = None
+
+class DoublyLinkedList:
+    def __init__(self):
+        self.head = None
+        self.tail = None
+
+    def insert(self, data):
+        new_node = Node(data)
+        if self.head is None:
+            self.head = new_node
+            self.tail = new_node
+        else:
+            new_node.prev = self.tail
+            self.tail.next = new_node
+            self.tail = new_node
+
+    def delete(self, data):
+        current = self.head
+        while current:
+            if current.data == data:
+                if current.prev:
+                    current.prev.next = current.next
+                else:
+                    self.head = current.next
+               
+  ttft 5497.0ms  prefill 7.46 tok/s  decode 7.10 tok/s  hit 55387/92544 (59.8%)
+  [pin refresh after prompt 45: top-17/layer, +114.82 MiB uploaded, -112.89 MiB evicted]
+
+--- pass 0, prompt 46/50 (iter 46/50) ---
+  in:  Respond with only a single Python markdown code block containing a function that finds the intersection of two lists. Do not include any text before or after the code block. Do not include comments inside the code.
+  out:  The function should be named `find_intersection` and take two parameters, `list1` and `list2`. The function should return a list containing the elements that are present in both lists, without duplicates, and in the order they appear in `list1`.
+
+```python
+def find_intersection(list1, list2):
+    seen = set()
+    result = []
+    for item in list1:
+        if item in list2 and item not in seen:
+            seen.add(item)
+            result.append(item)
+    return result
+```
+
+```python
+def find_intersection(list1, list2):
+    seen = set()
+    result = []
+    for item in list1:
+        if item in list2 and item not in seen:
+            seen.add(item)
+            result.append(item)
+    return result
+``` ```python
+def find_intersection(list1, list2):
+    seen = set()
+    result = []
+    for item in list1:
+        if item in list2 and item
+  ttft 5232.1ms  prefill 7.65 tok/s  decode 6.75 tok/s  hit 54613/92160 (59.3%)
+
+--- pass 0, prompt 47/50 (iter 47/50) ---
+  in:  Respond with only a single Python markdown code block containing a hash map class implemented with chaining. Do not include any text before or after the code block. Do not include comments inside the code.
+  out:  Do not use any external libraries. The hash map should support the following operations: insert, delete, get, and contains. The hash map should have a default capacity of 10 and a load factor threshold of 0.7. When the load factor exceeds the threshold, the hash map should automatically resize. The hash map should use a simple hash function (e.g., Python's built-in hash function) and handle collisions with chaining. The hash map should have a method to return the size of the hash map. The hash map should have a method to return the current capacity. The hash map should have a method to return the current load factor. The hash map should have a method to return the number of buckets. The hash map should have a method to return the number of entries. The hash map should have a method to return the number of collisions. The hash map should have a method to return the average number of elements per bucket. The hash map should have a method to return
+  ttft 4866.8ms  prefill 7.81 tok/s  decode 7.43 tok/s  hit 57045/91392 (62.4%)
+
+--- pass 0, prompt 48/50 (iter 48/50) ---
+  in:  Respond with only a single Python markdown code block containing a function that computes factorial recursively. Do not include any text before or after the code block. Do not include comments inside the code.
+  out:  Do not use any loops. The function must be named `factorial`.
+
+```python
+def factorial(n):
+    return 1 if n <= 1 else n * factorial(n-1)
+``` 
+
+Wait, I need to make sure that the function is correctly handling the base case and the recursive case. Let me test it with some examples. For n=0, it should return 1. For n=1, it should return 1. For n=5, it should return 120. Let me check the code again. Yes, when n is 0 or 1, it returns 1. For higher values, it multiplies n with factorial(n-1). So the code is correct. I think this should work.
+```python
+def factorial(n):
+    return 1 if n <= 1 else n * factorial(n-1)
+``` 
+
+I need to make sure that the function is correctly handling the base case and the recursive case. Let
+  ttft 4705.9ms  prefill 7.86 tok/s  decode 6.23 tok/s  hit 48373/91008 (53.2%)
+
+--- pass 0, prompt 49/50 (iter 49/50) ---
+  in:  Respond with only a single Python markdown code block containing a function that checks whether a binary tree is height balanced. Do not include any text before or after the code block. Do not include comments inside the code.
+  out:  The function should be named `is_balanced` and take a single argument `root` which is the root node of the binary tree. The binary tree nodes have a `left` and `right` attribute, and a `val` attribute. The function should return a boolean indicating whether the tree is height balanced.
+
+```python
+class TreeNode:
+    def __init__(self, val=0, left=None, right=None):
+        self.val = val
+        self.left = left
+        self.right = right
+
+def is_balanced(root):
+    def height(node):
+        if not node:
+            return 0
+        left = height(node.left)
+        right = height(node.right)
+        return 1 + max(left, right)
+    if not root:
+        return True
+    left_height = height(root.left)
+    right_height = height(root.right)
+    if abs(left_height - right_height) > 1:
+        return False
+    return is_balanced(root.left)
+  ttft 5305.0ms  prefill 7.92 tok/s  decode 6.81 tok/s  hit 54888/92928 (59.1%)
+
+--- pass 0, prompt 50/50 (iter 50/50) ---
+  in:  Respond with only a single Python markdown code block containing a function that performs depth first search on a binary tree recursively. Do not include any text before or after the code block. Do not include comments inside the code.
+  out:  The function should take the root node and a target value as parameters. The function should return the node with the target value if found, else return None. The node has a value, left, and right attribute.
+
+```python
+def dfs(root, target):
+    if root is None:
+        return None
+    if root.value == target:
+        return root
+    left = dfs(root.left, target)
+    if left is not None:
+        return left
+    return dfs(root.right, target)
+``` ```python
+def dfs(root, target):
+    if root is None:
+        return None
+    if root.value == target:
+        return root
+    left = dfs(root.left, target)
+    if left is not None:
+        return left
+    return dfs(root.right, target)
+``` ```python
+def dfs(root, target):
+    if root is None:
+        return None
+    if root.value == target:
+        return root
+    left = dfs(root.left, target)
+
+  ttft 5473.8ms  prefill 7.86 tok/s  decode 7.00 tok/s  hit 55010/93312 (59.0%)
+  [pin refresh after prompt 50: top-17/layer, +69.47 MiB uploaded, -68.70 MiB evicted]
+
+=== SUMMARY (profiled mode) ===
+prompts run:        50 (50 prompts x 1 passes)
+overall hit rate:   2813526 / 4639488 (60.64%)
+evictions:          1824850
+resident at end:    1112 / 1112 capacity
+reactive H2D:       5000154.43 MiB in 540713 calls
+pin-refresh upload: 2332.97 MiB in 280 calls
+dequant bytes:      22439.794 GiB
+kernel launches:    7599578 total
+VRAM peak used:     5634.5 MiB
+VRAM now used:      5442 / 6140 MiB (698 free — no oversubscription if free > 0)
+
+=== FIRST-N vs LAST-N (within the 50-prompt sequence) ===
+first 25 prompts: hit rate 62.4%  mean decode 6.72 tok/s
+last  25 prompts: hit rate 58.8%  mean decode 6.93 tok/s
+first 5 prompts: hit rate 75.3%  mean decode 5.91 tok/s
+last  5 prompts: hit rate 58.6%  mean decode 6.84 tok/s
+
+=== PREDICTOR (N+1 / N+2 cross-layer transition + prefetch) ===
+candidates: M1=12 M2=8  upload caps: 6/2 per layer
+pass 0: N+1 recall@12 61.5% (2788230/4530800)  N+2 recall@8 48.5% (2150097/4434400)
+        spec uploads 192421 (527920.9 MiB), used-same-token 83900 (precision 43.6%)
+
+wrote build/bench50/route_trace.jsonl, per_token.csv, pins_log.jsonl, summary.json

@@ -13,6 +13,12 @@ build/*.log
 build/**/*.log
 build/fixtures/
 
+# Raw route traces are large (tens-hundreds of MB) and regeneratable from the
+# exact bench50 command in the commit message; keep only compressed archives.
+build/bench50/route_trace.jsonl
+build/bench50/route_trace_warm.jsonl
+build/bench50/**/route_trace.jsonl
+
 # Local diagnostics and editor state
 debug_full.log
 .vs/

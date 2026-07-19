@@ -125,6 +125,63 @@ static const char* kPromptsPython10[10] = {
     "Respond with only a single Python markdown code block containing a function that implements bubble sort on a list. Do not include any text before or after the code block. Do not include comments inside the code.",
 };
 
+// All-Python, 50-prompt corpus (extends kPromptsPython10 verbatim as the
+// first 10) for the full route-trace data collection: 50 distinct concise
+// tasks across sorting, searching, graphs, trees, strings, math, and data
+// structures, all phrased for a single clean code block.
+static const char* kPromptsPython50[50] = {
+    "Respond with only a single Python markdown code block containing a function that sorts a list using quicksort. Do not include any text before or after the code block. Do not include comments inside the code.",
+    "Respond with only a single Python markdown code block containing a function that reverses a singly linked list. Do not include any text before or after the code block. Do not include comments inside the code.",
+    "Respond with only a single Python markdown code block containing a function that checks whether a string is a palindrome. Do not include any text before or after the code block. Do not include comments inside the code.",
+    "Respond with only a single Python markdown code block containing a function that computes the nth Fibonacci number iteratively. Do not include any text before or after the code block. Do not include comments inside the code.",
+    "Respond with only a single Python markdown code block containing a stack class implemented using a list. Do not include any text before or after the code block. Do not include comments inside the code.",
+    "Respond with only a single Python markdown code block containing a function that performs breadth first search on a graph given as an adjacency list. Do not include any text before or after the code block. Do not include comments inside the code.",
+    "Respond with only a single Python markdown code block containing a simple LRU cache class with get and put methods. Do not include any text before or after the code block. Do not include comments inside the code.",
+    "Respond with only a single Python markdown code block containing a function that performs binary search on a sorted list. Do not include any text before or after the code block. Do not include comments inside the code.",
+    "Respond with only a single Python markdown code block containing a function that implements merge sort on a list of integers. Do not include any text before or after the code block. Do not include comments inside the code.",
+    "Respond with only a single Python markdown code block containing a function that implements bubble sort on a list. Do not include any text before or after the code block. Do not include comments inside the code.",
+    "Respond with only a single Python markdown code block containing a function that performs depth first search on a graph given as an adjacency list. Do not include any text before or after the code block. Do not include comments inside the code.",
+    "Respond with only a single Python markdown code block containing a function that implements selection sort on a list. Do not include any text before or after the code block. Do not include comments inside the code.",
+    "Respond with only a single Python markdown code block containing a function that implements insertion sort on a list. Do not include any text before or after the code block. Do not include comments inside the code.",
+    "Respond with only a single Python markdown code block containing a function that checks whether a number is prime. Do not include any text before or after the code block. Do not include comments inside the code.",
+    "Respond with only a single Python markdown code block containing a function that computes the greatest common divisor of two integers. Do not include any text before or after the code block. Do not include comments inside the code.",
+    "Respond with only a single Python markdown code block containing a function that computes the least common multiple of two integers. Do not include any text before or after the code block. Do not include comments inside the code.",
+    "Respond with only a single Python markdown code block containing a function that counts the vowels in a string. Do not include any text before or after the code block. Do not include comments inside the code.",
+    "Respond with only a single Python markdown code block containing a function that reverses a string in place. Do not include any text before or after the code block. Do not include comments inside the code.",
+    "Respond with only a single Python markdown code block containing a function that checks whether two strings are anagrams. Do not include any text before or after the code block. Do not include comments inside the code.",
+    "Respond with only a single Python markdown code block containing a function that finds the longest common prefix among a list of strings. Do not include any text before or after the code block. Do not include comments inside the code.",
+    "Respond with only a single Python markdown code block containing a function that removes duplicates from a sorted list. Do not include any text before or after the code block. Do not include comments inside the code.",
+    "Respond with only a single Python markdown code block containing a function that finds the maximum subarray sum using Kadane's algorithm. Do not include any text before or after the code block. Do not include comments inside the code.",
+    "Respond with only a single Python markdown code block containing a queue class implemented using two stacks. Do not include any text before or after the code block. Do not include comments inside the code.",
+    "Respond with only a single Python markdown code block containing a function that performs inorder traversal of a binary tree. Do not include any text before or after the code block. Do not include comments inside the code.",
+    "Respond with only a single Python markdown code block containing a function that detects a cycle in a singly linked list. Do not include any text before or after the code block. Do not include comments inside the code.",
+    "Respond with only a single Python markdown code block containing a min-heap class with push and pop methods. Do not include any text before or after the code block. Do not include comments inside the code.",
+    "Respond with only a single Python markdown code block containing a function that flattens a nested list. Do not include any text before or after the code block. Do not include comments inside the code.",
+    "Respond with only a single Python markdown code block containing a function that converts a decimal integer to its binary string representation. Do not include any text before or after the code block. Do not include comments inside the code.",
+    "Respond with only a single Python markdown code block containing a function that sorts a list containing only 0s 1s and 2s in place. Do not include any text before or after the code block. Do not include comments inside the code.",
+    "Respond with only a single Python markdown code block containing a function that finds the missing number in a list containing n distinct numbers from 0 to n. Do not include any text before or after the code block. Do not include comments inside the code.",
+    "Respond with only a single Python markdown code block containing a function that rotates a list by k positions. Do not include any text before or after the code block. Do not include comments inside the code.",
+    "Respond with only a single Python markdown code block containing a trie class with insert and search methods. Do not include any text before or after the code block. Do not include comments inside the code.",
+    "Respond with only a single Python markdown code block containing a function that validates balanced parentheses in a string. Do not include any text before or after the code block. Do not include comments inside the code.",
+    "Respond with only a single Python markdown code block containing a function that computes the nth Catalan number. Do not include any text before or after the code block. Do not include comments inside the code.",
+    "Respond with only a single Python markdown code block containing a function that finds the kth largest element in an unsorted list. Do not include any text before or after the code block. Do not include comments inside the code.",
+    "Respond with only a single Python markdown code block containing a function that implements Dijkstra's shortest path algorithm on a weighted graph. Do not include any text before or after the code block. Do not include comments inside the code.",
+    "Respond with only a single Python markdown code block containing a function that performs topological sort on a directed acyclic graph. Do not include any text before or after the code block. Do not include comments inside the code.",
+    "Respond with only a single Python markdown code block containing a circular buffer class with push and pop methods. Do not include any text before or after the code block. Do not include comments inside the code.",
+    "Respond with only a single Python markdown code block containing a function that computes the edit distance between two strings. Do not include any text before or after the code block. Do not include comments inside the code.",
+    "Respond with only a single Python markdown code block containing a singly linked list class with insert and delete methods. Do not include any text before or after the code block. Do not include comments inside the code.",
+    "Respond with only a single Python markdown code block containing a function that counts the number of set bits in an integer. Do not include any text before or after the code block. Do not include comments inside the code.",
+    "Respond with only a single Python markdown code block containing a function that generates all permutations of a string. Do not include any text before or after the code block. Do not include comments inside the code.",
+    "Respond with only a single Python markdown code block containing a basic calculator function that evaluates an expression with plus minus times and divide. Do not include any text before or after the code block. Do not include comments inside the code.",
+    "Respond with only a single Python markdown code block containing a function that computes the sum of the digits of an integer. Do not include any text before or after the code block. Do not include comments inside the code.",
+    "Respond with only a single Python markdown code block containing a doubly linked list class with insert and delete methods. Do not include any text before or after the code block. Do not include comments inside the code.",
+    "Respond with only a single Python markdown code block containing a function that finds the intersection of two lists. Do not include any text before or after the code block. Do not include comments inside the code.",
+    "Respond with only a single Python markdown code block containing a hash map class implemented with chaining. Do not include any text before or after the code block. Do not include comments inside the code.",
+    "Respond with only a single Python markdown code block containing a function that computes factorial recursively. Do not include any text before or after the code block. Do not include comments inside the code.",
+    "Respond with only a single Python markdown code block containing a function that checks whether a binary tree is height balanced. Do not include any text before or after the code block. Do not include comments inside the code.",
+    "Respond with only a single Python markdown code block containing a function that performs depth first search on a binary tree recursively. Do not include any text before or after the code block. Do not include comments inside the code.",
+};
+
 // ---- Route predictor: cross-layer transitions (N+1, N+2) + within-layer
 // co-occurrence, learned online from live routes and optionally warm-loaded
 // from a previous run's route_trace.jsonl. Checklist refs: D (cross-layer
@@ -307,6 +364,10 @@ int main(int argc, char** argv) {
   if (corpus == "python10") {
     corpus_arr = kPromptsPython10;
     corpus_size = 10;
+    if (num_prompts > corpus_size) num_prompts = corpus_size;
+  } else if (corpus == "python50") {
+    corpus_arr = kPromptsPython50;
+    corpus_size = 50;
     if (num_prompts > corpus_size) num_prompts = corpus_size;
   }
   int total_iters = num_prompts * passes;
