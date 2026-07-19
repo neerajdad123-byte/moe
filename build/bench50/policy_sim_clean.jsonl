@@ -1,0 +1,37 @@
+{"name": "lru_no_pin", "hit_pct": 64.38, "evictions": 1651497, "category": "BASELINE"}
+{"name": "pin_k40_every10p [HOT]", "hit_pct": 62.81, "evictions": 1724237, "category": "HOT"}
+{"name": "pin_k40_every1p [HOT]", "hit_pct": 62.26, "evictions": 1749896, "category": "HOT"}
+{"name": "pin_k12_every10p [HOT]", "hit_pct": 62.12, "evictions": 1756300, "category": "HOT"}
+{"name": "pin_k40_every5p [HOT]", "hit_pct": 61.98, "evictions": 1762923, "category": "HOT"}
+{"name": "jaccard_budget40_theta0.15_every5p [CLUSTER]", "hit_pct": 61.98, "evictions": 1762923, "category": "CLUSTER"}
+{"name": "jaccard_budget40_theta0.25_every5p [CLUSTER]", "hit_pct": 61.98, "evictions": 1762923, "category": "CLUSTER"}
+{"name": "pin_k12_every1p [HOT]", "hit_pct": 61.7, "evictions": 1776037, "category": "HOT"}
+{"name": "pin_k12_every5p [HOT]", "hit_pct": 61.68, "evictions": 1776873, "category": "HOT"}
+{"name": "cluster_core27_mates15_every5p [CLUSTER]", "hit_pct": 61.3, "evictions": 1794217, "category": "CLUSTER"}
+{"name": "pin_k17_every10p [HOT]", "hit_pct": 60.34, "evictions": 1838938, "category": "HOT"}
+{"name": "cluster_core27_mates5_every5p [CLUSTER]", "hit_pct": 59.76, "evictions": 1866038, "category": "CLUSTER"}
+{"name": "pin_k17_every1p [HOT]", "hit_pct": 59.55, "evictions": 1875586, "category": "HOT"}
+{"name": "replica_pin17_every5prompts", "hit_pct": 59.49, "evictions": 1878287, "category": "BASELINE"}
+{"name": "pin_k17_every5p [HOT]", "hit_pct": 59.49, "evictions": 1878287, "category": "HOT"}
+{"name": "lift_core27_mates15_every5p [CLUSTER]", "hit_pct": 59.44, "evictions": 1880486, "category": "CLUSTER"}
+{"name": "cluster_core17_mates15_every5p [CLUSTER]", "hit_pct": 59.21, "evictions": 1891242, "category": "CLUSTER"}
+{"name": "cluster_core12_mates5_every5p [CLUSTER]", "hit_pct": 58.82, "evictions": 1909462, "category": "CLUSTER"}
+{"name": "jaccard_budget17_theta0.15_every5p [CLUSTER]", "hit_pct": 58.31, "evictions": 1932983, "category": "CLUSTER"}
+{"name": "pin_k27_every10p [HOT]", "hit_pct": 58.26, "evictions": 1935611, "category": "HOT"}
+{"name": "lift_core27_mates5_every5p [CLUSTER]", "hit_pct": 58.07, "evictions": 1944101, "category": "CLUSTER"}
+{"name": "jaccard_budget17_theta0.25_every5p [CLUSTER]", "hit_pct": 57.71, "evictions": 1960748, "category": "CLUSTER"}
+{"name": "lift_core12_mates5_every5p [CLUSTER]", "hit_pct": 57.16, "evictions": 1986309, "category": "CLUSTER"}
+{"name": "pin_k27_every5p [HOT]", "hit_pct": 57.03, "evictions": 1992338, "category": "HOT"}
+{"name": "pin_k27_every1p [HOT]", "hit_pct": 56.72, "evictions": 2007014, "category": "HOT"}
+{"name": "cluster_core12_mates15_every5p [CLUSTER]", "hit_pct": 55.93, "evictions": 2043504, "category": "CLUSTER"}
+{"name": "jaccard_budget27_theta0.25_every5p [CLUSTER]", "hit_pct": 55.39, "evictions": 2068526, "category": "CLUSTER"}
+{"name": "jaccard_budget27_theta0.15_every5p [CLUSTER]", "hit_pct": 55.31, "evictions": 2072330, "category": "CLUSTER"}
+{"name": "lfu_global", "hit_pct": 53.82, "evictions": 2141453, "category": "BASELINE"}
+{"name": "ema_hotness_decay1e-3", "hit_pct": 53.82, "evictions": 2141453, "category": "BASELINE"}
+{"name": "ema_hotness_decay1e-4", "hit_pct": 53.82, "evictions": 2141453, "category": "BASELINE"}
+{"name": "lift_core17_mates15_every5p [CLUSTER]", "hit_pct": 51.98, "evictions": 2226701, "category": "CLUSTER"}
+{"name": "cluster_core17_mates5_every5p [CLUSTER]", "hit_pct": 51.89, "evictions": 2231057, "category": "CLUSTER"}
+{"name": "lift_core17_mates5_every5p [CLUSTER]", "hit_pct": 48.39, "evictions": 2393340, "category": "CLUSTER"}
+{"name": "lift_core12_mates15_every5p [CLUSTER]", "hit_pct": 45.87, "evictions": 2510162, "category": "CLUSTER"}
+{"name": "belady_oracle_upper_bound [ORACLE]", "hit_pct": 83.19, "evictions": 778639, "category": "ORACLE"}
+{"name": "hybrid_lru_lfu", "hit_pct": 53.82, "evictions": 2141453, "category": "BASELINE"}

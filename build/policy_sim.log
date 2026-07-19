@@ -1,0 +1,103 @@
+loading build/bench50/route_trace.jsonl ...
+  579936 layer-touches, 4639488 key-touches, loaded in 2.1s
+capacity = 1112 (matches real GPU arena)
+
+=== A. Baselines (individual-expert hotness, no cluster awareness) ===
+  lru_no_pin                         hit  64.38%   evictions   1651497   (0.8s)
+  lfu_global                         hit  53.82%   evictions   2141453   (9.1s)
+  ema_hotness_decay1e-3              hit  53.82%   evictions   2141453   (12.0s)
+  ema_hotness_decay1e-4              hit  53.82%   evictions   2141453   (11.5s)
+  hybrid_lru_lfu                     hit   1.79%   evictions   4555286   (6.1s)
+
+=== B. Real-C++-policy replica (validation) ===
+  (total_tokens=12082, ~241.6/prompt, pin_every_tokens~=1208 approximates 'every 5 prompts')
+  replica_pin17_every5prompts        hit  59.49%   evictions   1878287   (46.7s)
+
+=== C. Pin hyperparameter sweep (frequency-core only -- 'hot experts') ===
+  pin_k12_every1p [HOT]              hit  61.70%   evictions   1776037   (42.0s)
+  pin_k12_every5p [HOT]              hit  61.68%   evictions   1776873   (41.2s)
+  pin_k12_every10p [HOT]             hit  62.12%   evictions   1756300   (39.3s)
+  pin_k17_every1p [HOT]              hit  59.55%   evictions   1875586   (80.6s)
+  pin_k17_every5p [HOT]              hit  59.49%   evictions   1878287   (73.3s)
+  pin_k17_every10p [HOT]             hit  60.34%   evictions   1838938   (64.4s)
+  pin_k27_every1p [HOT]              hit  56.72%   evictions   2007014   (155.8s)
+  pin_k27_every5p [HOT]              hit  57.03%   evictions   1992338   (137.6s)
+  pin_k27_every10p [HOT]             hit  58.26%   evictions   1935611   (125.3s)
+  pin_k40_every1p [HOT]              hit  62.26%   evictions   1749896   (122.3s)
+  pin_k40_every5p [HOT]              hit  61.98%   evictions   1762923   (115.3s)
+  pin_k40_every10p [HOT]             hit  62.81%   evictions   1724237   (97.5s)
+
+=== D. Cluster core + raw co-occurrence mates ('travels with the core') ===
+  cluster_core12_mates5_every5p [CLUSTER] hit  58.82%   evictions   1909462   (65.2s)
+  cluster_core12_mates15_every5p [CLUSTER] hit  55.93%   evictions   2043504   (145.5s)
+  cluster_core17_mates5_every5p [CLUSTER] hit  51.89%   evictions   2231057   (151.9s)
+  cluster_core17_mates15_every5p [CLUSTER] hit  59.21%   evictions   1891242   (136.7s)
+  cluster_core27_mates5_every5p [CLUSTER] hit  59.76%   evictions   1866038   (133.9s)
+  cluster_core27_mates15_every5p [CLUSTER] hit  61.30%   evictions   1794217   (114.9s)
+
+=== E. Cluster core + LIFT-normalized mates (filters out pairs that
+     only look 'together' because both are independently hot) ===
+  lift_core12_mates5_every5p [CLUSTER] hit  57.16%   evictions   1986309   (83.2s)
+  lift_core12_mates15_every5p [CLUSTER] hit  45.87%   evictions   2510162   (183.5s)
+  lift_core17_mates5_every5p [CLUSTER] hit  48.39%   evictions   2393340   (150.1s)
+  lift_core17_mates15_every5p [CLUSTER] hit  51.98%   evictions   2226701   (145.5s)
+  lift_core27_mates5_every5p [CLUSTER] hit  58.07%   evictions   1944101   (128.4s)
+  lift_core27_mates15_every5p [CLUSTER] hit  59.44%   evictions   1880486   (128.5s)
+
+=== F. Jaccard-similarity greedy clustering (checklist H --
+     pin whole discovered clusters, not individually-ranked experts) ===
+  jaccard_budget17_theta0.15_every5p [CLUSTER] hit  58.31%   evictions   1932983   (85.7s)
+  jaccard_budget17_theta0.25_every5p [CLUSTER] hit  57.71%   evictions   1960748   (87.6s)
+  jaccard_budget27_theta0.15_every5p [CLUSTER] hit  55.31%   evictions   2072330   (149.0s)
+  jaccard_budget27_theta0.25_every5p [CLUSTER] hit  55.39%   evictions   2068526   (148.1s)
+  jaccard_budget40_theta0.15_every5p [CLUSTER] hit  61.98%   evictions   1762923   (125.1s)
+  jaccard_budget40_theta0.25_every5p [CLUSTER] hit  61.98%   evictions   1762923   (125.8s)
+
+=== G. Oracle upper bound (NOT achievable online -- future-informed) ===
+  belady_oracle_upper_bound [ORACLE] hit  22.05%   evictions   3615209   (11.6s)
+
+=== RANKED (excluding oracle) ===
+   64.38%  lru_no_pin
+   62.81%  pin_k40_every10p [HOT]
+   62.26%  pin_k40_every1p [HOT]
+   62.12%  pin_k12_every10p [HOT]
+   61.98%  pin_k40_every5p [HOT]
+   61.98%  jaccard_budget40_theta0.15_every5p [CLUSTER]
+   61.98%  jaccard_budget40_theta0.25_every5p [CLUSTER]
+   61.70%  pin_k12_every1p [HOT]
+   61.68%  pin_k12_every5p [HOT]
+   61.30%  cluster_core27_mates15_every5p [CLUSTER]
+   60.34%  pin_k17_every10p [HOT]
+   59.76%  cluster_core27_mates5_every5p [CLUSTER]
+   59.55%  pin_k17_every1p [HOT]
+   59.49%  replica_pin17_every5prompts
+   59.49%  pin_k17_every5p [HOT]
+   59.44%  lift_core27_mates15_every5p [CLUSTER]
+   59.21%  cluster_core17_mates15_every5p [CLUSTER]
+   58.82%  cluster_core12_mates5_every5p [CLUSTER]
+   58.31%  jaccard_budget17_theta0.15_every5p [CLUSTER]
+   58.26%  pin_k27_every10p [HOT]
+   58.07%  lift_core27_mates5_every5p [CLUSTER]
+   57.71%  jaccard_budget17_theta0.25_every5p [CLUSTER]
+   57.16%  lift_core12_mates5_every5p [CLUSTER]
+   57.03%  pin_k27_every5p [HOT]
+   56.72%  pin_k27_every1p [HOT]
+   55.93%  cluster_core12_mates15_every5p [CLUSTER]
+   55.39%  jaccard_budget27_theta0.25_every5p [CLUSTER]
+   55.31%  jaccard_budget27_theta0.15_every5p [CLUSTER]
+   53.82%  lfu_global
+   53.82%  ema_hotness_decay1e-3
+   53.82%  ema_hotness_decay1e-4
+   51.98%  lift_core17_mates15_every5p [CLUSTER]
+   51.89%  cluster_core17_mates5_every5p [CLUSTER]
+   48.39%  lift_core17_mates5_every5p [CLUSTER]
+   45.87%  lift_core12_mates15_every5p [CLUSTER]
+    1.79%  hybrid_lru_lfu
+
+=== HOT-EXPERT best vs CLUSTER-AWARE best (the core question) ===
+  best individual-hotness policy: 64.38%  (lru_no_pin)
+  best cluster-aware policy:      61.98%  (jaccard_budget40_theta0.15_every5p [CLUSTER])
+  delta: -2.40 percentage points
+
+wrote build/bench50/policy_sim_results.json
+total simulation time: 3483.1s

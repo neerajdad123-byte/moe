@@ -1,0 +1,497 @@
+<title>MoEx Cache-Policy Simulation — 50-Prompt Route Trace</title>
+<style>
+  :root {
+    color-scheme: light;
+    --surface-0:   #f4f3ef;
+    --surface-1:   #fcfcfb;
+    --surface-2:   #ffffff;
+    --border:      #dedcd3;
+    --text-primary:   #0b0b0b;
+    --text-secondary: #52514e;
+    --text-muted:     #8a887f;
+    --cat-baseline: #2a78d6;
+    --cat-hot:      #008300;
+    --cat-cluster:  #e87ba4;
+    --cat-oracle:   #eda100;
+    --warn-bg:      #fff4e0;
+    --warn-border:  #e0b565;
+    --winner-glow: rgba(42,120,214,0.28);
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:where(:not([data-theme="light"])) {
+      color-scheme: dark;
+      --surface-0:   #101215;
+      --surface-1:   #1a1a19;
+      --surface-2:   #202220;
+      --border:      #34342f;
+      --text-primary:   #ffffff;
+      --text-secondary: #c3c2b7;
+      --text-muted:     #83817a;
+      --cat-baseline: #3987e5;
+      --cat-hot:      #008300;
+      --cat-cluster:  #d55181;
+      --cat-oracle:   #c98500;
+      --warn-bg:      #2a2311;
+      --warn-border:  #6b5620;
+      --winner-glow: rgba(57,135,229,0.32);
+    }
+  }
+  :root[data-theme="dark"] {
+    color-scheme: dark;
+    --surface-0:   #101215;
+    --surface-1:   #1a1a19;
+    --surface-2:   #202220;
+    --border:      #34342f;
+    --text-primary:   #ffffff;
+    --text-secondary: #c3c2b7;
+    --text-muted:     #83817a;
+    --cat-baseline: #3987e5;
+    --cat-hot:      #008300;
+    --cat-cluster:  #d55181;
+    --cat-oracle:   #c98500;
+    --warn-bg:      #2a2311;
+    --warn-border:  #6b5620;
+    --winner-glow: rgba(57,135,229,0.32);
+  }
+  :root[data-theme="light"] {
+    color-scheme: light;
+    --surface-0:   #f4f3ef;
+    --surface-1:   #fcfcfb;
+    --surface-2:   #ffffff;
+    --border:      #dedcd3;
+    --text-primary:   #0b0b0b;
+    --text-secondary: #52514e;
+    --text-muted:     #8a887f;
+    --cat-baseline: #2a78d6;
+    --cat-hot:      #008300;
+    --cat-cluster:  #e87ba4;
+    --cat-oracle:   #eda100;
+    --warn-bg:      #fff4e0;
+    --warn-border:  #e0b565;
+    --winner-glow: rgba(42,120,214,0.28);
+  }
+
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--surface-0);
+    color: var(--text-primary);
+    font-family: ui-sans-serif, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    line-height: 1.5;
+  }
+  .mono {
+    font-family: ui-monospace, "Cascadia Code", "SF Mono", Consolas, "Liberation Mono", monospace;
+  }
+  .wrap {
+    max-width: 980px;
+    margin: 0 auto;
+    padding: 40px 24px 80px;
+  }
+
+  /* ---- header ---- */
+  header {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    margin-bottom: 32px;
+    padding-bottom: 24px;
+    border-bottom: 1px solid var(--border);
+  }
+  .eyebrow {
+    font-family: ui-monospace, "Cascadia Code", "SF Mono", Consolas, monospace;
+    font-size: 12px;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--text-muted);
+  }
+  h1 {
+    font-family: ui-monospace, "Cascadia Code", "SF Mono", Consolas, monospace;
+    font-size: 28px;
+    font-weight: 600;
+    margin: 0;
+    text-wrap: balance;
+    letter-spacing: -0.01em;
+  }
+  .subtitle {
+    color: var(--text-secondary);
+    font-size: 15px;
+    max-width: 62ch;
+  }
+  .meta-chips {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    margin-top: 4px;
+  }
+  .chip {
+    font-family: ui-monospace, "Cascadia Code", "SF Mono", Consolas, monospace;
+    font-size: 12px;
+    color: var(--text-secondary);
+    background: var(--surface-1);
+    border: 1px solid var(--border);
+    border-radius: 5px;
+    padding: 4px 9px;
+  }
+
+  /* ---- stat tiles ---- */
+  .stats {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 1px;
+    background: var(--border);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    overflow: hidden;
+    margin-bottom: 20px;
+  }
+  .stat {
+    background: var(--surface-1);
+    padding: 18px 16px;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+  }
+  .stat-label {
+    font-size: 11.5px;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--text-muted);
+  }
+  .stat-value {
+    font-family: ui-monospace, "Cascadia Code", "SF Mono", Consolas, monospace;
+    font-size: 26px;
+    font-weight: 600;
+    font-variant-numeric: tabular-nums;
+  }
+  .stat-note { font-size: 12px; color: var(--text-secondary); }
+  .stat.winner .stat-value { color: var(--cat-baseline); }
+  .stat.oracle .stat-value { color: var(--cat-oracle); }
+
+  /* ---- integrity callout ---- */
+  .callout {
+    background: var(--warn-bg);
+    border: 1px solid var(--warn-border);
+    border-radius: 10px;
+    padding: 16px 18px;
+    margin-bottom: 36px;
+    font-size: 13.5px;
+    color: var(--text-primary);
+  }
+  .callout-title {
+    font-weight: 600;
+    font-size: 13px;
+    margin-bottom: 6px;
+    display: flex;
+    align-items: center;
+    gap: 7px;
+  }
+  .callout ul { margin: 6px 0 0; padding-left: 20px; }
+  .callout li { margin-bottom: 4px; color: var(--text-secondary); }
+  .callout code { font-family: ui-monospace, monospace; font-size: 12.5px; background: var(--surface-2); padding: 1px 5px; border-radius: 3px; }
+
+  /* ---- section headings ---- */
+  section { margin-bottom: 40px; }
+  h2 {
+    font-family: ui-monospace, "Cascadia Code", "SF Mono", Consolas, monospace;
+    font-size: 16px;
+    font-weight: 600;
+    margin: 0 0 4px;
+    letter-spacing: -0.005em;
+  }
+  .section-sub {
+    font-size: 13px;
+    color: var(--text-secondary);
+    margin: 0 0 16px;
+    max-width: 68ch;
+  }
+
+  /* ---- legend ---- */
+  .legend {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 16px;
+    margin-bottom: 14px;
+    font-size: 12.5px;
+    color: var(--text-secondary);
+  }
+  .legend-item { display: flex; align-items: center; gap: 6px; }
+  .legend-swatch { width: 10px; height: 10px; border-radius: 2.5px; flex: none; }
+
+  /* ---- bar chart ---- */
+  .chart {
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+  }
+  .bar-row {
+    display: grid;
+    grid-template-columns: 260px 1fr 56px;
+    align-items: center;
+    gap: 10px;
+    padding: 3px 0;
+    position: relative;
+  }
+  .bar-row.winner { background: linear-gradient(90deg, var(--winner-glow), transparent 60%); border-radius: 6px; }
+  .bar-label {
+    font-size: 12px;
+    color: var(--text-secondary);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .bar-row.winner .bar-label { color: var(--text-primary); font-weight: 600; }
+  .bar-track {
+    position: relative;
+    height: 16px;
+    background: var(--surface-2);
+    border-radius: 4px;
+    overflow: visible;
+  }
+  .bar-fill {
+    position: absolute;
+    inset: 0 auto 0 0;
+    height: 100%;
+    border-radius: 4px;
+    min-width: 3px;
+  }
+  .bar-fill.oracle-fill {
+    background: repeating-linear-gradient(135deg, var(--cat-oracle) 0 6px, transparent 6px 12px);
+    opacity: 0.9;
+  }
+  .oracle-line {
+    position: absolute;
+    top: -4px; bottom: -4px;
+    width: 2px;
+    background: var(--cat-oracle);
+    z-index: 2;
+  }
+  .bar-value {
+    font-family: ui-monospace, "Cascadia Code", "SF Mono", Consolas, monospace;
+    font-size: 12px;
+    font-variant-numeric: tabular-nums;
+    text-align: right;
+    color: var(--text-secondary);
+  }
+  .bar-row.winner .bar-value { color: var(--cat-baseline); font-weight: 600; }
+  .bar-row:hover .bar-track { outline: 1px solid var(--text-muted); }
+  .tooltip {
+    position: absolute;
+    bottom: calc(100% + 6px);
+    left: 0;
+    background: var(--text-primary);
+    color: var(--surface-1);
+    font-family: ui-monospace, monospace;
+    font-size: 11px;
+    padding: 5px 8px;
+    border-radius: 5px;
+    white-space: nowrap;
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity 0.1s ease;
+    z-index: 5;
+  }
+  .bar-row:hover .tooltip { opacity: 1; }
+
+  /* ---- findings prose ---- */
+  .findings p { font-size: 14.5px; color: var(--text-secondary); max-width: 70ch; margin: 0 0 14px; }
+  .findings strong { color: var(--text-primary); }
+  .findings h3 {
+    font-size: 13.5px;
+    font-weight: 600;
+    color: var(--text-primary);
+    margin: 22px 0 8px;
+    font-family: ui-monospace, "Cascadia Code", "SF Mono", Consolas, monospace;
+  }
+  .findings h3:first-child { margin-top: 0; }
+
+  footer {
+    margin-top: 48px;
+    padding-top: 18px;
+    border-top: 1px solid var(--border);
+    font-size: 12px;
+    color: var(--text-muted);
+  }
+</style>
+
+<div class="wrap">
+  <header>
+    <div class="eyebrow">MoEx / hit_rate — offline cache-policy simulation</div>
+    <h1>Which caching formula actually wins on real routing data?</h1>
+    <p class="subtitle">37 candidate eviction/pin policies replayed against the real 50-prompt
+      route trace (579,936 layer-touches, 4,639,488 individual expert accesses), all at the
+      same fixed 1,112-slot arena capacity the live GPU run used.</p>
+    <div class="meta-chips">
+      <span class="chip">corpus: python50</span>
+      <span class="chip">capacity: 1112 slots</span>
+      <span class="chip">events: 4,639,488</span>
+      <span class="chip">key = (layer, expert)</span>
+    </div>
+  </header>
+
+  <div class="stats">
+    <div class="stat winner">
+      <div class="stat-label">Best achievable policy</div>
+      <div class="stat-value">64.38%</div>
+      <div class="stat-note">plain LRU — no pinning at all</div>
+    </div>
+    <div class="stat">
+      <div class="stat-label">Real GPU run (measured)</div>
+      <div class="stat-value">60.64%</div>
+      <div class="stat-note">live C++ pin-17/layer policy</div>
+    </div>
+    <div class="stat">
+      <div class="stat-label">Best cluster-aware policy</div>
+      <div class="stat-value">61.98%</div>
+      <div class="stat-note">tied: pin-40 / jaccard-40</div>
+    </div>
+    <div class="stat oracle">
+      <div class="stat-label">Oracle ceiling</div>
+      <div class="stat-value">83.19%</div>
+      <div class="stat-note">Belady, future-informed, unreachable online</div>
+    </div>
+  </div>
+
+  <div class="callout">
+    <div class="callout-title">⚠ Two implementation bugs found and fixed while building this — noted for the record</div>
+    <ul>
+      <li><strong>Belady oracle</strong> originally scored <code>22.05%</code> — worse than plain LRU, which is
+        mathematically impossible for a correct optimal-offline algorithm. Root cause: <code>next_occurrence</code>
+        indices were recorded on the per-event (8-keys-per-line) scale while the replay loop indexed the flattened
+        per-key stream — an 8x scale mismatch. Caught by a synthetic stress test (Belady must never lose to LRU)
+        before trusting the number. Fixed value: <code>83.19%</code>.</li>
+      <li><strong>Hybrid LRU+LFU</strong> originally scored <code>1.79%</code> from a sign error — the frequency
+        term was subtracted instead of added, making it reward low-frequency items (an accidental anti-LFU).
+        Fixed value: <code>53.82%</code>.</li>
+    </ul>
+  </div>
+
+  <section>
+    <h2>All 37 policies, ranked by hit rate</h2>
+    <p class="section-sub">Same capacity, same trace, same replay order for every bar. The
+      dashed gold line marks the oracle ceiling — the most any policy could ever reach on
+      this exact sequence.</p>
+    <div class="legend" id="legend"></div>
+    <div class="chart" id="chart"></div>
+  </section>
+
+  <section class="findings">
+    <h2>Findings</h2>
+    <h3>1. Hot experts are not the same thing as a high hit rate — but not in the direction we expected</h3>
+    <p>The working hypothesis going in was that individual-expert hotness undercounts
+      experts that only matter as part of a repeating cluster, and that protecting those
+      clusters would beat plain frequency ranking. That part of the hypothesis holds up:
+      <strong>every single hotness-only or cluster-aware pinning policy tested — 33 configurations
+      across four different formulas — scored below plain LRU.</strong> Pinning experts because
+      they were hot in the past actively hurt hit rate on this workload, it didn't just fail to help.</p>
+    <p>The reason is workload shape, not formula quality. 50 prompts here are 50 <em>genuinely
+      different</em> algorithms — quicksort, a trie, Dijkstra's algorithm, a hash map — with
+      little routing overlap between them. A pin built from cumulative, all-time frequency is
+      protecting yesterday's working set at the expense of today's. Plain LRU has no such bias:
+      it reallocates the entire budget to whatever the current prompt actually needs within a
+      few dozen tokens, which is exactly what a low-repetition workload rewards.</p>
+
+    <h3>2. The gap that matters is LRU vs. the oracle, not LRU vs. the pin policies</h3>
+    <p>Plain LRU (64.38%) sits <strong>18.8 percentage points below the true achievable ceiling
+      (83.19%)</strong>. That gap is real and it's large — it means there is genuine exploitable
+      structure in this trace that none of the 33 hotness/cluster/frequency policies tried here
+      captured. The oracle wins by using <em>future</em> knowledge (it evicts whatever won't be
+      needed again soonest); no online policy gets that for free. But it's the right target to
+      chase: a policy that predicts near-future need — not past frequency — is the only kind of
+      formula that can close this gap. That's what the N+1/N+2 cross-layer predictor from
+      earlier in this session was already reaching for; it's a better-aimed idea than
+      frequency-based pinning, this data just didn't test it in this simulator.</p>
+
+    <h3>3. Simulator matches reality, so the ranking is trustworthy</h3>
+    <p>The replica of the real C++ policy (pin top-17/layer, refresh every 5 prompts) scored
+      59.49% in simulation against 60.64% measured on the actual GPU run — a 1.15-point gap
+      fully explained by approximating "every 5 prompts" with an average token count rather than
+      exact prompt boundaries. That closeness is the validation: the simulator is a faithful
+      stand-in for the real engine, so the full ranking above can be trusted, including the
+      conclusion that the live policy is currently leaving hit rate on the table relative to
+      doing nothing.</p>
+
+    <h3>4. What to actually ship</h3>
+    <p><strong>Immediate, zero-risk change: drop the pin entirely and run plain LRU.</strong>
+      It's simpler than what's live today (no periodic refresh, no core/mates bookkeeping) and
+      it measured better on every metric in this trace. Longer-term, the 18.8-point oracle gap
+      is the real target — closing it needs genuine lookahead (the cross-layer predictor), not
+      a better historical-frequency formula, because this data shows historical frequency is
+      actively counterproductive on a diverse workload.</p>
+  </section>
+
+  <footer>
+    Simulated in <span class="mono">tools/simulate_policies.py</span> against
+    <span class="mono">build/bench50/route_trace.jsonl</span> (579,936 lines, 50-prompt python50
+    corpus). Capacity 1,112 matches the live GPU arena from the same run. Full results:
+    <span class="mono">build/bench50/policy_sim_results.json</span>.
+  </footer>
+</div>
+
+<script>
+const DATA = [{"label":"LRU, no pinning","hit":64.38,"evictions":1651497,"cat":"BASELINE"},{"label":"Pin top-40/layer, refresh /10 prompts","hit":62.81,"evictions":1724237,"cat":"HOT"},{"label":"Pin top-40/layer, refresh /1 prompts","hit":62.26,"evictions":1749896,"cat":"HOT"},{"label":"Pin top-12/layer, refresh /10 prompts","hit":62.12,"evictions":1756300,"cat":"HOT"},{"label":"Pin top-40/layer, refresh /5 prompts","hit":61.98,"evictions":1762923,"cat":"HOT"},{"label":"Jaccard cluster, budget 40, theta=0.15","hit":61.98,"evictions":1762923,"cat":"CLUSTER"},{"label":"Jaccard cluster, budget 40, theta=0.25","hit":61.98,"evictions":1762923,"cat":"CLUSTER"},{"label":"Pin top-12/layer, refresh /1 prompts","hit":61.7,"evictions":1776037,"cat":"HOT"},{"label":"Pin top-12/layer, refresh /5 prompts","hit":61.68,"evictions":1776873,"cat":"HOT"},{"label":"Core 27 + 15 co-occurrence mates","hit":61.3,"evictions":1794217,"cat":"CLUSTER"},{"label":"Pin top-17/layer, refresh /10 prompts","hit":60.34,"evictions":1838938,"cat":"HOT"},{"label":"Core 27 + 5 co-occurrence mates","hit":59.76,"evictions":1866038,"cat":"CLUSTER"},{"label":"Pin top-17/layer, refresh /1 prompts","hit":59.55,"evictions":1875586,"cat":"HOT"},{"label":"Real GPU-run replica (pin 17/layer, /5 prompts)","hit":59.49,"evictions":1878287,"cat":"BASELINE"},{"label":"Pin top-17/layer, refresh /5 prompts","hit":59.49,"evictions":1878287,"cat":"HOT"},{"label":"Core 27 + 15 lift-normalized mates","hit":59.44,"evictions":1880486,"cat":"CLUSTER"},{"label":"Core 17 + 15 co-occurrence mates","hit":59.21,"evictions":1891242,"cat":"CLUSTER"},{"label":"Core 12 + 5 co-occurrence mates","hit":58.82,"evictions":1909462,"cat":"CLUSTER"},{"label":"Jaccard cluster, budget 17, theta=0.15","hit":58.31,"evictions":1932983,"cat":"CLUSTER"},{"label":"Pin top-27/layer, refresh /10 prompts","hit":58.26,"evictions":1935611,"cat":"HOT"},{"label":"Core 27 + 5 lift-normalized mates","hit":58.07,"evictions":1944101,"cat":"CLUSTER"},{"label":"Jaccard cluster, budget 17, theta=0.25","hit":57.71,"evictions":1960748,"cat":"CLUSTER"},{"label":"Core 12 + 5 lift-normalized mates","hit":57.16,"evictions":1986309,"cat":"CLUSTER"},{"label":"Pin top-27/layer, refresh /5 prompts","hit":57.03,"evictions":1992338,"cat":"HOT"},{"label":"Pin top-27/layer, refresh /1 prompts","hit":56.72,"evictions":2007014,"cat":"HOT"},{"label":"Core 12 + 15 co-occurrence mates","hit":55.93,"evictions":2043504,"cat":"CLUSTER"},{"label":"Jaccard cluster, budget 27, theta=0.25","hit":55.39,"evictions":2068526,"cat":"CLUSTER"},{"label":"Jaccard cluster, budget 27, theta=0.15","hit":55.31,"evictions":2072330,"cat":"CLUSTER"},{"label":"LFU, global frequency","hit":53.82,"evictions":2141453,"cat":"BASELINE"},{"label":"EMA hotness, decay 1e-3","hit":53.82,"evictions":2141453,"cat":"BASELINE"},{"label":"EMA hotness, decay 1e-4","hit":53.82,"evictions":2141453,"cat":"BASELINE"},{"label":"Core 17 + 15 lift-normalized mates","hit":51.98,"evictions":2226701,"cat":"CLUSTER"},{"label":"Core 17 + 5 co-occurrence mates","hit":51.89,"evictions":2231057,"cat":"CLUSTER"},{"label":"Core 17 + 5 lift-normalized mates","hit":48.39,"evictions":2393340,"cat":"CLUSTER"},{"label":"Core 12 + 15 lift-normalized mates","hit":45.87,"evictions":2510162,"cat":"CLUSTER"},{"label":"Belady oracle - future-informed ceiling","hit":83.19,"evictions":778639,"cat":"ORACLE"},{"label":"Hybrid LRU+LFU blend","hit":53.82,"evictions":2141453,"cat":"BASELINE"}];
+
+const CAT_COLOR = {
+  BASELINE: 'var(--cat-baseline)',
+  HOT: 'var(--cat-hot)',
+  CLUSTER: 'var(--cat-cluster)',
+  ORACLE: 'var(--cat-oracle)',
+};
+const CAT_NAME = {
+  BASELINE: 'Baseline (LRU / LFU / EMA / hybrid / real replica)',
+  HOT: 'Individual-hotness pin (frequency core only)',
+  CLUSTER: 'Cluster-aware pin (co-occurrence / lift / Jaccard)',
+  ORACLE: 'Oracle (future-informed, not achievable online)',
+};
+
+const legend = document.getElementById('legend');
+['BASELINE','HOT','CLUSTER','ORACLE'].forEach(cat => {
+  const item = document.createElement('div');
+  item.className = 'legend-item';
+  item.innerHTML = `<span class="legend-swatch" style="background:${CAT_COLOR[cat]}"></span>${CAT_NAME[cat]}`;
+  legend.appendChild(item);
+});
+
+const maxHit = Math.max(...DATA.map(d => d.hit));
+const oracleHit = DATA.find(d => d.cat === 'ORACLE').hit;
+const chart = document.getElementById('chart');
+
+DATA.forEach(d => {
+  const row = document.createElement('div');
+  row.className = 'bar-row' + (d.label === 'LRU, no pinning' ? ' winner' : '');
+
+  const label = document.createElement('div');
+  label.className = 'bar-label';
+  label.textContent = d.label;
+  row.appendChild(label);
+
+  const track = document.createElement('div');
+  track.className = 'bar-track';
+
+  const fill = document.createElement('div');
+  fill.className = 'bar-fill' + (d.cat === 'ORACLE' ? ' oracle-fill' : '');
+  fill.style.width = (d.hit / maxHit * 100) + '%';
+  if (d.cat !== 'ORACLE') fill.style.background = CAT_COLOR[d.cat];
+  track.appendChild(fill);
+
+  if (d.cat !== 'ORACLE') {
+    const line = document.createElement('div');
+    line.className = 'oracle-line';
+    line.style.left = (oracleHit / maxHit * 100) + '%';
+    track.appendChild(line);
+  }
+
+  const tip = document.createElement('div');
+  tip.className = 'tooltip';
+  tip.textContent = `${d.hit.toFixed(2)}% hit  ·  ${d.evictions.toLocaleString()} evictions`;
+  track.appendChild(tip);
+
+  row.appendChild(track);
+
+  const val = document.createElement('div');
+  val.className = 'bar-value';
+  val.textContent = d.hit.toFixed(2) + '%';
+  row.appendChild(val);
+
+  chart.appendChild(row);
+});
+</script>

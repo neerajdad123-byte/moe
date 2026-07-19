@@ -1,0 +1,305 @@
+{
+  "capacity": 1112,
+  "trace": "build/bench50/route_trace.jsonl",
+  "total_events": 579936,
+  "results": [
+    {
+      "name": "lru_no_pin",
+      "hits": 2986879,
+      "misses": 1652609,
+      "evictions": 1651497,
+      "hit_pct": 64.37949618578602,
+      "seconds": 0.8
+    },
+    {
+      "name": "pin_k40_every10p [HOT]",
+      "hits": 2914139,
+      "misses": 1725349,
+      "evictions": 1724237,
+      "hit_pct": 62.81165076836065,
+      "seconds": 97.5
+    },
+    {
+      "name": "pin_k40_every1p [HOT]",
+      "hits": 2888480,
+      "misses": 1751008,
+      "evictions": 1749896,
+      "hit_pct": 62.258594051757434,
+      "seconds": 122.3
+    },
+    {
+      "name": "pin_k12_every10p [HOT]",
+      "hits": 2882076,
+      "misses": 1757412,
+      "evictions": 1756300,
+      "hit_pct": 62.12056157920874,
+      "seconds": 39.3
+    },
+    {
+      "name": "pin_k40_every5p [HOT]",
+      "hits": 2875453,
+      "misses": 1764035,
+      "evictions": 1762923,
+      "hit_pct": 61.9778087582078,
+      "seconds": 115.3
+    },
+    {
+      "name": "jaccard_budget40_theta0.15_every5p [CLUSTER]",
+      "hits": 2875453,
+      "misses": 1764035,
+      "evictions": 1762923,
+      "hit_pct": 61.9778087582078,
+      "seconds": 125.1
+    },
+    {
+      "name": "jaccard_budget40_theta0.25_every5p [CLUSTER]",
+      "hits": 2875453,
+      "misses": 1764035,
+      "evictions": 1762923,
+      "hit_pct": 61.9778087582078,
+      "seconds": 125.8
+    },
+    {
+      "name": "pin_k12_every1p [HOT]",
+      "hits": 2862339,
+      "misses": 1777149,
+      "evictions": 1776037,
+      "hit_pct": 61.695148257738786,
+      "seconds": 42.0
+    },
+    {
+      "name": "pin_k12_every5p [HOT]",
+      "hits": 2861503,
+      "misses": 1777985,
+      "evictions": 1776873,
+      "hit_pct": 61.67712902803068,
+      "seconds": 41.2
+    },
+    {
+      "name": "cluster_core27_mates15_every5p [CLUSTER]",
+      "hits": 2844159,
+      "misses": 1795329,
+      "evictions": 1794217,
+      "hit_pct": 61.30329467389505,
+      "seconds": 114.9
+    },
+    {
+      "name": "pin_k17_every10p [HOT]",
+      "hits": 2799438,
+      "misses": 1840050,
+      "evictions": 1838938,
+      "hit_pct": 60.339373655024005,
+      "seconds": 64.4
+    },
+    {
+      "name": "cluster_core27_mates5_every5p [CLUSTER]",
+      "hits": 2772338,
+      "misses": 1867150,
+      "evictions": 1866038,
+      "hit_pct": 59.755257476687085,
+      "seconds": 133.9
+    },
+    {
+      "name": "pin_k17_every1p [HOT]",
+      "hits": 2762790,
+      "misses": 1876698,
+      "evictions": 1875586,
+      "hit_pct": 59.5494589058103,
+      "seconds": 80.6
+    },
+    {
+      "name": "replica_pin17_every5prompts",
+      "hits": 2760089,
+      "misses": 1879399,
+      "evictions": 1878287,
+      "hit_pct": 59.4912412748993,
+      "seconds": 46.7
+    },
+    {
+      "name": "pin_k17_every5p [HOT]",
+      "hits": 2760089,
+      "misses": 1879399,
+      "evictions": 1878287,
+      "hit_pct": 59.4912412748993,
+      "seconds": 73.3
+    },
+    {
+      "name": "lift_core27_mates15_every5p [CLUSTER]",
+      "hits": 2757890,
+      "misses": 1881598,
+      "evictions": 1880486,
+      "hit_pct": 59.44384380345417,
+      "seconds": 128.5
+    },
+    {
+      "name": "cluster_core17_mates15_every5p [CLUSTER]",
+      "hits": 2747134,
+      "misses": 1892354,
+      "evictions": 1891242,
+      "hit_pct": 59.21200787673123,
+      "seconds": 136.7
+    },
+    {
+      "name": "cluster_core12_mates5_every5p [CLUSTER]",
+      "hits": 2728914,
+      "misses": 1910574,
+      "evictions": 1909462,
+      "hit_pct": 58.81929212878662,
+      "seconds": 65.2
+    },
+    {
+      "name": "jaccard_budget17_theta0.15_every5p [CLUSTER]",
+      "hits": 2705393,
+      "misses": 1934095,
+      "evictions": 1932983,
+      "hit_pct": 58.31231808337472,
+      "seconds": 85.7
+    },
+    {
+      "name": "pin_k27_every10p [HOT]",
+      "hits": 2702765,
+      "misses": 1936723,
+      "evictions": 1935611,
+      "hit_pct": 58.2556739019478,
+      "seconds": 125.3
+    },
+    {
+      "name": "lift_core27_mates5_every5p [CLUSTER]",
+      "hits": 2694275,
+      "misses": 1945213,
+      "evictions": 1944101,
+      "hit_pct": 58.07267957153893,
+      "seconds": 128.4
+    },
+    {
+      "name": "jaccard_budget17_theta0.25_every5p [CLUSTER]",
+      "hits": 2677628,
+      "misses": 1961860,
+      "evictions": 1960748,
+      "hit_pct": 57.7138684268609,
+      "seconds": 87.6
+    },
+    {
+      "name": "lift_core12_mates5_every5p [CLUSTER]",
+      "hits": 2652067,
+      "misses": 1987421,
+      "evictions": 1986309,
+      "hit_pct": 57.162924012304806,
+      "seconds": 83.2
+    },
+    {
+      "name": "pin_k27_every5p [HOT]",
+      "hits": 2646038,
+      "misses": 1993450,
+      "evictions": 1992338,
+      "hit_pct": 57.03297432820173,
+      "seconds": 137.6
+    },
+    {
+      "name": "pin_k27_every1p [HOT]",
+      "hits": 2631362,
+      "misses": 2008126,
+      "evictions": 2007014,
+      "hit_pct": 56.716646319593885,
+      "seconds": 155.8
+    },
+    {
+      "name": "cluster_core12_mates15_every5p [CLUSTER]",
+      "hits": 2594872,
+      "misses": 2044616,
+      "evictions": 2043504,
+      "hit_pct": 55.9301371185786,
+      "seconds": 145.5
+    },
+    {
+      "name": "jaccard_budget27_theta0.25_every5p [CLUSTER]",
+      "hits": 2569850,
+      "misses": 2069638,
+      "evictions": 2068526,
+      "hit_pct": 55.39081036528169,
+      "seconds": 148.1
+    },
+    {
+      "name": "jaccard_budget27_theta0.15_every5p [CLUSTER]",
+      "hits": 2566046,
+      "misses": 2073442,
+      "evictions": 2072330,
+      "hit_pct": 55.3088185592893,
+      "seconds": 149.0
+    },
+    {
+      "name": "lfu_global",
+      "hits": 2496923,
+      "misses": 2142565,
+      "evictions": 2141453,
+      "hit_pct": 53.81893433068476,
+      "seconds": 9.1
+    },
+    {
+      "name": "ema_hotness_decay1e-3",
+      "hits": 2496923,
+      "misses": 2142565,
+      "evictions": 2141453,
+      "hit_pct": 53.81893433068476,
+      "seconds": 12.0
+    },
+    {
+      "name": "ema_hotness_decay1e-4",
+      "hits": 2496923,
+      "misses": 2142565,
+      "evictions": 2141453,
+      "hit_pct": 53.81893433068476,
+      "seconds": 11.5
+    },
+    {
+      "name": "lift_core17_mates15_every5p [CLUSTER]",
+      "hits": 2411675,
+      "misses": 2227813,
+      "evictions": 2226701,
+      "hit_pct": 51.9814901989185,
+      "seconds": 145.5
+    },
+    {
+      "name": "cluster_core17_mates5_every5p [CLUSTER]",
+      "hits": 2407319,
+      "misses": 2232169,
+      "evictions": 2231057,
+      "hit_pct": 51.88760052833416,
+      "seconds": 151.9
+    },
+    {
+      "name": "lift_core17_mates5_every5p [CLUSTER]",
+      "hits": 2245036,
+      "misses": 2394452,
+      "evictions": 2393340,
+      "hit_pct": 48.38973610881201,
+      "seconds": 150.1
+    },
+    {
+      "name": "lift_core12_mates15_every5p [CLUSTER]",
+      "hits": 2128214,
+      "misses": 2511274,
+      "evictions": 2510162,
+      "hit_pct": 45.871742744026925,
+      "seconds": 183.5
+    },
+    {
+      "name": "belady_oracle_upper_bound [ORACLE]",
+      "hits": 3859737,
+      "misses": 779751,
+      "evictions": 778639,
+      "hit_pct": 83.19,
+      "seconds": 11.6,
+      "note": "corrected after flat-index-scale bug fix"
+    },
+    {
+      "name": "hybrid_lru_lfu",
+      "hits": 2497825,
+      "misses": 2141663,
+      "evictions": 2141453,
+      "hit_pct": 53.82,
+      "seconds": 6.1,
+      "note": "corrected after sign-bug fix; script text also fixed"
+    }
+  ]
+}
