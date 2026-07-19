@@ -18,6 +18,23 @@
 
 namespace moex {
 
+// GPU-resident mirror of one expert's {gate,up,down,resident}. Defined here
+// (not in gemv.cuh, which holds the __global__ kernels that consume it) so
+// device_model.cu doesn't have to include a kernel header: nvcc's non-rdc
+// compilation gives each .cu its own copy of any __global__ function a
+// header pulls in, and linking two .cu's that both got a copy of the same
+// kernel is a duplicate-symbol error at the host link stage.
+struct GpuExpertPtr {
+  const uint8_t* gate;
+  const uint8_t* up;
+  const uint8_t* down;
+  int resident;
+};
+
+}  // namespace moex
+
+namespace moex {
+
 // A tensor resident in VRAM: raw quantized bytes + shape/type so a kernel can
 // decode it. `dptr` is a device pointer.
 struct DeviceTensor {
@@ -136,6 +153,11 @@ class DeviceModel {
   uint64_t bytes_resident() const { return bytes_resident_; }
   uint32_t resident_expert_count() const { return resident_count_; }
 
+  // GPU-resident mirror of the expert pointer table (device_model.cu keeps
+  // this in sync on every residency change), for dispatch_gather_kernel —
+  // the router->dispatch chain never needs the host to touch this.
+  const GpuExpertPtr* device_ptr_table() const { return d_ptrs_; }
+
  private:
   // Allocate + copy one tensor's bytes to VRAM.
   DeviceTensor upload_tensor_(const gguf::TensorInfo* t, const uint8_t* host_base,
@@ -165,6 +187,7 @@ class DeviceModel {
   uint32_t capacity_ = 0;        // 0 = unbounded
   uint32_t resident_count_ = 0;  // experts currently resident
   uint64_t tick_ = 0;            // monotonic recency counter
+  GpuExpertPtr* d_ptrs_ = nullptr;  // GPU mirror, size n_layers*n_experts
 
   // --- slot-pool arena state (only set when init_arena succeeded) ---
   bool arena_mode_ = false;
@@ -189,6 +212,12 @@ class DeviceModel {
   void stage_upload_(const ExpertBundle& b, const uint8_t* host_base,
                      DeviceExpert& de, size_t flat, int64_t slot,
                      cudaStream_t stream);
+  // Push one entry's current {gate,up,down,resident} to the GPU table.
+  // Synchronous (blocking) — this only runs on residency changes (cache
+  // misses / evictions), never per-token, so a 32-byte blocking copy is
+  // negligible; async would be unsafe here without a persistent staging
+  // buffer since the source would be a stack temporary.
+  void sync_gpu_ptr_(size_t flat, const DeviceExpert& de);
 };
 
 }  // namespace moex

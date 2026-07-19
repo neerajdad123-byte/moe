@@ -446,7 +446,12 @@ int main(int argc, char** argv) {
     std::vector<int> route_buf((size_t)c.n_layers * c.n_experts_used, -1);
     std::vector<float> weight_buf((size_t)c.n_layers * c.n_experts_used, 0.f);
 
-    Forward fwd(dm, c, max_ctx);
+    // gpu_dispatch stays off here: this tool's whole cache/predictor/pin
+    // machinery needs per-layer host route visibility (ensure_experts,
+    // route_out/weight_out), which the zero-round-trip fast path skips by
+    // design. That fast path is for the fully-pinned ceiling case
+    // (moex_generate.cu), not general paged decode.
+    Forward fwd(dm, c, max_ctx, man);
     fwd.prof = profile ? &prof : nullptr;
     const int pass_now = p / num_prompts;
     fwd.ensure_experts = [&](uint32_t layer, const int* rids, uint32_t n) {

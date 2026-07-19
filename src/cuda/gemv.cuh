@@ -8,6 +8,7 @@
 // launches per selected expert into two while retaining execution order.
 #pragma once
 
+#include "cuda/device_model.h"  // GpuExpertPtr
 #include "cuda/kernels.cuh"
 
 namespace moex {
@@ -175,11 +176,14 @@ struct ExpertDispatch {
   float weight[8];
 };
 
-// The dispatch table is passed BY VALUE: kernel parameters live in constant
-// memory (broadcast-cached), so no thread ever reads the pointer table from
-// global memory. The earlier by-pointer version made every thread load the
-// whole 224-byte struct from global, which is why grouped dispatch used to
-// lose to 16 serial launches.
+// The dispatch table is passed BY VALUE for the host-built-dispatch call
+// sites (kernel params live in constant memory, broadcast-cached — no
+// per-thread global read, which is why grouped dispatch used to lose to 16
+// serial launches with the old by-pointer version). The _dptr variants below
+// take a device pointer instead, for the GPU-built-dispatch fast path (dot
+// dispatch_gather_kernel): each block loads the ~224-byte struct into shared
+// memory ONCE (not once per thread) and broadcasts from there, so GPU-side
+// construction costs nothing beyond that single shared load per block.
 __global__ void expert_group_gate_up_silu_kernel(
     int type, const ExpertDispatch d, const float* x, float* gates,
     int n_experts, int d_ff, int cols, int row_bytes) {
@@ -227,6 +231,61 @@ __global__ void expert_group_residual_kernel(const ExpertDispatch d,
   x[i] = v;
 }
 
+// --- _dptr variants: dispatch struct built ON GPU (by dispatch_gather_kernel
+// below) and consumed via a device pointer, one shared-memory load per block.
+__global__ void expert_group_gate_up_silu_dptr_kernel(
+    int type, const ExpertDispatch* dispatch, const float* x, float* gates,
+    int n_experts, int d_ff, int cols, int row_bytes) {
+  extern __shared__ float xs[];
+  __shared__ ExpertDispatch ds;
+  if (threadIdx.x == 0) ds = *dispatch;
+  for (int i = threadIdx.x; i < cols; i += blockDim.x) xs[i] = x[i];
+  __syncthreads();
+  const int expert = blockIdx.y;
+  if (expert >= n_experts) return;
+  const int lane = threadIdx.x & 31;
+  const int row = blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
+  if (row >= d_ff) return;
+  const float g = row_dot(type, ds.gate[expert] + (size_t)row * row_bytes,
+                          xs, cols, lane);
+  const float u = row_dot(type, ds.up[expert] + (size_t)row * row_bytes,
+                          xs, cols, lane);
+  if (lane == 0)
+    gates[(size_t)expert * d_ff + row] = (g / (1.0f + expf(-g))) * u;
+}
+
+__global__ void expert_group_down_dptr_kernel(
+    int type, const ExpertDispatch* dispatch, const float* gates, float* outs,
+    int n_experts, int d_model, int cols, int row_bytes) {
+  extern __shared__ float gs2[];
+  __shared__ ExpertDispatch ds;
+  if (threadIdx.x == 0) ds = *dispatch;
+  const int expert = blockIdx.y;
+  if (expert >= n_experts) { __syncthreads(); return; }
+  const float* gate = gates + (size_t)expert * cols;
+  for (int i = threadIdx.x; i < cols; i += blockDim.x) gs2[i] = gate[i];
+  __syncthreads();
+  const int lane = threadIdx.x & 31;
+  const int row = blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
+  if (row >= d_model) return;
+  const float v = row_dot(type, ds.down[expert] + (size_t)row * row_bytes,
+                          gs2, cols, lane);
+  if (lane == 0) outs[(size_t)expert * d_model + row] = v;
+}
+
+__global__ void expert_group_residual_dptr_kernel(const ExpertDispatch* dispatch,
+                                                   const float* outs, float* x,
+                                                   int n_experts, int d_model) {
+  __shared__ ExpertDispatch ds;
+  if (threadIdx.x == 0) ds = *dispatch;
+  __syncthreads();
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= d_model) return;
+  float v = x[i];
+  for (int j = 0; j < n_experts; ++j) v += ds.weight[j] * outs[(size_t)j * d_model + i];
+  x[i] = v;
+}
+
 inline void launch_expert_group_gate_up_silu(
     int type, const ExpertDispatch& dispatch, const float* x, float* gates,
     int n_experts, int d_ff, int cols, int row_bytes) {
@@ -251,6 +310,33 @@ inline void launch_expert_group_residual(const ExpertDispatch& dispatch,
                                          int n_experts, int d_model) {
   constexpr int threads = 256;
   expert_group_residual_kernel<<<(d_model + threads - 1) / threads, threads>>>(
+      dispatch, outs, x, n_experts, d_model);
+}
+
+inline void launch_expert_group_gate_up_silu_dptr(
+    int type, const ExpertDispatch* dispatch, const float* x, float* gates,
+    int n_experts, int d_ff, int cols, int row_bytes) {
+  constexpr int threads = 256;
+  dim3 grid((d_ff + 7) / 8, n_experts);
+  expert_group_gate_up_silu_dptr_kernel<<<grid, threads, (size_t)cols * sizeof(float)>>>(
+      type, dispatch, x, gates, n_experts, d_ff, cols, row_bytes);
+}
+
+inline void launch_expert_group_down_dptr(int type, const ExpertDispatch* dispatch,
+                                          const float* gates, float* outs,
+                                          int n_experts, int d_model, int cols,
+                                          int row_bytes) {
+  constexpr int threads = 256;
+  dim3 grid((d_model + 7) / 8, n_experts);
+  expert_group_down_dptr_kernel<<<grid, threads, (size_t)cols * sizeof(float)>>>(
+      type, dispatch, gates, outs, n_experts, d_model, cols, row_bytes);
+}
+
+inline void launch_expert_group_residual_dptr(const ExpertDispatch* dispatch,
+                                              const float* outs, float* x,
+                                              int n_experts, int d_model) {
+  constexpr int threads = 256;
+  expert_group_residual_dptr_kernel<<<(d_model + threads - 1) / threads, threads>>>(
       dispatch, outs, x, n_experts, d_model);
 }
 
@@ -298,6 +384,69 @@ __global__ void router_topk8_kernel(const float* logits, int n_experts, int k,
       ssum += p;
     }
     for (int j = 0; j < k; ++j) out->w[j] = (float)(out->w[j] / ssum);
+  }
+}
+
+// --- Fused router top-k + dispatch gather (GpuExpertPtr in device_model.h) -
+// Same top-k/softmax as router_topk8_kernel, but thread 0 also resolves each
+// selected id's pointers from the GPU-resident table and writes them
+// straight into `out` (device ExpertDispatch) — ONE launch instead of two.
+// This exists because measurement showed launch *count* dominates on this
+// WDDM setup: a separate dispatch_gather_kernel eliminated a 64B D2H but
+// added a whole extra launch, and net lost to the launch it added. Fusing
+// keeps per-layer launch count at parity with the original host-round-trip
+// path while still removing the D2H + host-side idx/dispatch construction.
+// Hit/miss go to device counters, read back once per run, not per layer.
+__global__ void router_topk8_dispatch_kernel(const float* logits, int n_experts,
+                                              int k, RouteTopK* route_out,
+                                              const GpuExpertPtr* ptrs,
+                                              uint32_t layer_base,
+                                              ExpertDispatch* dispatch_out,
+                                              unsigned long long* hit_ctr,
+                                              unsigned long long* miss_ctr) {
+  __shared__ float sl[128];
+  __shared__ float red[128];
+  const int t = threadIdx.x;
+  const float v = (t < n_experts) ? logits[t] : -1e30f;
+  sl[t] = v;
+  red[t] = v;
+  __syncthreads();
+  for (int s = 64; s > 0; s >>= 1) {
+    if (t < s) red[t] = fmaxf(red[t], red[t + s]);
+    __syncthreads();
+  }
+  const float maxl = red[0];
+  __syncthreads();
+  __shared__ double se[128];
+  se[t] = (t < n_experts) ? exp((double)(sl[t] - maxl)) : 0.0;
+  __syncthreads();
+  if (t == 0) {
+    double denom = 0.0;
+    for (int i = 0; i < n_experts; ++i) denom += se[i];
+    double ssum = 0.0;
+    int ids[8];
+    for (int j = 0; j < k; ++j) {
+      int bi = -1;
+      float bv = -1e30f;
+      for (int i = 0; i < n_experts; ++i)
+        if (sl[i] > bv) { bv = sl[i]; bi = i; }
+      sl[bi] = -2e30f;
+      ids[j] = bi;
+      route_out->ids[j] = bi;
+      const double p = se[bi] / denom;
+      route_out->w[j] = (float)p;
+      ssum += p;
+    }
+    for (int j = 0; j < k; ++j) {
+      route_out->w[j] = (float)(route_out->w[j] / ssum);
+      const GpuExpertPtr p = ptrs[layer_base + (uint32_t)ids[j]];
+      dispatch_out->gate[j] = p.gate;
+      dispatch_out->up[j] = p.up;
+      dispatch_out->down[j] = p.down;
+      dispatch_out->weight[j] = route_out->w[j];
+      if (p.resident) atomicAdd(hit_ctr, 1ull);
+      else atomicAdd(miss_ctr, 1ull);
+    }
   }
 }
 

@@ -1,9 +1,12 @@
 // MoEx: pin experts for "hi", then re-run the same prompt fully from VRAM
 // (3B-style: no mid-token H2D). Default: 3 identical "hi" passes after pin.
 //
-// Usage: moex_generate [gguf] [n_gen] [n_repeats]
-//   n_gen     = tokens to generate after "hi" on each pass (default 4)
-//   n_repeats = how many times to re-send "hi" after pin (default 3)
+// Usage: moex_generate [gguf] [n_gen] [n_repeats] [gpu_dispatch]
+//   n_gen        = tokens to generate after "hi" on each pass (default 4)
+//   n_repeats    = how many times to re-send "hi" after pin (default 3)
+//   gpu_dispatch = 1 (default) for Phase 1's zero-host-round-trip fast path
+//                  (router top-k + expert pointer resolution + dispatch all
+//                  stay on GPU), 0 for the original per-layer host path
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -83,6 +86,7 @@ int main(int argc, char** argv) {
       argc > 1 ? argv[1] : "C:/models/Qwen_Qwen3-30B-A3B-Q4_K_M.gguf";
   int n_gen = argc > 2 ? std::atoi(argv[2]) : 4;
   int n_repeats = argc > 3 ? std::atoi(argv[3]) : 3;
+  bool use_gpu_dispatch = argc > 4 ? (std::atoi(argv[4]) != 0) : true;
   if (n_repeats < 1) n_repeats = 1;
   if (n_gen < 1) n_gen = 1;
   const uint32_t max_ctx = 256;
@@ -110,6 +114,9 @@ int main(int argc, char** argv) {
   MOEX_CUDA(cudaMemGetInfo(&free0, &total0));
   std::printf("=== MoEx: PIN then \"hi\" x%d (VRAM-only, 3B-style) ===\n",
               n_repeats);
+  std::printf("gpu_dispatch: %s (Phase 1 only; Phase 0 discovery and the\n"
+              "  detailed-profile pass always use the host round-trip path)\n",
+              use_gpu_dispatch ? "ON — zero host round trips per layer" : "off");
   std::printf("model:  %s\n", path);
   std::printf("config: layers=%u experts=%u top_k=%u d_model=%u\n", c.n_layers,
               c.n_experts, c.n_experts_used, c.d_model);
@@ -159,7 +166,7 @@ int main(int argc, char** argv) {
 
   std::printf("\n=== PHASE 0: DISCOVER (reactive pin on first \"hi\") ===\n");
   {
-    Forward disc(dm, c, max_ctx);
+    Forward disc(dm, c, max_ctx, man);
     disc.ensure_experts = make_uploader(true);
     PassResult cold = run_hi(disc, c, detok, prompt, n_gen, &h2d_calls,
                              &h2d_bytes);
@@ -206,14 +213,22 @@ int main(int argc, char** argv) {
 
   for (int rep = 1; rep <= n_repeats; ++rep) {
     // Brand-new Forward = empty KV, same DeviceModel (experts stay resident).
-    Forward fwd(dm, c, max_ctx);
+    Forward fwd(dm, c, max_ctx, man);
+    fwd.gpu_dispatch = use_gpu_dispatch;
     long hits = 0, miss = 0;
     int h2d_before = h2d_calls;
     uint64_t b_before = h2d_bytes;
-    // No upload — only count residency.
+    // No upload — only count residency. Unused when gpu_dispatch is on
+    // (that path never calls ensure_experts); harmless to leave set.
     fwd.ensure_experts = make_probe(&hits, &miss);
 
     PassResult pr = run_hi(fwd, c, detok, prompt, n_gen, &h2d_calls, &h2d_bytes);
+    if (use_gpu_dispatch) {
+      unsigned long long ghits = 0, gmiss = 0;
+      fwd.read_hit_miss_counters(&ghits, &gmiss);
+      hits = (long)ghits;
+      miss = (long)gmiss;
+    }
     pr.hits = hits;
     pr.miss = miss;
     pr.h2d_calls = h2d_calls - h2d_before;
@@ -289,7 +304,7 @@ int main(int argc, char** argv) {
   // Separate synchronized diagnostic run: excluded from headline tok/s.
   std::printf("\n=== DETAILED PROFILE (separate pinned run; not headline tok/s) ===\n");
   {
-    Forward fprof(dm, c, max_ctx);
+    Forward fprof(dm, c, max_ctx, man);
     StepProf prof;
     fprof.prof = &prof;
     long phits = 0, pmiss = 0;

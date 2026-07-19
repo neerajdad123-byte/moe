@@ -1,0 +1,83 @@
+﻿=== MoEx: PIN then "hi" x3 (VRAM-only, 3B-style) ===
+gpu_dispatch: off (Phase 1 only; Phase 0 discovery and the
+  detailed-profile pass always use the host round-trip path)
+model:  C:\models\Qwen_Qwen3-30B-A3B-Q4_K_M.gguf
+config: layers=48 experts=128 top_k=8 d_model=2048
+GPU:    5080 / 6140 MiB free before load
+static resident: 1023.342 MiB
+
+=== PHASE 0: DISCOVER (reactive pin on first "hi") ===
+prompt: "hi"  output: " * 100000000000000000000000000000"
+experts pinned:   1676  (layer-scoped bundles)
+expert H2D:       4550.59 MiB in 639 uploads, 2441.0 ms (1.95 GB/s)
+total resident:   5.443 GiB
+VRAM:             6140 / 6140 MiB  (0 free)
+cold prefill:     517.8 ms  | cold decode: 7.86 tok/s (32 tok)
+NOTE: cold pass paid H2D — not the 3B-style number.
+
+=== PHASE 1: EXPERTS PRE-PINNED — re-send "hi" 3 times ===
+(fresh KV each pass, live router, H2D disabled — pure VRAM)
+
+--- pass 1/3 ---
+  output:     " * 100000000000000000000000000000"
+  prefill:    33.8 ms   (TTFT / first-id ready)
+  decode:     15.22 tok/s  (32 tok in 2102.5 ms, mean 65.7 ms/tok)
+  per-tok ms: min 33.8  p50 64.3  p95 103.9  max 115.7
+  expert hit: 12672 / 12672  (100.0%)  miss=0
+  H2D this pass: 0 calls, 0.00 MiB  (GOOD — pure VRAM)
+
+--- pass 2/3 ---
+  output:     " * 100000000000000000000000000000"
+  prefill:    34.9 ms   (TTFT / first-id ready)
+  decode:     15.48 tok/s  (32 tok in 2067.5 ms, mean 64.6 ms/tok)
+  per-tok ms: min 34.5  p50 63.7  p95 105.9  max 114.0
+  expert hit: 12672 / 12672  (100.0%)  miss=0
+  H2D this pass: 0 calls, 0.00 MiB  (GOOD — pure VRAM)
+
+--- pass 3/3 ---
+  output:     " * 100000000000000000000000000000"
+  prefill:    34.0 ms   (TTFT / first-id ready)
+  decode:     15.49 tok/s  (32 tok in 2066.3 ms, mean 64.6 ms/tok)
+  per-tok ms: min 34.0  p50 64.8  p95 103.8  max 109.3
+  expert hit: 12672 / 12672  (100.0%)  miss=0
+  H2D this pass: 0 calls, 0.00 MiB  (GOOD — pure VRAM)
+
+=== SUMMARY (pinned "hi" x3) ===
+experts pre-pinned:  1676
+MoEx resident:       5.443 GiB
+VRAM now:            6140 / 6140 MiB
+avg prefill (TTFT):  34.2 ms
+avg decode tok/s:    15.39
+  pass 1:  15.22 tok/s  prefill 33.8 ms  hit 100.0%
+  pass 2:  15.48 tok/s  prefill 34.9 ms  hit 100.0%
+  pass 3:  15.49 tok/s  prefill 34.0 ms  hit 100.0%
+overall hit rate:    38016 / 38016 (100.00%)
+H2D during repeats:  0 calls (want 0)
+pure-VRAM passes:    3 / 3
+
+VERDICT: YES — experts pinned first; all 3 "hi" runs pure VRAM (3B-style resident path)
+
+=== DETAILED PROFILE (separate pinned run; not headline tok/s) ===
+profiled tokens: 33  wall mean 65.146 ms  p50 61.265  p95 107.057  p99 113.590
+phase ms/token: embed 0.043 | attention 17.102 | router 3.521 | experts 42.399 | final 1.717
+host sync ms/token: router 2.622 | logits/sample 1.693
+transfers: H2D 0 B/0 calls | D2H 101508 B/1617 calls | D2D 6488064 B/1584 calls
+quant weight reads: 61.291 GiB total (1.857 GiB/token)
+experts: hits 12672 misses 0 evictions 0 | peak VRAM 6140.5 MiB
+CUDA launches: 20757 total (629.0/token)
+  argmax_stage1                33 (1.0/token)
+  argmax_stage2                33 (1.0/token)
+  embed                        33 (1.0/token)
+  expert_group_down            1584 (48.0/token)
+  expert_group_gate_up_silu    1584 (48.0/token)
+  expert_group_residual        1584 (48.0/token)
+  gemv_attn_out_residual       1584 (48.0/token)
+  gemv_logits                  33 (1.0/token)
+  gemv_router                  1584 (48.0/token)
+  gqa_attn                     1584 (48.0/token)
+  head_rmsnorm_rope            3168 (96.0/token)
+  kv_store                     1584 (48.0/token)
+  qkv_fused                    1584 (48.0/token)
+  rmsnorm                      3201 (97.0/token)
+  router_topk8                 1584 (48.0/token)
+per-token real trace: build/profile_trace.csv

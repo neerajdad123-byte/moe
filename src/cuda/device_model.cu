@@ -4,7 +4,7 @@
 #include <algorithm>
 #include <cstring>
 
-#include "cuda/cuda_common.h"
+#include "cuda/cuda_common.h"  // GpuExpertPtr is declared in device_model.h
 
 namespace moex {
 
@@ -12,6 +12,7 @@ DeviceModel::~DeviceModel() {
   for (void* p : allocs_) {
     if (p) cudaFree(p);
   }
+  if (d_ptrs_) cudaFree(d_ptrs_);
   if (arena_mode_) {
     // All expert dptrs point inside the single arena allocation.
     cudaDeviceSynchronize();  // let in-flight staging copies drain first
@@ -94,6 +95,14 @@ uint64_t DeviceModel::upload_static(const gguf::Model& gguf, const Manifest& man
   // ensure_bounded()/upload_experts() call — instead of lazily resizing on
   // first upload, which left a window where the vector was still empty.
   experts_.assign((size_t)c.n_layers * c.n_experts, DeviceExpert{});
+  // GPU mirror of the pointer table (all-zero = not resident, null ptrs),
+  // for dispatch_gather_kernel's zero-host-round-trip fast path.
+  const size_t n_flat = experts_.size();
+  if (cudaMalloc(&d_ptrs_, n_flat * sizeof(GpuExpertPtr)) == cudaSuccess) {
+    cudaMemset(d_ptrs_, 0, n_flat * sizeof(GpuExpertPtr));
+  } else {
+    d_ptrs_ = nullptr;
+  }
   const uint64_t start = bytes_resident_;
 
   try {
@@ -145,6 +154,7 @@ uint64_t DeviceModel::upload_experts(
         de.up = upload_slice_(b.up, host_base);
         de.down = upload_slice_(b.down, host_base);
         de.resident = true;
+        sync_gpu_ptr_(static_cast<size_t>(l) * c.n_experts + e, de);
       }
     }
   } catch (const std::exception& ex) {
@@ -225,6 +235,16 @@ uint32_t DeviceModel::init_arena(const Manifest& man, uint32_t capacity,
   return capacity;
 }
 
+void DeviceModel::sync_gpu_ptr_(size_t flat, const DeviceExpert& de) {
+  if (!d_ptrs_) return;
+  GpuExpertPtr h;
+  h.gate = (const uint8_t*)de.gate.dptr;
+  h.up = (const uint8_t*)de.up.dptr;
+  h.down = (const uint8_t*)de.down.dptr;
+  h.resident = de.resident ? 1 : 0;
+  cudaMemcpy(d_ptrs_ + flat, &h, sizeof(GpuExpertPtr), cudaMemcpyHostToDevice);
+}
+
 void DeviceModel::pin(uint32_t layer, uint32_t expert, bool value) {
   if (experts_.empty()) return;  // nothing uploaded yet
   experts_[static_cast<size_t>(layer) * n_experts_ + expert].pinned = value;
@@ -269,6 +289,9 @@ bool DeviceModel::evict_one_(uint64_t* bytes_freed, int64_t* freed_slot,
   de.up = DeviceTensor{};
   de.down = DeviceTensor{};
   de.resident = false;
+  sync_gpu_ptr_((size_t)best_idx, de);  // null out pointers: a stray GPU-side
+                                        // dereference faults loudly instead
+                                        // of silently reading evicted bytes.
   --resident_count_;
   return true;
 }
@@ -349,6 +372,10 @@ uint32_t DeviceModel::prefetch_async(const Manifest& man, const uint8_t* host_ba
       de.pinned = false;
       de.last_used = tick_;
       de.inflight_ev = (int)bev;
+      sync_gpu_ptr_(flat, de);  // NOTE: correct only for the reactive-hit path
+                                // and the gpu_dispatch fast path when used as
+                                // documented (no in-flight prefetch during the
+                                // fast-path window) — see Forward::gpu_dispatch.
       ++resident_count_;
       ++issued;
       if (bytes) *bytes += b.total_bytes();
@@ -414,6 +441,7 @@ uint32_t DeviceModel::ensure_bounded(const gguf::Model& gguf, const Manifest& ma
         de.down = upload_slice_untracked_(b.down, host_base);
       }
       de.resident = true;
+      sync_gpu_ptr_(flat, de);
       ++resident_count_;
       if (bytes_uploaded) *bytes_uploaded += b.total_bytes();
       if (n_uploaded) *n_uploaded += 1;

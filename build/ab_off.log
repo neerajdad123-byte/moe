@@ -1,0 +1,146 @@
+=== MoEx: PIN then "hi" x10 (VRAM-only, 3B-style) ===
+gpu_dispatch: off (Phase 1 only; Phase 0 discovery and the
+  detailed-profile pass always use the host round-trip path)
+model:  C:/models/Qwen_Qwen3-30B-A3B-Q4_K_M.gguf
+config: layers=48 experts=128 top_k=8 d_model=2048
+GPU:    5080 / 6140 MiB free before load
+static resident: 1023.342 MiB
+
+=== PHASE 0: DISCOVER (reactive pin on first "hi") ===
+prompt: "hi"  output: " * 100000000000000000000000000000"
+experts pinned:   1676  (layer-scoped bundles)
+expert H2D:       4550.59 MiB in 639 uploads, 2365.2 ms (2.02 GB/s)
+total resident:   5.443 GiB
+VRAM:             6140 / 6140 MiB  (0 free)
+cold prefill:     583.4 ms  | cold decode: 8.42 tok/s (32 tok)
+NOTE: cold pass paid H2D — not the 3B-style number.
+
+=== PHASE 1: EXPERTS PRE-PINNED — re-send "hi" 10 times ===
+(fresh KV each pass, live router, H2D disabled — pure VRAM)
+
+--- pass 1/10 ---
+  output:     " * 100000000000000000000000000000"
+  prefill:    35.2 ms   (TTFT / first-id ready)
+  decode:     16.56 tok/s  (32 tok in 1932.2 ms, mean 60.4 ms/tok)
+  per-tok ms: min 34.3  p50 58.2  p95 97.3  max 108.6
+  expert hit: 12672 / 12672  (100.0%)  miss=0
+  H2D this pass: 0 calls, 0.00 MiB  (GOOD — pure VRAM)
+
+--- pass 2/10 ---
+  output:     " * 100000000000000000000000000000"
+  prefill:    34.1 ms   (TTFT / first-id ready)
+  decode:     16.66 tok/s  (32 tok in 1920.6 ms, mean 60.0 ms/tok)
+  per-tok ms: min 33.9  p50 57.7  p95 99.8  max 108.3
+  expert hit: 12672 / 12672  (100.0%)  miss=0
+  H2D this pass: 0 calls, 0.00 MiB  (GOOD — pure VRAM)
+
+--- pass 3/10 ---
+  output:     " * 100000000000000000000000000000"
+  prefill:    34.6 ms   (TTFT / first-id ready)
+  decode:     16.37 tok/s  (32 tok in 1955.2 ms, mean 61.1 ms/tok)
+  per-tok ms: min 34.7  p50 59.8  p95 100.8  max 121.0
+  expert hit: 12672 / 12672  (100.0%)  miss=0
+  H2D this pass: 0 calls, 0.00 MiB  (GOOD — pure VRAM)
+
+--- pass 4/10 ---
+  output:     " * 100000000000000000000000000000"
+  prefill:    34.0 ms   (TTFT / first-id ready)
+  decode:     16.58 tok/s  (32 tok in 1930.3 ms, mean 60.3 ms/tok)
+  per-tok ms: min 34.0  p50 57.1  p95 100.6  max 107.8
+  expert hit: 12672 / 12672  (100.0%)  miss=0
+  H2D this pass: 0 calls, 0.00 MiB  (GOOD — pure VRAM)
+
+--- pass 5/10 ---
+  output:     " * 100000000000000000000000000000"
+  prefill:    34.5 ms   (TTFT / first-id ready)
+  decode:     16.33 tok/s  (32 tok in 1959.5 ms, mean 61.2 ms/tok)
+  per-tok ms: min 34.7  p50 59.6  p95 97.4  max 106.7
+  expert hit: 12672 / 12672  (100.0%)  miss=0
+  H2D this pass: 0 calls, 0.00 MiB  (GOOD — pure VRAM)
+
+--- pass 6/10 ---
+  output:     " * 100000000000000000000000000000"
+  prefill:    34.1 ms   (TTFT / first-id ready)
+  decode:     16.54 tok/s  (32 tok in 1935.0 ms, mean 60.5 ms/tok)
+  per-tok ms: min 34.7  p50 57.7  p95 100.8  max 109.0
+  expert hit: 12672 / 12672  (100.0%)  miss=0
+  H2D this pass: 0 calls, 0.00 MiB  (GOOD — pure VRAM)
+
+--- pass 7/10 ---
+  output:     " * 100000000000000000000000000000"
+  prefill:    33.7 ms   (TTFT / first-id ready)
+  decode:     16.47 tok/s  (32 tok in 1943.2 ms, mean 60.7 ms/tok)
+  per-tok ms: min 34.4  p50 59.3  p95 96.8  max 106.5
+  expert hit: 12672 / 12672  (100.0%)  miss=0
+  H2D this pass: 0 calls, 0.00 MiB  (GOOD — pure VRAM)
+
+--- pass 8/10 ---
+  output:     " * 100000000000000000000000000000"
+  prefill:    34.4 ms   (TTFT / first-id ready)
+  decode:     16.53 tok/s  (32 tok in 1936.3 ms, mean 60.5 ms/tok)
+  per-tok ms: min 33.4  p50 57.6  p95 99.0  max 111.0
+  expert hit: 12672 / 12672  (100.0%)  miss=0
+  H2D this pass: 0 calls, 0.00 MiB  (GOOD — pure VRAM)
+
+--- pass 9/10 ---
+  output:     " * 100000000000000000000000000000"
+  prefill:    34.7 ms   (TTFT / first-id ready)
+  decode:     16.46 tok/s  (32 tok in 1943.8 ms, mean 60.7 ms/tok)
+  per-tok ms: min 33.5  p50 59.9  p95 96.4  max 105.6
+  expert hit: 12672 / 12672  (100.0%)  miss=0
+  H2D this pass: 0 calls, 0.00 MiB  (GOOD — pure VRAM)
+
+--- pass 10/10 ---
+  output:     " * 100000000000000000000000000000"
+  prefill:    34.1 ms   (TTFT / first-id ready)
+  decode:     16.56 tok/s  (32 tok in 1932.8 ms, mean 60.4 ms/tok)
+  per-tok ms: min 34.6  p50 57.3  p95 100.2  max 107.7
+  expert hit: 12672 / 12672  (100.0%)  miss=0
+  H2D this pass: 0 calls, 0.00 MiB  (GOOD — pure VRAM)
+
+=== SUMMARY (pinned "hi" x10) ===
+experts pre-pinned:  1676
+MoEx resident:       5.443 GiB
+VRAM now:            6140 / 6140 MiB
+avg prefill (TTFT):  34.3 ms
+avg decode tok/s:    16.50
+  pass 1:  16.56 tok/s  prefill 35.2 ms  hit 100.0%
+  pass 2:  16.66 tok/s  prefill 34.1 ms  hit 100.0%
+  pass 3:  16.37 tok/s  prefill 34.6 ms  hit 100.0%
+  pass 4:  16.58 tok/s  prefill 34.0 ms  hit 100.0%
+  pass 5:  16.33 tok/s  prefill 34.5 ms  hit 100.0%
+  pass 6:  16.54 tok/s  prefill 34.1 ms  hit 100.0%
+  pass 7:  16.47 tok/s  prefill 33.7 ms  hit 100.0%
+  pass 8:  16.53 tok/s  prefill 34.4 ms  hit 100.0%
+  pass 9:  16.46 tok/s  prefill 34.7 ms  hit 100.0%
+  pass 10:  16.56 tok/s  prefill 34.1 ms  hit 100.0%
+overall hit rate:    126720 / 126720 (100.00%)
+H2D during repeats:  0 calls (want 0)
+pure-VRAM passes:    10 / 10
+
+VERDICT: YES — experts pinned first; all 3 "hi" runs pure VRAM (3B-style resident path)
+
+=== DETAILED PROFILE (separate pinned run; not headline tok/s) ===
+profiled tokens: 33  wall mean 61.742 ms  p50 56.774  p95 97.942  p99 105.941
+phase ms/token: embed 0.053 | attention 17.401 | router 3.795 | experts 38.376 | final 1.725
+host sync ms/token: router 2.653 | logits/sample 1.698
+transfers: H2D 0 B/0 calls | D2H 101508 B/1617 calls | D2D 6488064 B/1584 calls
+quant weight reads: 61.291 GiB total (1.857 GiB/token)
+experts: hits 12672 misses 0 evictions 0 | peak VRAM 6140.5 MiB
+CUDA launches: 20757 total (629.0/token)
+  argmax_stage1                33 (1.0/token)
+  argmax_stage2                33 (1.0/token)
+  embed                        33 (1.0/token)
+  expert_group_down            1584 (48.0/token)
+  expert_group_gate_up_silu    1584 (48.0/token)
+  expert_group_residual        1584 (48.0/token)
+  gemv_attn_out_residual       1584 (48.0/token)
+  gemv_logits                  33 (1.0/token)
+  gemv_router                  1584 (48.0/token)
+  gqa_attn                     1584 (48.0/token)
+  head_rmsnorm_rope            3168 (96.0/token)
+  kv_store                     1584 (48.0/token)
+  qkv_fused                    1584 (48.0/token)
+  rmsnorm                      3201 (97.0/token)
+  router_topk8                 1584 (48.0/token)
+per-token real trace: build/profile_trace.csv

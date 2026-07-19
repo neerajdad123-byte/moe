@@ -1,0 +1,17 @@
+﻿=== GPU: NVIDIA GeForce RTX 4050 Laptop GPU | 20 SMs | mem_clock=8001000 kHz bus=96 bit -> 192 GB/s theoretical (spec) | maxThreads/SM=1536 ===
+
+=== 1. Occupancy of production kernels (exact, via CUDA runtime API) ===
+expert_group_gate_up_silu        regs= 44 smem_static=   0 smem_dyn=  8192 -> 5 blocks/SM, 40/48 warps active (83.3% occupancy)
+expert_group_down                regs= 42 smem_static=   0 smem_dyn=  3072 -> 5 blocks/SM, 40/48 warps active (83.3% occupancy)
+qkv_q_kernel                     regs= 44 smem_static=   0 smem_dyn=  8192 -> 5 blocks/SM, 40/48 warps active (83.3% occupancy)
+gemv_q_residual                  regs= 44 smem_static=   0 smem_dyn=  8192 -> 5 blocks/SM, 40/48 warps active (83.3% occupancy)
+router_topk8_kernel              regs= 33 smem_static=2048 smem_dyn=     0 -> 12 blocks/SM, 48/48 warps active (100.0% occupancy)
+argmax_stage1_kernel             regs= 12 smem_static=2048 smem_dyn=     0 -> 6 blocks/SM, 48/48 warps active (100.0% occupancy)
+
+=== 2. Raw achievable bandwidth on THIS card (not spec sheet) ===
+raw_sequential_read                187.90 GB/s  (2.857 ms/rep, fully coalesced float4 stream)
+
+=== 3. row_dot's actual Q4_K access pattern, same total bytes ===
+row_dot_q4k_pattern                110.41 GB/s  (4.390 ms/rep, 5120 warps, lane-strided q4k reads)
+
+efficiency vs raw achievable: 58.8%

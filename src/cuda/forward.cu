@@ -271,7 +271,8 @@ static void dbg(const char* tag, const float* dv, int n) {
 
 static inline int gt(gguf::GgmlType t) { return (int)t; }
 
-Forward::Forward(const DeviceModel& dm, const ModelConfig& cfg, uint32_t max_ctx)
+Forward::Forward(const DeviceModel& dm, const ModelConfig& cfg, uint32_t max_ctx,
+                 const Manifest& man)
     : dm_(dm), cfg_(cfg), max_ctx_(max_ctx) {
   auto alloc = [](float** p, size_t n) {
     MOEX_CUDA(cudaMalloc(p, n * sizeof(float)));
@@ -299,9 +300,30 @@ Forward::Forward(const DeviceModel& dm, const ModelConfig& cfg, uint32_t max_ctx
   MOEX_CUDA(cudaMalloc(&d_argmax_, sizeof(int)));
   MOEX_CUDA(cudaMalloc(&d_route_, sizeof(RouteTopK)));
   MOEX_CUDA(cudaMallocHost(&h_route_, sizeof(RouteTopK)));
+  MOEX_CUDA(cudaMalloc(&d_gdispatch_, sizeof(ExpertDispatch)));
+  MOEX_CUDA(cudaMalloc(&d_hit_ctr_, sizeof(unsigned long long)));
+  MOEX_CUDA(cudaMalloc(&d_miss_ctr_, sizeof(unsigned long long)));
+  MOEX_CUDA(cudaMemset(d_hit_ctr_, 0, sizeof(unsigned long long)));
+  MOEX_CUDA(cudaMemset(d_miss_ctr_, 0, sizeof(unsigned long long)));
   h_logits_ = (float*)malloc((size_t)cfg.vocab_size * sizeof(float));
   h_router_ = (float*)malloc((size_t)cfg.n_experts * sizeof(float));
   last_route_.assign((size_t)cfg.n_layers * cfg.n_experts_used, -1);
+
+  // Per-layer expert tensor type/row-bytes, from the manifest (not from any
+  // resident DeviceExpert — geometry is uniform across a layer's 128 experts,
+  // and the gpu_dispatch fast path never learns a specific expert id on the
+  // host to key a DeviceExpert lookup off of).
+  gu_type_by_layer_.resize(cfg.n_layers);
+  dn_type_by_layer_.resize(cfg.n_layers);
+  gu_rowbytes_by_layer_.resize(cfg.n_layers);
+  dn_rowbytes_by_layer_.resize(cfg.n_layers);
+  for (uint32_t l = 0; l < cfg.n_layers; ++l) {
+    const ExpertBundle& b = man.expert(l, 0);
+    gu_type_by_layer_[l] = (int)b.gate.type;
+    dn_type_by_layer_[l] = (int)b.down.type;
+    gu_rowbytes_by_layer_[l] = (int)(b.gate.nbytes / cfg.d_ff_expert);
+    dn_rowbytes_by_layer_[l] = (int)(b.down.nbytes / cfg.d_model);
+  }
 }
 
 Forward::~Forward() {
@@ -311,7 +333,8 @@ Forward::~Forward() {
     if (p) cudaFree(p);
   }
   for (void* p : {(void*)argmax_part_v_, (void*)argmax_part_i_,
-                  (void*)d_argmax_, (void*)d_route_}) {
+                  (void*)d_argmax_, (void*)d_route_, (void*)d_gdispatch_,
+                  (void*)d_hit_ctr_, (void*)d_miss_ctr_}) {
     if (p) cudaFree(p);
   }
   if (h_route_) cudaFreeHost(h_route_);
@@ -319,6 +342,19 @@ Forward::~Forward() {
   if (h_dispatch_) cudaFreeHost(h_dispatch_);
   free(h_logits_);
   free(h_router_);
+}
+
+void Forward::read_hit_miss_counters(unsigned long long* hits,
+                                     unsigned long long* misses) const {
+  if (hits) MOEX_CUDA(cudaMemcpy(hits, d_hit_ctr_, sizeof(unsigned long long),
+                                 cudaMemcpyDeviceToHost));
+  if (misses) MOEX_CUDA(cudaMemcpy(misses, d_miss_ctr_, sizeof(unsigned long long),
+                                   cudaMemcpyDeviceToHost));
+}
+
+void Forward::reset_hit_miss_counters() {
+  MOEX_CUDA(cudaMemset(d_hit_ctr_, 0, sizeof(unsigned long long)));
+  MOEX_CUDA(cudaMemset(d_miss_ctr_, 0, sizeof(unsigned long long)));
 }
 
 int Forward::step(int token_id, int pos, std::vector<int>* route_out,
@@ -469,6 +505,32 @@ int Forward::step(int token_id, int pos, std::vector<int>* route_out,
     if (dbgl) dbg("l0.router_logits", router_logits_, c.n_experts);
     if (pf) ev3 = pf->pool.mark();
 
+    if (gpu_dispatch && !force_route && !pf) {
+      // Zero-host-round-trip path: router top-k, pointer resolution, and
+      // dispatch all stay on GPU, in ONE fused launch (see kernel doc: a
+      // separate dispatch_gather_kernel measured net SLOWER on this WDDM
+      // setup — the extra launch cost more than the D2H it removed). See
+      // Forward::gpu_dispatch doc comment for the residency contract.
+      const uint32_t layer_base = l * c.n_experts;
+      router_topk8_dispatch_kernel<<<1, 128>>>(
+          router_logits_, (int)c.n_experts, (int)c.n_experts_used, d_route_,
+          dm_.device_ptr_table(), layer_base, d_gdispatch_, d_hit_ctr_,
+          d_miss_ctr_);
+      hit("router_topk8_dispatch");
+      launch_expert_group_gate_up_silu_dptr(
+          gu_type_by_layer_[l], d_gdispatch_, xn_, group_gate_buf_,
+          (int)c.n_experts_used, c.d_ff_expert, D, gu_rowbytes_by_layer_[l]);
+      hit("expert_group_gate_up_silu_dptr");
+      launch_expert_group_down_dptr(
+          dn_type_by_layer_[l], d_gdispatch_, group_gate_buf_,
+          group_expert_out_, (int)c.n_experts_used, D, c.d_ff_expert,
+          dn_rowbytes_by_layer_[l]);
+      hit("expert_group_down_dptr");
+      launch_expert_group_residual_dptr(d_gdispatch_, group_expert_out_, x_,
+                                        (int)c.n_experts_used, D);
+      hit("expert_group_residual_dptr");
+      if (pf) { ev4 = pf->pool.mark(); phase(&pf->experts_ms); }
+    } else {
     // Router softmax + top-k ON GPU; host receives one 64 B RouteTopK copy
     // (was: 512 B logits D2H + host softmax + partial_sort per layer).
     auto t_rs = Clock::now();
@@ -574,6 +636,7 @@ int Forward::step(int token_id, int pos, std::vector<int>* route_out,
       hit("expert_group_residual");
     }
     if (pf) { ev4 = pf->pool.mark(); phase(&pf->experts_ms); }
+    }  // else (non-gpu_dispatch path)
     if (debug_on()) {  // per-layer: catch first non-finite AND any launch error
       cudaError_t e1 = cudaDeviceSynchronize();
       cudaError_t e2 = cudaGetLastError();
