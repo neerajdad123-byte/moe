@@ -14,6 +14,7 @@
 namespace moex {
 
 struct ExpertDispatch;
+struct RouteTopK;
 
 class Forward {
  public:
@@ -61,6 +62,8 @@ class Forward {
   int* d_topk_idx_ = nullptr;   // [n_experts_used]
   float* d_topk_w_ = nullptr;   // [n_experts_used]
   int argmax_nblocks_ = 256;
+  RouteTopK* d_route_ = nullptr;  // GPU router top-8 output (64 B)
+  RouteTopK* h_route_ = nullptr;  // pinned host mirror
 
   std::vector<int> last_route_;
   float* h_logits_ = nullptr;

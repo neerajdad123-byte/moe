@@ -294,6 +294,11 @@ Forward::Forward(const DeviceModel& dm, const ModelConfig& cfg, uint32_t max_ctx
   alloc(&logits_, cfg.vocab_size);
   alloc(&kcache_, (size_t)cfg.n_layers * max_ctx * cfg.kv_dim());
   alloc(&vcache_, (size_t)cfg.n_layers * max_ctx * cfg.kv_dim());
+  alloc(&argmax_part_v_, argmax_nblocks_);
+  MOEX_CUDA(cudaMalloc(&argmax_part_i_, argmax_nblocks_ * sizeof(int)));
+  MOEX_CUDA(cudaMalloc(&d_argmax_, sizeof(int)));
+  MOEX_CUDA(cudaMalloc(&d_route_, sizeof(RouteTopK)));
+  MOEX_CUDA(cudaMallocHost(&h_route_, sizeof(RouteTopK)));
   h_logits_ = (float*)malloc((size_t)cfg.vocab_size * sizeof(float));
   h_router_ = (float*)malloc((size_t)cfg.n_experts * sizeof(float));
   last_route_.assign((size_t)cfg.n_layers * cfg.n_experts_used, -1);
@@ -305,6 +310,11 @@ Forward::~Forward() {
                    group_expert_out_, logits_, kcache_, vcache_}) {
     if (p) cudaFree(p);
   }
+  for (void* p : {(void*)argmax_part_v_, (void*)argmax_part_i_,
+                  (void*)d_argmax_, (void*)d_route_}) {
+    if (p) cudaFree(p);
+  }
+  if (h_route_) cudaFreeHost(h_route_);
   if (d_dispatch_) cudaFree(d_dispatch_);
   if (h_dispatch_) cudaFreeHost(h_dispatch_);
   free(h_logits_);
@@ -459,41 +469,48 @@ int Forward::step(int token_id, int pos, std::vector<int>* route_out,
     if (dbgl) dbg("l0.router_logits", router_logits_, c.n_experts);
     if (pf) ev3 = pf->pool.mark();
 
-    // Router softmax + top-k on host (exact, simple, correctness-first).
+    // Router softmax + top-k ON GPU; host receives one 64 B RouteTopK copy
+    // (was: 512 B logits D2H + host softmax + partial_sort per layer).
     auto t_rs = Clock::now();
-    MOEX_CUDA(cudaMemcpy(h_router_, router_logits_,
-                         c.n_experts * sizeof(float), cudaMemcpyDeviceToHost));
-    if (pf) {
-      pf->d2h_bytes += (uint64_t)c.n_experts * sizeof(float);
-      pf->d2h_calls += 1;
-    }
-    // top-k by logit, unless force_route is set (resident-route ceiling).
-    std::vector<int> idx(c.n_experts);
+    std::vector<int> idx(c.n_experts_used);
+    float sel_w[64];
     if (force_route) {
+      // Debug/ceiling path: forced ids still need full logits for weights.
+      MOEX_CUDA(cudaMemcpy(h_router_, router_logits_,
+                           c.n_experts * sizeof(float), cudaMemcpyDeviceToHost));
+      if (pf) {
+        pf->d2h_bytes += (uint64_t)c.n_experts * sizeof(float);
+        pf->d2h_calls += 1;
+      }
       for (uint32_t j = 0; j < c.n_experts_used; ++j)
         idx[j] = force_route[(size_t)l * c.n_experts_used + j];
+      float maxl = -1e30f;
+      for (int i = 0; i < (int)c.n_experts; ++i) maxl = fmaxf(maxl, h_router_[i]);
+      double denom = 0.0;
+      for (int i = 0; i < (int)c.n_experts; ++i)
+        denom += exp((double)(h_router_[i] - maxl));
+      double sel_sum = 0.0;
+      for (uint32_t j = 0; j < c.n_experts_used; ++j) {
+        double p = exp((double)(h_router_[idx[j]] - maxl)) / denom;
+        sel_w[j] = (float)p;
+        sel_sum += p;
+      }
+      for (uint32_t j = 0; j < c.n_experts_used; ++j) sel_w[j] /= (float)sel_sum;
     } else {
-      for (int i = 0; i < (int)c.n_experts; ++i) idx[i] = i;
-      std::partial_sort(idx.begin(), idx.begin() + c.n_experts_used, idx.end(),
-                        [&](int a, int b) {
-                          return h_router_[a] > h_router_[b];
-                        });
+      router_topk8_kernel<<<1, 128>>>(router_logits_, (int)c.n_experts,
+                                      (int)c.n_experts_used, d_route_);
+      hit("router_topk8");
+      MOEX_CUDA(cudaMemcpy(h_route_, d_route_, sizeof(RouteTopK),
+                           cudaMemcpyDeviceToHost));
+      if (pf) {
+        pf->d2h_bytes += sizeof(RouteTopK);
+        pf->d2h_calls += 1;
+      }
+      for (uint32_t j = 0; j < c.n_experts_used; ++j) {
+        idx[j] = h_route_->ids[j];
+        sel_w[j] = h_route_->w[j];
+      }
     }
-    // softmax over ALL experts' logits for selected weights (Qwen3: softmax
-    // over full logits then select top-k, then renormalize the k weights).
-    float maxl = -1e30f;
-    for (int i = 0; i < (int)c.n_experts; ++i) maxl = fmaxf(maxl, h_router_[i]);
-    double denom = 0.0;
-    for (int i = 0; i < (int)c.n_experts; ++i)
-      denom += exp((double)(h_router_[i] - maxl));
-    float sel_w[64];
-    double sel_sum = 0.0;
-    for (uint32_t j = 0; j < c.n_experts_used; ++j) {
-      double p = exp((double)(h_router_[idx[j]] - maxl)) / denom;
-      sel_w[j] = (float)p;
-      sel_sum += p;
-    }
-    for (uint32_t j = 0; j < c.n_experts_used; ++j) sel_w[j] /= (float)sel_sum;
     if (pf) {
       pf->router_sync_ms += ms_since(t_rs);
       // router_ms = GPU router gemv + host top-k window from last phase mark
@@ -523,24 +540,38 @@ int Forward::step(int token_id, int pos, std::vector<int>* route_out,
       ensure_experts(l, route_ids, c.n_experts_used);
     }
 
-    // The serial fused path is faster than grouped dispatch on this GPU: each
-    // expert retains its own contiguous launch, avoiding pointer-table traffic
-    // and preserving cache behavior.
-    for (uint32_t j = 0; j < c.n_experts_used; ++j) {
-      int e = idx[j];
-      const DeviceExpert& de = dm_.expert(l, e);
-      launch_expert_gate_up_silu(
-          gt(de.gate.type), (const uint8_t*)de.gate.dptr,
-          (const uint8_t*)de.up.dptr, xn_, gate_buf_, c.d_ff_expert, D,
-          (int)(de.gate.nbytes / c.d_ff_expert));
-      hit("expert_gate_up_silu");
-      account_gemv(de.gate.nbytes, c.d_ff_expert, D);
-      account_gemv(de.up.nbytes, c.d_ff_expert, D);
-      launch_expert_down_residual(
-          gt(de.down.type), (const uint8_t*)de.down.dptr, gate_buf_, x_,
-          sel_w[j], D, c.d_ff_expert, (int)(de.down.nbytes / D));
-      hit("expert_down_residual");
-      account_gemv(de.down.nbytes, D, c.d_ff_expert);
+    // Grouped dispatch: all top-k experts in 3 launches (was 16), with the
+    // pointer table passed by value in kernel constant params — no global
+    // pointer-table reads, no host->device dispatch copy, and a full-GPU
+    // grid (k x d_ff blocks) instead of k sequential small waves.
+    {
+      ExpertDispatch disp{};
+      const DeviceExpert& de0 = dm_.expert(l, idx[0]);
+      const int gu_row_bytes = (int)(de0.gate.nbytes / c.d_ff_expert);
+      const int dn_row_bytes = (int)(de0.down.nbytes / D);
+      const int gu_type = gt(de0.gate.type);
+      const int dn_type = gt(de0.down.type);
+      for (uint32_t j = 0; j < c.n_experts_used; ++j) {
+        const DeviceExpert& de = dm_.expert(l, idx[j]);
+        disp.gate[j] = (const uint8_t*)de.gate.dptr;
+        disp.up[j] = (const uint8_t*)de.up.dptr;
+        disp.down[j] = (const uint8_t*)de.down.dptr;
+        disp.weight[j] = sel_w[j];
+        account_gemv(de.gate.nbytes, c.d_ff_expert, D);
+        account_gemv(de.up.nbytes, c.d_ff_expert, D);
+        account_gemv(de.down.nbytes, D, c.d_ff_expert);
+      }
+      launch_expert_group_gate_up_silu(gu_type, disp, xn_, group_gate_buf_,
+                                       (int)c.n_experts_used, c.d_ff_expert, D,
+                                       gu_row_bytes);
+      hit("expert_group_gate_up_silu");
+      launch_expert_group_down(dn_type, disp, group_gate_buf_,
+                               group_expert_out_, (int)c.n_experts_used, D,
+                               c.d_ff_expert, dn_row_bytes);
+      hit("expert_group_down");
+      launch_expert_group_residual(disp, group_expert_out_, x_,
+                                   (int)c.n_experts_used, D);
+      hit("expert_group_residual");
     }
     if (pf) { ev4 = pf->pool.mark(); phase(&pf->experts_ms); }
     if (debug_on()) {  // per-layer: catch first non-finite AND any launch error
@@ -569,12 +600,20 @@ int Forward::step(int token_id, int pos, std::vector<int>* route_out,
   dbg("final_logits", logits_, (int)c.vocab_size);
   if (pf) ev5 = pf->pool.mark();
 
+  // Greedy sampling ON GPU (design doc P0 "on-GPU sampling"): two-stage
+  // argmax over 151,936 logits, then a 4-byte D2H — replaces a 608 KB logits
+  // copy + host scan every token.
   auto t_ls = Clock::now();
-  MOEX_CUDA(cudaMemcpy(h_logits_, logits_, c.vocab_size * sizeof(float),
-                       cudaMemcpyDeviceToHost));
-  MOEX_CUDA(cudaDeviceSynchronize());
+  argmax_stage1_kernel<<<argmax_nblocks_, 256>>>(logits_, (int)c.vocab_size,
+                                                 argmax_part_v_, argmax_part_i_);
+  hit("argmax_stage1");
+  argmax_stage2_kernel<<<1, 256>>>(argmax_part_v_, argmax_part_i_,
+                                   argmax_nblocks_, d_argmax_);
+  hit("argmax_stage2");
+  int best = 0;
+  MOEX_CUDA(cudaMemcpy(&best, d_argmax_, sizeof(int), cudaMemcpyDeviceToHost));
   if (pf) {
-    pf->d2h_bytes += (uint64_t)c.vocab_size * sizeof(float);
+    pf->d2h_bytes += sizeof(int);
     pf->d2h_calls += 1;
     pf->logits_sync_ms += ms_since(t_ls);
     pf->final_ms += ms_since(pf->tp);
@@ -583,16 +622,11 @@ int Forward::step(int token_id, int pos, std::vector<int>* route_out,
   }
 
   if (debug_on()) {
+    MOEX_CUDA(cudaMemcpy(h_logits_, logits_, c.vocab_size * sizeof(float),
+                         cudaMemcpyDeviceToHost));
     std::fprintf(stderr, "  [dbg] raw logits[0..9]:");
     for (int i = 0; i < 10; ++i) std::fprintf(stderr, " %.3e", h_logits_[i]);
     std::fprintf(stderr, "\n");
-  }
-
-  // argmax
-  int best = 0;
-  float bestv = h_logits_[0];
-  for (int i = 1; i < (int)c.vocab_size; ++i) {
-    if (h_logits_[i] > bestv) { bestv = h_logits_[i]; best = i; }
   }
   if (pf) {
     const double wall_ms = ms_since(tok_t0);

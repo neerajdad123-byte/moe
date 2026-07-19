@@ -216,6 +216,85 @@ __device__ __forceinline__ float dot_superblock_q6k(const uint8_t* p, const floa
   return acc;
 }
 
+// ---- Lane-cooperative superblock dots: all 32 lanes of a warp work on ONE
+// superblock together (lane = element position within each 32-elem group).
+// The old whole-superblock-per-lane functions above idle 24-29 of 32 lanes on
+// this model's 2048/768-column matrices (only nsb=8 or 3 superblocks per row);
+// these keep every lane busy and make q-byte reads coalesced. The per-warp
+// partial-sum association changes (fp reassociation within tolerance); the
+// dequant value math is identical to the bit-exact-validated formulas above.
+//
+// Q4_K group map (matches dot_superblock_q4k): group g in 0..7 covers elems
+// [32g, 32g+32); scale pair index = g; q byte = q[(g>>1)*32 + lane]; low
+// nibble when g is even, high when odd.
+__device__ __forceinline__ float dot_sb_q4k_lane(const uint8_t* p,
+                                                 const float* x, int lane) {
+  const float d = rd_h(p);
+  const float dmin = rd_h(p + 2);
+  const uint8_t* scales = p + 4;
+  const uint8_t* q = p + 16;
+  float acc = 0.0f;
+#pragma unroll
+  for (int g = 0; g < 8; ++g) {
+    uint8_t sc, m;
+    scale_min_k4(g, scales, &sc, &m);
+    const uint8_t b = q[(g >> 1) * 32 + lane];
+    const int nib = (g & 1) ? (b >> 4) : (b & 0x0F);
+    acc += (d * sc * nib - dmin * m) * x[g * 32 + lane];
+  }
+  return acc;
+}
+
+// Q5_K: same grouping as Q4_K plus the high bit from qh[lane], mask 1<<g.
+__device__ __forceinline__ float dot_sb_q5k_lane(const uint8_t* p,
+                                                 const float* x, int lane) {
+  const float d = rd_h(p);
+  const float dmin = rd_h(p + 2);
+  const uint8_t* scales = p + 4;
+  const uint8_t* qh = p + 16;
+  const uint8_t* ql = p + 48;
+  const uint8_t hbyte = qh[lane];
+  float acc = 0.0f;
+#pragma unroll
+  for (int g = 0; g < 8; ++g) {
+    uint8_t sc, m;
+    scale_min_k4(g, scales, &sc, &m);
+    const uint8_t b = ql[(g >> 1) * 32 + lane];
+    const int nib = (g & 1) ? (b >> 4) : (b & 0x0F);
+    const int hi = (hbyte & (1u << g)) ? 16 : 0;
+    acc += (d * sc * (nib + hi) - dmin * m) * x[g * 32 + lane];
+  }
+  return acc;
+}
+
+// Q6_K: the reference inner loop is already elementwise in l — give each lane
+// its own l and let it produce the same four outputs per 128-elem half.
+__device__ __forceinline__ float dot_sb_q6k_lane(const uint8_t* p,
+                                                 const float* x, int lane) {
+  const uint8_t* ql = p;
+  const uint8_t* qh = p + 128;
+  const int8_t* sc = (const int8_t*)(p + 192);
+  const float d = rd_h(p + 208);
+  float acc = 0.0f;
+#pragma unroll
+  for (int half = 0; half < 2; ++half) {
+    const uint8_t* qlh = ql + 64 * half;
+    const uint8_t* qhh = qh + 32 * half;
+    const int8_t* sch = sc + 8 * half;
+    const float* xx = x + 128 * half;
+    const int is = lane >> 4;
+    const int q1 = (int)((qlh[lane] & 0x0F) | (((qhh[lane] >> 0) & 3) << 4)) - 32;
+    const int q2 = (int)((qlh[lane + 32] & 0x0F) | (((qhh[lane] >> 2) & 3) << 4)) - 32;
+    const int q3 = (int)((qlh[lane] >> 4) | (((qhh[lane] >> 4) & 3) << 4)) - 32;
+    const int q4 = (int)((qlh[lane + 32] >> 4) | (((qhh[lane] >> 6) & 3) << 4)) - 32;
+    acc += d * sch[is + 0] * q1 * xx[lane + 0];
+    acc += d * sch[is + 2] * q2 * xx[lane + 32];
+    acc += d * sch[is + 4] * q3 * xx[lane + 64];
+    acc += d * sch[is + 6] * q4 * xx[lane + 96];
+  }
+  return acc;
+}
+
 // GGML type codes we handle (mirror gguf::GgmlType values).
 enum : int { GT_F32 = 0, GT_F16 = 1, GT_Q8_0 = 8, GT_Q4_K = 12, GT_Q5_K = 13, GT_Q6_K = 14 };
 
