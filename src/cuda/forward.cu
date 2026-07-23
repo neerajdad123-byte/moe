@@ -107,70 +107,55 @@ __global__ void kv_store_kernel(const float* k, const float* v, float* kcache,
   vcache[(size_t)pos * kv_dim + i] = v[i];
 }
 
-// GQA decode attention. One block per query head. Streams over 0..pos.
-// KV head = qhead / (n_head/n_head_kv). Softmax over scores, weighted sum of V.
+// GQA decode attention. One block per query head, 32 threads (one warp).
+// Online softmax over timesteps with warp-shuffled m/l/acc — no atomics, no
+// per-thread acc[128], no block-wide tree sync per timestep.
 __global__ void gqa_attention_kernel(const float* q, const float* kcache,
                                      const float* vcache, float* out,
                                      int n_head, int n_head_kv, int head_dim,
                                      int pos, float scale) {
-  int qh = blockIdx.x;
-  int t = threadIdx.x;
-  int half_ratio = n_head / n_head_kv;
-  int kvh = qh / half_ratio;
-  int kv_dim = n_head_kv * head_dim;
-  const float* qv = q + qh * head_dim;
+  const int qh = blockIdx.x;
+  const int lane = threadIdx.x;  // 0..31
+  const int half_ratio = n_head / n_head_kv;
+  const int kvh = qh / half_ratio;
+  const int kv_dim = n_head_kv * head_dim;
 
-  extern __shared__ float sh[];  // [head_dim] for q, then reductions
-  float* qs = sh;
-  for (int i = t; i < head_dim; i += blockDim.x) qs[i] = qv[i];
-  __syncthreads();
+  extern __shared__ float qs[];
+  for (int i = lane; i < head_dim; i += 32) qs[i] = q[qh * head_dim + i];
+  __syncwarp();
 
-  // Online softmax accumulation over timesteps.
-  // Each thread handles a subset of timesteps, then we combine.
+  // Each lane owns head_dim/32 output dims (4 when head_dim=128).
+  const int nvec = head_dim >> 5;  // 4
+  float acc[8];                    // head_dim/32 <= 8 for head_dim<=256
   float m = -1e30f, l = 0.0f;
-  float acc[128];  // head_dim <= 128
-  for (int i = 0; i < head_dim; ++i) acc[i] = 0.0f;
+#pragma unroll
+  for (int v = 0; v < 8; ++v) acc[v] = 0.0f;
 
-  for (int ts = t; ts <= pos; ts += blockDim.x) {
+  for (int ts = 0; ts <= pos; ++ts) {
     const float* kk = kcache + (size_t)ts * kv_dim + kvh * head_dim;
-    float dot = 0.0f;
-    for (int i = 0; i < head_dim; ++i) dot += qs[i] * kk[i];
-    dot *= scale;
-    float mn = fmaxf(m, dot);
-    float corr = expf(m - mn);
-    float p = expf(dot - mn);
+    float partial = 0.0f;
+#pragma unroll
+    for (int v = 0; v < nvec; ++v) partial += qs[lane + v * 32] * kk[lane + v * 32];
+    for (int offset = 16; offset > 0; offset >>= 1)
+      partial += __shfl_xor_sync(0xffffffff, partial, offset);
+    const float score = partial * scale;
+
+    const float mn = fmaxf(m, score);
+    const float corr = expf(m - mn);
+    const float p = expf(score - mn);
     l = l * corr + p;
-    const float* vv = vcache + (size_t)ts * kv_dim + kvh * head_dim;
-    for (int i = 0; i < head_dim; ++i) acc[i] = acc[i] * corr + p * vv[i];
+#pragma unroll
+    for (int v = 0; v < nvec; ++v) {
+      const float* vv = vcache + (size_t)ts * kv_dim + kvh * head_dim;
+      acc[v] = acc[v] * corr + p * vv[lane + v * 32];
+    }
     m = mn;
   }
 
-  // Combine partials across threads via shared memory.
-  __shared__ float red_m[256];
-  __shared__ float red_l[256];
-  red_m[t] = m;
-  red_l[t] = l;
-  __syncthreads();
-  // Reduce max
-  float gm = -1e30f;
-  for (int i = 0; i < blockDim.x; ++i) gm = fmaxf(gm, red_m[i]);
-  float corr = expf(m - gm);
-  // rescale this thread's acc and l
-  for (int i = 0; i < head_dim; ++i) acc[i] *= corr;
-  red_l[t] = l * corr;
-  __syncthreads();
-  float gl = 0.0f;
-  for (int i = 0; i < blockDim.x; ++i) gl += red_l[i];
-
-  // Sum acc across threads: use shared mem per dim (serialize threads).
-  __shared__ float sacc[128];
-  for (int i = t; i < head_dim; i += blockDim.x) sacc[i] = 0.0f;
-  __syncthreads();
-  for (int i = 0; i < head_dim; ++i) atomicAdd(&sacc[i], acc[i]);
-  __syncthreads();
-  float inv = 1.0f / gl;
-  for (int i = t; i < head_dim; i += blockDim.x)
-    out[qh * head_dim + i] = sacc[i] * inv;
+  const float inv = 1.0f / l;
+#pragma unroll
+  for (int v = 0; v < nvec; ++v)
+    out[qh * head_dim + lane + v * 32] = acc[v] * inv;
 }
 
 // SiLU(gate) * up  ->  gate_buf
@@ -472,8 +457,8 @@ int Forward::step(int token_id, int pos, std::vector<int>* route_out,
     wprobe("q_postrope", q_, c.q_dim());
     wprobe("k_postrope", k_, c.kv_dim());
 
-    // Attention.
-    gqa_attention_kernel<<<c.n_head, threads, c.head_dim * sizeof(float)>>>(
+    // Attention: one warp per head (shuffle reduce, no atomics).
+    gqa_attention_kernel<<<c.n_head, 32, (size_t)c.head_dim * sizeof(float)>>>(
         q_, kc, vc, attn_out_, c.n_head, c.n_head_kv, c.head_dim, pos,
         attn_scale);
     hit("gqa_attn");
@@ -497,7 +482,7 @@ int Forward::step(int token_id, int pos, std::vector<int>* route_out,
     wprobe("ffn_norm", xn_, D);
 
     // Router logits = Wr . xn  (F32 weights [n_experts x d_model])
-    gemv_q<<<blocks(c.n_experts * 32, threads), threads, (size_t)D * sizeof(float)>>>( 
+    gemv_q<<<blocks(c.n_experts * 32, threads), threads, gemv_smem_bytes(D)>>>( 
         gt(dl.router.type), (const uint8_t*)dl.router.dptr, xn_,
         router_logits_, c.n_experts, D, (int)(dl.router.nbytes / c.n_experts));
     hit("gemv_router");
@@ -505,7 +490,10 @@ int Forward::step(int token_id, int pos, std::vector<int>* route_out,
     if (dbgl) dbg("l0.router_logits", router_logits_, c.n_experts);
     if (pf) ev3 = pf->pool.mark();
 
-    if (gpu_dispatch && !force_route && !pf) {
+    // gpu_dispatch: keep the fast path even while profiling (phase syncs still
+    // inflate absolute ms; headline tok/s stays on prof==nullptr). Skip only
+    // when force_route needs host-visible ids.
+    if (gpu_dispatch && !force_route) {
       // Zero-host-round-trip path: router top-k, pointer resolution, and
       // dispatch all stay on GPU, in ONE fused launch (see kernel doc: a
       // separate dispatch_gather_kernel measured net SLOWER on this WDDM
@@ -517,6 +505,11 @@ int Forward::step(int token_id, int pos, std::vector<int>* route_out,
           dm_.device_ptr_table(), layer_base, d_gdispatch_, d_hit_ctr_,
           d_miss_ctr_);
       hit("router_topk8_dispatch");
+      if (pf) {
+        cudaDeviceSynchronize();
+        pf->router_ms += ms_since(pf->tp);
+        pf->tp = Clock::now();
+      }
       launch_expert_group_gate_up_silu_dptr(
           gu_type_by_layer_[l], d_gdispatch_, xn_, group_gate_buf_,
           (int)c.n_experts_used, c.d_ff_expert, D, gu_rowbytes_by_layer_[l]);
@@ -529,7 +522,18 @@ int Forward::step(int token_id, int pos, std::vector<int>* route_out,
       launch_expert_group_residual_dptr(d_gdispatch_, group_expert_out_, x_,
                                         (int)c.n_experts_used, D);
       hit("expert_group_residual_dptr");
-      if (pf) { ev4 = pf->pool.mark(); phase(&pf->experts_ms); }
+      if (pf) {
+        for (uint32_t j = 0; j < c.n_experts_used; ++j) {
+          account_gemv((uint64_t)gu_rowbytes_by_layer_[l] * c.d_ff_expert,
+                       c.d_ff_expert, D);
+          account_gemv((uint64_t)gu_rowbytes_by_layer_[l] * c.d_ff_expert,
+                       c.d_ff_expert, D);
+          account_gemv((uint64_t)dn_rowbytes_by_layer_[l] * D, D,
+                       c.d_ff_expert);
+        }
+        ev4 = pf->pool.mark();
+        phase(&pf->experts_ms);
+      }
     } else {
     // Router softmax + top-k ON GPU; host receives one 64 B RouteTopK copy
     // (was: 512 B logits D2H + host softmax + partial_sort per layer).
@@ -655,7 +659,7 @@ int Forward::step(int token_id, int pos, std::vector<int>* route_out,
       x_, (const float*)dm_.output_norm().dptr, xn_, D, c.rms_eps);
   hit("rmsnorm");
   dbg("final_norm", xn_, D);
-  gemv_q<<<blocks(c.vocab_size * 32, threads), threads, (size_t)D * sizeof(float)>>>( 
+  gemv_q<<<blocks(c.vocab_size * 32, threads), threads, gemv_smem_bytes(D)>>>(
       gt(dm_.output().type), (const uint8_t*)dm_.output().dptr, xn_, logits_,
       c.vocab_size, D, (int)(dm_.output().nbytes / c.vocab_size));
   hit("gemv_logits");

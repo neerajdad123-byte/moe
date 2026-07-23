@@ -6,16 +6,19 @@ Experimental CUDA inference runtime for `Qwen3-30B-A3B` GGUF models on a 6 GB GP
 
 The latest short-context `"hi"` benchmark uses a real model load, discovers and pins the experts used by `"hi"` plus four generated tokens, then replays the prompt three times with fresh KV cache and expert uploads disabled.
 
+Branch `feat/40toks-kernel-opts` (warp-shuffle GQA attention, `gpu_dispatch` profile path):
+
 | Metric | Result |
 |---|---:|
-| Warm decode | 17.35 tok/s |
-| Warm TTFT | 58.8 ms |
+| Warm decode (best pass) | 18.27 tok/s |
+| Warm decode (3-pass avg) | 16.94 tok/s |
+| Warm TTFT (avg) | 63.6 ms |
 | Warm expert hit rate | 100% |
 | Warm H2D transfers | 0 |
-| Cold expert upload | 3.18 GiB |
-| Cold expert upload time | 1.30 s |
 
-The accepted CUDA changes currently include fused expert gate/up/SiLU, fused expert down/residual, fused QKV dispatch with per-tensor quantization support, fused attention output/residual, and fused Q/K RMSNorm/RoPE.
+Prior mainline ceiling was 17.35 tok/s. Path to 40+ still requires a measured Q8/`dp4a` GEMV win and launch reduction (CUDA graphs); naive multi-warp and Q8 staging regressed on this 4050/WDDM box and are compiled but disabled.
+
+The accepted CUDA changes currently include fused expert gate/up/SiLU, fused expert down/residual, fused QKV dispatch with per-tensor quantization support, fused attention output/residual, fused Q/K RMSNorm/RoPE, and rewrite of GQA decode attention (warp shuffle, no atomics).
 
 Detailed real-pass logs and the per-token trace are under `build/`.
 

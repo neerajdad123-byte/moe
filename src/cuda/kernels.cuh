@@ -245,6 +245,81 @@ __device__ __forceinline__ float dot_sb_q4k_lane(const uint8_t* p,
   return acc;
 }
 
+// ---- Q8 activation staging + dp4a dots (MMVQ-style, clean-room) ------------
+// Activations are quantized once per GEMV block to int8 + per-32 scale, then
+// Q4_K/Q6_K dots use __dp4a instead of float×dequant MACs.
+
+__device__ __forceinline__ int moex_dp4a(int a, int b, int c) {
+#if __CUDA_ARCH__ >= 610
+  return __dp4a(a, b, c);
+#else
+  const int8_t* aa = reinterpret_cast<const int8_t*>(&a);
+  const int8_t* bb = reinterpret_cast<const int8_t*>(&b);
+  return c + (int)aa[0] * bb[0] + (int)aa[1] * bb[1] + (int)aa[2] * bb[2] +
+         (int)aa[3] * bb[3];
+#endif
+}
+
+// Quantize float x[cols] (cols % 32 == 0) into q[cols] + d[cols/32] in smem.
+__device__ __forceinline__ void quantize_activation_q8(const float* x, int cols,
+                                                      float* d_out,
+                                                      int8_t* q_out) {
+  const int nblk = cols >> 5;
+  for (int b = threadIdx.x; b < nblk; b += blockDim.x) {
+    const float* xb = x + (b << 5);
+    float amax = 0.0f;
+#pragma unroll
+    for (int i = 0; i < 32; ++i) amax = fmaxf(amax, fabsf(xb[i]));
+    const float dv = amax / 127.0f + 1e-8f;
+    const float id = 1.0f / dv;
+    d_out[b] = dv;
+    int8_t* qb = q_out + (b << 5);
+#pragma unroll
+    for (int i = 0; i < 32; ++i) {
+      int q = __float2int_rn(xb[i] * id);
+      q = q < -127 ? -127 : (q > 127 ? 127 : q);
+      qb[i] = (int8_t)q;
+    }
+  }
+}
+
+// One Q4_K superblock × Q8 acts. 32 lanes: 4 threads × 8 elems per group.
+__device__ __forceinline__ float dot_sb_q4k_q8_lane(const uint8_t* p,
+                                                     const float* xd,
+                                                     const int8_t* xq,
+                                                     int lane) {
+  const float d = rd_h(p);
+  const float dmin = rd_h(p + 2);
+  const uint8_t* scales = p + 4;
+  const uint8_t* q = p + 16;
+  const int g = lane >> 2;          // 0..7
+  const int e0 = (lane & 3) << 3;   // 0,8,16,24
+  uint8_t sc, m;
+  scale_min_k4(g, scales, &sc, &m);
+  const float ds = d * (float)sc * xd[g];
+  const float dms = dmin * (float)m * xd[g];
+  int sumi = 0;
+  int sumx = 0;
+#pragma unroll
+  for (int pass = 0; pass < 2; ++pass) {
+    const int base = e0 + (pass << 2);
+    int vi = 0;
+    int ui = 0;
+#pragma unroll
+    for (int k = 0; k < 4; ++k) {
+      const int idx = base + k;
+      const uint8_t b = q[(g >> 1) * 32 + idx];
+      const int nib = (g & 1) ? (b >> 4) : (b & 0x0F);
+      const int8_t xqi = xq[g * 32 + idx];
+      vi |= (nib & 0xff) << (8 * k);
+      ui |= ((int)(uint8_t)xqi) << (8 * k);
+      sumx += (int)xqi;
+    }
+    sumi = moex_dp4a(vi, ui, sumi);
+  }
+  return ds * (float)sumi - dms * (float)sumx;
+}
+
 // Q5_K: same grouping as Q4_K plus the high bit from qh[lane], mask 1<<g.
 __device__ __forceinline__ float dot_sb_q5k_lane(const uint8_t* p,
                                                  const float* x, int lane) {
@@ -291,6 +366,42 @@ __device__ __forceinline__ float dot_sb_q6k_lane(const uint8_t* p,
     acc += d * sch[is + 2] * q2 * xx[lane + 32];
     acc += d * sch[is + 4] * q3 * xx[lane + 64];
     acc += d * sch[is + 6] * q4 * xx[lane + 96];
+  }
+  return acc;
+}
+
+// Q6_K × Q8 acts with dp4a on the four (q,x) pairs per half that share a lane.
+__device__ __forceinline__ float dot_sb_q6k_q8_lane(const uint8_t* p,
+                                                     const float* xd,
+                                                     const int8_t* xq,
+                                                     int lane) {
+  const uint8_t* ql = p;
+  const uint8_t* qh = p + 128;
+  const int8_t* sc = (const int8_t*)(p + 192);
+  const float d = rd_h(p + 208);
+  float acc = 0.0f;
+#pragma unroll
+  for (int half = 0; half < 2; ++half) {
+    const uint8_t* qlh = ql + 64 * half;
+    const uint8_t* qhh = qh + 32 * half;
+    const int8_t* sch = sc + 8 * half;
+    const int8_t* xqh = xq + 128 * half;
+    const float* xdh = xd + 4 * half;  // 128 elems = 4 q8 blocks
+    const int is = lane >> 4;
+    const int q1 = (int)((qlh[lane] & 0x0F) | (((qhh[lane] >> 0) & 3) << 4)) - 32;
+    const int q2 = (int)((qlh[lane + 32] & 0x0F) | (((qhh[lane] >> 2) & 3) << 4)) - 32;
+    const int q3 = (int)((qlh[lane] >> 4) | (((qhh[lane] >> 4) & 3) << 4)) - 32;
+    const int q4 = (int)((qlh[lane + 32] >> 4) | (((qhh[lane] >> 6) & 3) << 4)) - 32;
+    // q8 blocks: elems [0,32), [32,64), [64,96), [96,128) → xd indices 0..3
+    const int8_t x1 = xqh[lane + 0];
+    const int8_t x2 = xqh[lane + 32];
+    const int8_t x3 = xqh[lane + 64];
+    const int8_t x4 = xqh[lane + 96];
+    // Per-term scales differ across the four q6 slots — int products + float scale.
+    acc += d * (float)sch[is + 0] * xdh[0] * (float)(q1 * (int)x1);
+    acc += d * (float)sch[is + 2] * xdh[1] * (float)(q2 * (int)x2);
+    acc += d * (float)sch[is + 4] * xdh[2] * (float)(q3 * (int)x3);
+    acc += d * (float)sch[is + 6] * xdh[3] * (float)(q4 * (int)x4);
   }
   return acc;
 }

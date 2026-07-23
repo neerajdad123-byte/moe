@@ -47,9 +47,9 @@ class Forward {
   // be resident and stay resident for the run's duration (no concurrent
   // eviction/upload) — exactly the existing "pinned, H2D disabled"
   // ceiling-test invariant. Hit/miss are tracked in GPU counters, read back
-  // once via read_hit_miss_counters(), not per token. Only takes effect when
-  // force_route == nullptr and prof == nullptr (profiling needs host-visible
-  // per-layer route data; force_route is the deterministic-replay debug path).
+  // once via read_hit_miss_counters(), not per token. Disabled only when
+  // force_route != nullptr (deterministic-replay debug path). Profiling may
+  // use this path; absolute ms are still sync-inflated when prof != nullptr.
   bool gpu_dispatch = false;
   void read_hit_miss_counters(unsigned long long* hits, unsigned long long* misses) const;
   void reset_hit_miss_counters();

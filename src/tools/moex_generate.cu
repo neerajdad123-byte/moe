@@ -114,8 +114,8 @@ int main(int argc, char** argv) {
   MOEX_CUDA(cudaMemGetInfo(&free0, &total0));
   std::printf("=== MoEx: PIN then \"hi\" x%d (VRAM-only, 3B-style) ===\n",
               n_repeats);
-  std::printf("gpu_dispatch: %s (Phase 1 only; Phase 0 discovery and the\n"
-              "  detailed-profile pass always use the host round-trip path)\n",
+  std::printf("gpu_dispatch: %s (Phase 1 + profile; Phase 0 discovery always\n"
+              "  uses the host round-trip path for reactive pin)\n",
               use_gpu_dispatch ? "ON — zero host round trips per layer" : "off");
   std::printf("model:  %s\n", path);
   std::printf("config: layers=%u experts=%u top_k=%u d_model=%u\n", c.n_layers,
@@ -307,6 +307,7 @@ int main(int argc, char** argv) {
     Forward fprof(dm, c, max_ctx, man);
     StepProf prof;
     fprof.prof = &prof;
+    fprof.gpu_dispatch = use_gpu_dispatch;
     long phits = 0, pmiss = 0;
     fprof.ensure_experts = make_probe(&phits, &pmiss);
     int hcalls_before = h2d_calls;
