@@ -73,7 +73,6 @@ __device__ __forceinline__ float row_dot_q8(int type, const uint8_t* row,
       acc += dot_sb_q6k_q8_lane(row + (size_t)sb * BQ6_K, xd + sb * 8,
                                 xq + sb * 256, lane);
   } else {
-    // Should not be used for non-K types; keep a safe fallback.
     return 0.0f;
   }
   return warp_reduce_sum(acc);

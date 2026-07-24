@@ -569,8 +569,8 @@ int Forward::step(int token_id, int pos, std::vector<int>* route_out,
         pf->router_ms += ms_since(pf->tp);
         pf->tp = Clock::now();
       }
-      // Float experts (100% pin match). Q8/MMVQ path is wired but needs real
-      // dp4a packing before it beats this ceiling.
+      // Float experts (correct routes / 100% pin). dp4a Q8 gate is coded but
+      // packing still drifts routes (was ~68% hit) — fix before enabling.
       launch_expert_group_gate_up_silu_dptr(
           gu_type_by_layer_[l], d_gdispatch_, xn_, group_gate_buf_,
           (int)c.n_experts_used, c.d_ff_expert, D, gu_rowbytes_by_layer_[l]);

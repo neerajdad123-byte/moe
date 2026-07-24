@@ -290,7 +290,12 @@ __device__ __forceinline__ void quantize_activation_q8(const float* x, int cols,
   }
 }
 
-// One Q4_K superblock × Q8 acts. Int nibble×q8 product, float scales.
+__device__ __forceinline__ float warp_reduce_sum_f(float v) {
+  for (int o = 16; o > 0; o >>= 1) v += __shfl_down_sync(0xffffffff, v, o);
+  return v;
+}
+
+// One Q4_K superblock × Q8 acts (1 elem/lane). Kept for reference/tests.
 __device__ __forceinline__ float dot_sb_q4k_q8_lane(const uint8_t* p,
                                                      const float* xd,
                                                      const int8_t* xq,
@@ -312,6 +317,40 @@ __device__ __forceinline__ float dot_sb_q4k_q8_lane(const uint8_t* p,
            dmin * (float)m * d8 * (float)q8;
   }
   return acc;
+}
+
+// Q4_K×Q8 MMVQ-style: 8 lanes × __dp4a(4) per group (same scale), then
+// warp-sum. Clean-room algorithm (GGUF Q4_K group map + dp4a), not a copy.
+__device__ __forceinline__ float dot_sb_q4k_q8_dp4a(const uint8_t* p,
+                                                     const float* xd,
+                                                     const int8_t* xq,
+                                                     int lane) {
+  const float d = rd_h(p);
+  const float dmin = rd_h(p + 2);
+  const uint8_t* scales = p + 4;
+  const uint8_t* q = p + 16;
+  float acc = 0.0f;
+  if (lane < 8) {
+#pragma unroll
+    for (int g = 0; g < 8; ++g) {
+      uint8_t sc, m;
+      scale_min_k4(g, scales, &sc, &m);
+      int v = 0, u = 0;
+#pragma unroll
+      for (int k = 0; k < 4; ++k) {
+        const int li = lane * 4 + k;
+        const uint8_t b = q[(g >> 1) * 32 + li];
+        const int nib = (g & 1) ? (b >> 4) : (b & 0x0F);
+        reinterpret_cast<int8_t*>(&v)[k] = (int8_t)nib;
+        reinterpret_cast<int8_t*>(&u)[k] = xq[g * 32 + li];
+      }
+      const int ip = moex_dp4a(v, u, 0);
+      const int is = moex_dp4a(0x01010101, u, 0);
+      const float d8 = xd[g];
+      acc += d * (float)sc * d8 * (float)ip - dmin * (float)m * d8 * (float)is;
+    }
+  }
+  return acc;  // caller warp-reduces once across superblocks
 }
 
 // Q5_K: same grouping as Q4_K plus the high bit from qh[lane], mask 1<<g.
