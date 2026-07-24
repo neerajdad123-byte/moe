@@ -57,21 +57,17 @@ __device__ __forceinline__ float row_dot(int type, const uint8_t* row,
   return warp_reduce_sum(acc);
 }
 
-// Q4_K / Q6_K against Q8-quantized activations (__dp4a path).
+// Q4_K / Q6_K against Q8-quantized activations (__dp4a MMVQ path for Q4_K).
 __device__ __forceinline__ float row_dot_q8(int type, const uint8_t* row,
                                              const float* xd, const int8_t* xq,
                                              int cols, int lane) {
   float acc = 0.0f;
   if (type == GT_Q4_K) {
     const int nsb = cols / 256;
-    for (int sb = 0; sb < nsb; ++sb)
-      acc += dot_sb_q4k_q8_lane(row + (size_t)sb * BQ4_K, xd + sb * 8,
-                                xq + sb * 256, lane);
+    acc = row_dot_q4k_q8_mmvq(row, xd, xq, nsb, lane);
   } else if (type == GT_Q6_K) {
     const int nsb = cols / 256;
-    for (int sb = 0; sb < nsb; ++sb)
-      acc += dot_sb_q6k_q8_lane(row + (size_t)sb * BQ6_K, xd + sb * 8,
-                                xq + sb * 256, lane);
+    acc = row_dot_q6k_q8_mmvq(row, xd, xq, nsb, lane);
   } else {
     return 0.0f;
   }
@@ -80,6 +76,24 @@ __device__ __forceinline__ float row_dot_q8(int type, const uint8_t* row,
 
 __host__ __device__ __forceinline__ bool type_uses_q8_dot(int type) {
   return type == GT_Q4_K || type == GT_Q6_K;
+}
+
+// Two output rows per warp for Q4_K×Q8 MMVQ (llama.cpp rows_per_block=2).
+__device__ __forceinline__ void row_dot_q4k_q8_mmvq2(
+    const uint8_t* row0, const uint8_t* row1, bool have1, const float* xd,
+    const int8_t* xq, int nsb, int lane, float& o0, float& o1) {
+  float a0 = 0.0f, a1 = 0.0f;
+  const int iqs = 2 * (lane & 15);
+#pragma unroll 1
+  for (int sb = lane >> 4; sb < nsb; sb += 2) {
+    const float* xds = xd + sb * 8;
+    const int8_t* xqs = xq + sb * 256;
+    a0 += vec_dot_q4k_q8_iqs(row0 + (size_t)sb * BQ4_K, xds, xqs, iqs);
+    if (have1)
+      a1 += vec_dot_q4k_q8_iqs(row1 + (size_t)sb * BQ4_K, xds, xqs, iqs);
+  }
+  o0 = warp_reduce_sum(a0);
+  o1 = warp_reduce_sum(a1);
 }
 
 // Stage float x then (for Q4_K/Q6_K) quantize to Q8 side buffers.
@@ -156,6 +170,26 @@ __global__ void gemv_q_multiwarp(int type, const uint8_t* W, const float* x,
   }
 }
 
+// F32 GEMV without smem staging (router: 128×2048 — staging costs more than it saves).
+__global__ void gemv_f32(const float* W, const float* x, float* y, int rows,
+                         int cols) {
+  const int row = blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
+  const int lane = threadIdx.x & 31;
+  if (row >= rows) return;
+  const float* wrow = W + (size_t)row * cols;
+  float acc = 0.0f;
+  for (int i = lane; i < cols; i += 32) acc += wrow[i] * x[i];
+  acc = warp_reduce_sum(acc);
+  if (lane == 0) y[row] = acc;
+}
+
+inline void launch_gemv_f32(const float* W, const float* x, float* y, int rows,
+                            int cols) {
+  constexpr int threads = 256;
+  gemv_f32<<<(rows + 7) / 8, threads, 0, moex_launch_stream()>>>(W, x, y, rows,
+                                                                 cols);
+}
+
 __global__ void gemv_q(int type, const uint8_t* W, const float* x, float* y,
                        int rows, int cols, int row_bytes) {
   extern __shared__ char raw[];
@@ -180,7 +214,6 @@ __global__ void qkv_q_kernel(
   float* xs;
   float* xd;
   int8_t* xq;
-  // QKV stays on float path for now; expert FFN uses global Q8 (mmvq.cuh).
   stage_activations(raw, x, cols, xs, xd, xq, false);
   const int lane = threadIdx.x & 31;
   const int row = blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
@@ -198,6 +231,110 @@ __global__ void qkv_q_kernel(
   }
 }
 
+// Q8_0 weights × Q8 activations (int8×int8 + scales).
+__device__ __forceinline__ float row_dot_q8_0_q8(const uint8_t* row,
+                                                   const float* xd,
+                                                   const int8_t* xq, int cols,
+                                                   int lane) {
+  float acc = 0.0f;
+  const int nb = cols / 32;
+  for (int b = lane; b < nb; b += 32) {
+    const uint8_t* p = row + (size_t)b * BQ8_0;
+    const float d = rd_h(p);
+    const int8_t* q = (const int8_t*)(p + 2);
+    float s = 0.0f;
+#pragma unroll
+    for (int i = 0; i < 32; ++i) s += (float)q[i] * (float)xq[b * 32 + i];
+    acc += d * xd[b] * s;
+  }
+  return warp_reduce_sum(acc);
+}
+
+__device__ __forceinline__ float row_dot_auto_q8(int type, const uint8_t* row,
+                                                  const float* xd,
+                                                  const int8_t* xq, int cols,
+                                                  int lane) {
+  if (type == GT_Q4_K || type == GT_Q6_K)
+    return row_dot_q8(type, row, xd, xq, cols, lane);
+  if (type == GT_Q8_0) return row_dot_q8_0_q8(row, xd, xq, cols, lane);
+  return 0.0f;
+}
+
+__global__ void qkv_q8_kernel(
+    int q_type, const uint8_t* Wq, int q_row_bytes, int k_type,
+    const uint8_t* Wk, int k_row_bytes, int v_type, const uint8_t* Wv,
+    int v_row_bytes, const float* xd_g, const int8_t* xq_g, float* q, float* k,
+    float* v, int q_rows, int kv_rows, int cols) {
+  extern __shared__ char raw[];
+  float* xd;
+  int8_t* xq;
+  stage_q8_smem(raw, xd_g, xq_g, cols, xd, xq);
+  const int lane = threadIdx.x & 31;
+  const int row = blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
+  if (row < q_rows) {
+    const float out =
+        row_dot_auto_q8(q_type, Wq + (size_t)row * q_row_bytes, xd, xq, cols,
+                        lane);
+    if (lane == 0) q[row] = out;
+  } else if (row < q_rows + kv_rows) {
+    const int r = row - q_rows;
+    const float out =
+        row_dot_auto_q8(k_type, Wk + (size_t)r * k_row_bytes, xd, xq, cols,
+                        lane);
+    if (lane == 0) k[r] = out;
+  } else if (row < q_rows + 2 * kv_rows) {
+    const int r = row - q_rows - kv_rows;
+    const float out =
+        row_dot_auto_q8(v_type, Wv + (size_t)r * v_row_bytes, xd, xq, cols,
+                        lane);
+    if (lane == 0) v[r] = out;
+  }
+}
+
+// Hybrid: Q4_K/Q6_K rows use global Q8+MMVQ; Q8_0 (K) uses float x (Q8×Q8_0
+// packing was numerically wrong and produced garbage tokens).
+__global__ void qkv_hybrid_kernel(
+    int q_type, const uint8_t* Wq, int q_row_bytes, int k_type,
+    const uint8_t* Wk, int k_row_bytes, int v_type, const uint8_t* Wv,
+    int v_row_bytes, const float* x, const float* xd_g, const int8_t* xq_g,
+    float* q, float* k, float* v, int q_rows, int kv_rows, int cols) {
+  extern __shared__ char raw[];
+  // Layout: xs[cols] | xd[cols/32] | xq[cols]
+  float* xs = reinterpret_cast<float*>(raw);
+  float* xd = xs + cols;
+  int8_t* xq = reinterpret_cast<int8_t*>(xd + cols / 32);
+  const int nblk = cols >> 5;
+  for (int i = threadIdx.x; i < cols; i += blockDim.x) xs[i] = x[i];
+  for (int i = threadIdx.x; i < nblk; i += blockDim.x) xd[i] = xd_g[i];
+  for (int i = threadIdx.x; i < cols; i += blockDim.x) xq[i] = xq_g[i];
+  __syncthreads();
+  const int lane = threadIdx.x & 31;
+  const int row = blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
+  if (row < q_rows) {
+    const float out =
+        type_uses_q8_dot(q_type)
+            ? row_dot_q8(q_type, Wq + (size_t)row * q_row_bytes, xd, xq, cols,
+                         lane)
+            : row_dot(q_type, Wq + (size_t)row * q_row_bytes, xs, cols, lane);
+    if (lane == 0) q[row] = out;
+  } else if (row < q_rows + kv_rows) {
+    const int r = row - q_rows;
+    // K is Q8_0 — always float path.
+    const float out =
+        row_dot(k_type, Wk + (size_t)r * k_row_bytes, xs, cols, lane);
+    if (lane == 0) k[r] = out;
+  } else if (row < q_rows + 2 * kv_rows) {
+    const int r = row - q_rows - kv_rows;
+    // V is Q6_K — Q8 lane (not broken MMVQ).
+    const float out =
+        type_uses_q8_dot(v_type)
+            ? row_dot_q8(v_type, Wv + (size_t)r * v_row_bytes, xd, xq, cols,
+                         lane)
+            : row_dot(v_type, Wv + (size_t)r * v_row_bytes, xs, cols, lane);
+    if (lane == 0) v[r] = out;
+  }
+}
+
 inline void launch_qkv_q(int q_type, const uint8_t* Wq, int q_row_bytes,
                          int k_type, const uint8_t* Wk, int k_row_bytes,
                          int v_type, const uint8_t* Wv, int v_row_bytes,
@@ -208,6 +345,33 @@ inline void launch_qkv_q(int q_type, const uint8_t* Wq, int q_row_bytes,
   qkv_q_kernel<<<(total_rows + 7) / 8, threads, gemv_smem_bytes(cols), moex_launch_stream()>>>(
       q_type, Wq, q_row_bytes, k_type, Wk, k_row_bytes, v_type, Wv,
       v_row_bytes, x, q, k, v, q_rows, kv_rows, cols);
+}
+
+inline void launch_qkv_q8(int q_type, const uint8_t* Wq, int q_row_bytes,
+                          int k_type, const uint8_t* Wk, int k_row_bytes,
+                          int v_type, const uint8_t* Wv, int v_row_bytes,
+                          const float* xd, const int8_t* xq, float* q, float* k,
+                          float* v, int q_rows, int kv_rows, int cols) {
+  constexpr int threads = 256;
+  const int total_rows = q_rows + 2 * kv_rows;
+  qkv_q8_kernel<<<(total_rows + 7) / 8, threads, q8_smem_bytes(cols),
+                  moex_launch_stream()>>>(
+      q_type, Wq, q_row_bytes, k_type, Wk, k_row_bytes, v_type, Wv, v_row_bytes,
+      xd, xq, q, k, v, q_rows, kv_rows, cols);
+}
+
+inline void launch_qkv_hybrid(int q_type, const uint8_t* Wq, int q_row_bytes,
+                              int k_type, const uint8_t* Wk, int k_row_bytes,
+                              int v_type, const uint8_t* Wv, int v_row_bytes,
+                              const float* x, const float* xd, const int8_t* xq,
+                              float* q, float* k, float* v, int q_rows,
+                              int kv_rows, int cols) {
+  constexpr int threads = 256;
+  const int total_rows = q_rows + 2 * kv_rows;
+  const size_t smem = gemv_smem_bytes(cols) + q8_smem_bytes(cols);
+  qkv_hybrid_kernel<<<(total_rows + 7) / 8, threads, smem, moex_launch_stream()>>>(
+      q_type, Wq, q_row_bytes, k_type, Wk, k_row_bytes, v_type, Wv, v_row_bytes,
+      x, xd, xq, q, k, v, q_rows, kv_rows, cols);
 }
 
 // Fuses attention output GEMV and its residual write, avoiding the temporary
@@ -226,11 +390,152 @@ __global__ void gemv_q_residual(int type, const uint8_t* W, const float* in,
   if (lane == 0) x[row] += out;
 }
 
+__global__ void gemv_q_residual_q8(int type, const uint8_t* W, const float* xd_g,
+                                   const int8_t* xq_g, float* x, int rows,
+                                   int cols, int row_bytes) {
+  extern __shared__ char raw[];
+  float* xd;
+  int8_t* xq;
+  stage_q8_smem(raw, xd_g, xq_g, cols, xd, xq);
+  const int lane = threadIdx.x & 31;
+  const int warp = threadIdx.x >> 5;
+  const int row0 = (blockIdx.x * (blockDim.x / 32) + warp) * 2;
+  if (row0 >= rows) return;
+  const bool have1 = (row0 + 1) < rows;
+  float v0, v1;
+  if (type == GT_Q4_K) {
+    const int nsb = cols / 256;
+    row_dot_q4k_q8_mmvq2(W + (size_t)row0 * row_bytes,
+                         W + (size_t)(row0 + 1) * row_bytes, have1, xd, xq, nsb,
+                         lane, v0, v1);
+  } else {
+    v0 = row_dot_auto_q8(type, W + (size_t)row0 * row_bytes, xd, xq, cols,
+                         lane);
+    v1 = 0.0f;
+    if (have1)
+      v1 = row_dot_auto_q8(type, W + (size_t)(row0 + 1) * row_bytes, xd, xq,
+                           cols, lane);
+  }
+  if (lane == 0) {
+    x[row0] += v0;
+    if (have1) x[row0 + 1] += v1;
+  }
+}
+
 inline void launch_gemv_q_residual(int type, const uint8_t* W, const float* in,
                                    float* x, int rows, int cols, int row_bytes) {
   constexpr int threads = 256;
   gemv_q_residual<<<(rows + 7) / 8, threads, gemv_smem_bytes(cols), moex_launch_stream()>>>(
       type, W, in, x, rows, cols, row_bytes);
+}
+
+inline void launch_gemv_q_residual_q8(int type, const uint8_t* W,
+                                      const float* xd, const int8_t* xq,
+                                      float* x, int rows, int cols,
+                                      int row_bytes) {
+  constexpr int threads = 256;
+  gemv_q_residual_q8<<<(rows + 15) / 16, threads, q8_smem_bytes(cols),
+                       moex_launch_stream()>>>(type, W, xd, xq, x, rows, cols,
+                                               row_bytes);
+}
+
+// Q4_K×Q8 MMVQ GEMV with 2 rows/warp (global Q8 acts).
+__global__ void gemv_q4k_q8_rpb2(const uint8_t* W, const float* xd_g,
+                                 const int8_t* xq_g, float* y, int rows,
+                                 int cols, int row_bytes) {
+  extern __shared__ char raw[];
+  float* xd;
+  int8_t* xq;
+  stage_q8_smem(raw, xd_g, xq_g, cols, xd, xq);
+  const int lane = threadIdx.x & 31;
+  const int warp = threadIdx.x >> 5;
+  const int row0 = (blockIdx.x * (blockDim.x / 32) + warp) * 2;
+  if (row0 >= rows) return;
+  const bool have1 = (row0 + 1) < rows;
+  const int nsb = cols / 256;
+  float v0, v1;
+  row_dot_q4k_q8_mmvq2(W + (size_t)row0 * row_bytes,
+                       W + (size_t)(row0 + 1) * row_bytes, have1, xd, xq, nsb,
+                       lane, v0, v1);
+  if (lane == 0) {
+    y[row0] = v0;
+    if (have1) y[row0 + 1] = v1;
+  }
+}
+
+// Q4_K×Q8 MMVQ GEMV with 4 rows/warp (better amortize Q8 stage on tall GEMVs).
+__global__ void gemv_q4k_q8_rpb4(const uint8_t* W, const float* xd_g,
+                                 const int8_t* xq_g, float* y, int rows,
+                                 int cols, int row_bytes) {
+  extern __shared__ char raw[];
+  float* xd;
+  int8_t* xq;
+  stage_q8_smem(raw, xd_g, xq_g, cols, xd, xq);
+  const int lane = threadIdx.x & 31;
+  const int warp = threadIdx.x >> 5;
+  const int row0 = (blockIdx.x * (blockDim.x / 32) + warp) * 4;
+  if (row0 >= rows) return;
+  const int nsb = cols / 256;
+  const int iqs = 2 * (lane & 15);
+  float a[4] = {0, 0, 0, 0};
+#pragma unroll 1
+  for (int sb = lane >> 4; sb < nsb; sb += 2) {
+    const float* xds = xd + sb * 8;
+    const int8_t* xqs = xq + sb * 256;
+    const size_t off = (size_t)sb * BQ4_K;
+#pragma unroll
+    for (int r = 0; r < 4; ++r) {
+      if (row0 + r < rows)
+        a[r] += vec_dot_q4k_q8_iqs(W + (size_t)(row0 + r) * row_bytes + off,
+                                   xds, xqs, iqs);
+    }
+  }
+#pragma unroll
+  for (int r = 0; r < 4; ++r) a[r] = warp_reduce_sum(a[r]);
+  if (lane == 0) {
+#pragma unroll
+    for (int r = 0; r < 4; ++r)
+      if (row0 + r < rows) y[row0 + r] = a[r];
+  }
+}
+
+inline void launch_gemv_q4k_q8_rpb2(const uint8_t* W, const float* xd,
+                                   const int8_t* xq, float* y, int rows,
+                                   int cols, int row_bytes) {
+  constexpr int threads = 256;
+  // Tall Q (4096): 4 rows/warp. Shorter: 2 rows/warp.
+  if (rows >= 2048) {
+    gemv_q4k_q8_rpb4<<<(rows + 31) / 32, threads, q8_smem_bytes(cols),
+                       moex_launch_stream()>>>(W, xd, xq, y, rows, cols,
+                                               row_bytes);
+    return;
+  }
+  gemv_q4k_q8_rpb2<<<(rows + 15) / 16, threads, q8_smem_bytes(cols),
+                     moex_launch_stream()>>>(W, xd, xq, y, rows, cols,
+                                             row_bytes);
+}
+
+__global__ void gemv_q8(int type, const uint8_t* W, const float* xd_g,
+                        const int8_t* xq_g, float* y, int rows, int cols,
+                        int row_bytes) {
+  extern __shared__ char raw[];
+  float* xd;
+  int8_t* xq;
+  stage_q8_smem(raw, xd_g, xq_g, cols, xd, xq);
+  const int warp = blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
+  const int lane = threadIdx.x & 31;
+  if (warp >= rows) return;
+  const float r =
+      row_dot_auto_q8(type, W + (size_t)warp * row_bytes, xd, xq, cols, lane);
+  if (lane == 0) y[warp] = r;
+}
+
+inline void launch_gemv_q8(int type, const uint8_t* W, const float* xd,
+                           const int8_t* xq, float* y, int rows, int cols,
+                           int row_bytes) {
+  constexpr int threads = 256;
+  gemv_q8<<<(rows + 7) / 8, threads, q8_smem_bytes(cols), moex_launch_stream()>>>(
+      type, W, xd, xq, y, rows, cols, row_bytes);
 }
 
 // One fused launch for gate projection, up projection and SiLU multiplication.
@@ -308,16 +613,29 @@ __device__ __forceinline__ float row_dot_multiwarp(int type, const uint8_t* wrow
   float acc = 0.0f;
   if (type == GT_Q4_K) {
     const int nsb = cols / 256;
-    for (int sb = warp; sb < nsb; sb += nwarps)
-      acc += q8 ? dot_sb_q4k_q8_lane(wrow + (size_t)sb * BQ4_K, xd + sb * 8,
-                                     xq + sb * 256, lane)
-                : dot_sb_q4k_lane(wrow + (size_t)sb * BQ4_K, xs + sb * 256, lane);
+    if (q8) {
+      // Each cooperating warp owns a subset of superblocks; within a block
+      // all 16 iqs lanes of that warp run the MMVQ partial.
+      const int iqs = 2 * (lane & 15);
+      for (int sb = warp; sb < nsb; sb += nwarps) {
+        if ((lane & 16) == 0)
+          acc += vec_dot_q4k_q8_iqs(wrow + (size_t)sb * BQ4_K, xd + sb * 8,
+                                   xq + sb * 256, iqs);
+      }
+    } else {
+      for (int sb = warp; sb < nsb; sb += nwarps)
+        acc += dot_sb_q4k_lane(wrow + (size_t)sb * BQ4_K, xs + sb * 256, lane);
+    }
   } else if (type == GT_Q6_K) {
     const int nsb = cols / 256;
-    for (int sb = warp; sb < nsb; sb += nwarps)
-      acc += q8 ? dot_sb_q6k_q8_lane(wrow + (size_t)sb * BQ6_K, xd + sb * 8,
-                                     xq + sb * 256, lane)
-                : dot_sb_q6k_lane(wrow + (size_t)sb * BQ6_K, xs + sb * 256, lane);
+    if (q8) {
+      for (int sb = warp; sb < nsb; sb += nwarps)
+        acc += vec_dot_q6k_q8_iqs(wrow + (size_t)sb * BQ6_K, xd + sb * 8,
+                                  xq + sb * 256, lane);
+    } else {
+      for (int sb = warp; sb < nsb; sb += nwarps)
+        acc += dot_sb_q6k_lane(wrow + (size_t)sb * BQ6_K, xs + sb * 256, lane);
+    }
   } else {
     if (warp == 0)
       return q8 ? row_dot_q8(type, wrow, xd, xq, cols, lane)
@@ -413,7 +731,8 @@ __global__ void expert_group_gate_up_silu_dptr_q8_kernel(
     int type, const ExpertDispatch* dispatch, const float* xd_g,
     const int8_t* xq_g, float* gates, int n_experts, int d_ff, int cols,
     int row_bytes) {
-  // Dynamic smem: [ExpertDispatch | xd | xq] — no float xs (llama.cpp-style).
+  // Dynamic smem: [ExpertDispatch | xd | xq]. Global Q8 staged once; each warp
+  // owns 2 output rows (llama.cpp rows_per_block=2).
   extern __shared__ char raw[];
   ExpertDispatch* ds = reinterpret_cast<ExpertDispatch*>(raw);
   float* xd = reinterpret_cast<float*>(ds + 1);
@@ -426,17 +745,56 @@ __global__ void expert_group_gate_up_silu_dptr_q8_kernel(
   const int expert = blockIdx.y;
   if (expert >= n_experts) return;
   const int lane = threadIdx.x & 31;
-  const int row = blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
-  if (row >= d_ff) return;
+  const int warp = threadIdx.x >> 5;
+  const int row0 = (blockIdx.x * (blockDim.x / 32) + warp) * 2;
+  if (row0 >= d_ff) return;
   const uint8_t* Wg = ds->gate[expert];
   const uint8_t* Wu = ds->up[expert];
   if (!Wg || !Wu) return;
-  const float g =
-      row_dot_q8(type, Wg + (size_t)row * row_bytes, xd, xq, cols, lane);
-  const float u =
-      row_dot_q8(type, Wu + (size_t)row * row_bytes, xd, xq, cols, lane);
-  if (lane == 0)
-    gates[(size_t)expert * d_ff + row] = (g / (1.0f + expf(-g))) * u;
+  const bool have1 = (row0 + 1) < d_ff;
+  float g0, g1, u0, u1;
+  if (type == GT_Q4_K) {
+    const int nsb = cols / 256;
+    // Interleave gate+up K traversal so Wg/Wu share activation cache residency.
+    float ag0 = 0, ag1 = 0, au0 = 0, au1 = 0;
+    const int iqs = 2 * (lane & 15);
+#pragma unroll 1
+    for (int sb = lane >> 4; sb < nsb; sb += 2) {
+      const float* xds = xd + sb * 8;
+      const int8_t* xqs = xq + sb * 256;
+      const size_t off = (size_t)sb * BQ4_K;
+      ag0 += vec_dot_q4k_q8_iqs(Wg + (size_t)row0 * row_bytes + off, xds, xqs,
+                                iqs);
+      au0 += vec_dot_q4k_q8_iqs(Wu + (size_t)row0 * row_bytes + off, xds, xqs,
+                                iqs);
+      if (have1) {
+        ag1 += vec_dot_q4k_q8_iqs(Wg + (size_t)(row0 + 1) * row_bytes + off,
+                                  xds, xqs, iqs);
+        au1 += vec_dot_q4k_q8_iqs(Wu + (size_t)(row0 + 1) * row_bytes + off,
+                                  xds, xqs, iqs);
+      }
+    }
+    g0 = warp_reduce_sum(ag0);
+    g1 = warp_reduce_sum(ag1);
+    u0 = warp_reduce_sum(au0);
+    u1 = warp_reduce_sum(au1);
+  } else {
+    g0 = row_dot_q8(type, Wg + (size_t)row0 * row_bytes, xd, xq, cols, lane);
+    u0 = row_dot_q8(type, Wu + (size_t)row0 * row_bytes, xd, xq, cols, lane);
+    g1 = u1 = 0.0f;
+    if (have1) {
+      g1 = row_dot_q8(type, Wg + (size_t)(row0 + 1) * row_bytes, xd, xq, cols,
+                      lane);
+      u1 = row_dot_q8(type, Wu + (size_t)(row0 + 1) * row_bytes, xd, xq, cols,
+                      lane);
+    }
+  }
+  if (lane == 0) {
+    gates[(size_t)expert * d_ff + row0] = (g0 / (1.0f + expf(-g0))) * u0;
+    if (have1)
+      gates[(size_t)expert * d_ff + row0 + 1] =
+          (g1 / (1.0f + expf(-g1))) * u1;
+  }
 }
 
 __global__ void expert_group_down_dptr_kernel(
@@ -466,22 +824,53 @@ __global__ void expert_group_down_dptr_q8_kernel(
     const int8_t* xq_g, float* outs, int n_experts, int d_model, int cols,
     int row_bytes) {
   extern __shared__ char raw[];
-  __shared__ ExpertDispatch ds;
-  if (threadIdx.x == 0) ds = *dispatch;
+  ExpertDispatch* ds = reinterpret_cast<ExpertDispatch*>(raw);
+  float* xd = reinterpret_cast<float*>(ds + 1);
+  int8_t* xq = reinterpret_cast<int8_t*>(xd + cols / 32);
+  if (threadIdx.x == 0) *ds = *dispatch;
   const int expert = blockIdx.y;
   const int nblk = cols >> 5;
-  float* xd;
-  int8_t* xq;
-  stage_q8_smem(raw, xd_g + (size_t)(expert < n_experts ? expert : 0) * nblk,
-                xq_g + (size_t)(expert < n_experts ? expert : 0) * cols, cols, xd,
-                xq);
+  const float* xd_src =
+      xd_g + (size_t)(expert < n_experts ? expert : 0) * nblk;
+  const int8_t* xq_src =
+      xq_g + (size_t)(expert < n_experts ? expert : 0) * cols;
+  for (int i = threadIdx.x; i < nblk; i += blockDim.x) xd[i] = xd_src[i];
+  for (int i = threadIdx.x; i < cols; i += blockDim.x) xq[i] = xq_src[i];
+  __syncthreads();
   if (expert >= n_experts) return;
   const int lane = threadIdx.x & 31;
-  const int row = blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
-  if (row >= d_model) return;
-  const float v = row_dot_q8(type, ds.down[expert] + (size_t)row * row_bytes, xd,
-                             xq, cols, lane);
-  if (lane == 0) outs[(size_t)expert * d_model + row] = v;
+  const int warp = threadIdx.x >> 5;
+  const int row0 = (blockIdx.x * (blockDim.x / 32) + warp) * 2;
+  if (row0 >= d_model) return;
+  const uint8_t* Wd = ds->down[expert];
+  if (!Wd) return;
+  const bool have1 = (row0 + 1) < d_model;
+  float v0, v1;
+  if (type == GT_Q4_K) {
+    const int nsb = cols / 256;
+    row_dot_q4k_q8_mmvq2(Wd + (size_t)row0 * row_bytes,
+                         Wd + (size_t)(row0 + 1) * row_bytes, have1, xd, xq,
+                         nsb, lane, v0, v1);
+  } else if (type == GT_Q6_K) {
+    const int nsb = cols / 256;
+    v0 = row_dot_q6k_q8_mmvq(Wd + (size_t)row0 * row_bytes, xd, xq, nsb, lane);
+    v1 = 0.0f;
+    if (have1)
+      v1 = row_dot_q6k_q8_mmvq(Wd + (size_t)(row0 + 1) * row_bytes, xd, xq,
+                               nsb, lane);
+    v0 = warp_reduce_sum(v0);
+    v1 = warp_reduce_sum(v1);
+  } else {
+    v0 = row_dot_q8(type, Wd + (size_t)row0 * row_bytes, xd, xq, cols, lane);
+    v1 = 0.0f;
+    if (have1)
+      v1 = row_dot_q8(type, Wd + (size_t)(row0 + 1) * row_bytes, xd, xq, cols,
+                      lane);
+  }
+  if (lane == 0) {
+    outs[(size_t)expert * d_model + row0] = v0;
+    if (have1) outs[(size_t)expert * d_model + row0 + 1] = v1;
+  }
 }
 
 __global__ void expert_group_residual_dptr_kernel(const ExpertDispatch* dispatch,
@@ -540,7 +929,7 @@ inline void launch_expert_group_gate_up_silu_dptr_q8(
     const int8_t* xq_g, float* gates, int n_experts, int d_ff, int cols,
     int row_bytes) {
   constexpr int threads = 256;
-  dim3 grid((d_ff + 7) / 8, n_experts);
+  dim3 grid((d_ff + 15) / 16, n_experts);
   const size_t smem = sizeof(ExpertDispatch) + q8_smem_bytes(cols);
   expert_group_gate_up_silu_dptr_q8_kernel<<<grid, threads, smem,
                                              moex_launch_stream()>>>(
@@ -563,8 +952,9 @@ inline void launch_expert_group_down_dptr_q8(
     const int8_t* xq_g, float* outs, int n_experts, int d_model, int cols,
     int row_bytes) {
   constexpr int threads = 256;
-  dim3 grid((d_model + 7) / 8, n_experts);
-  expert_group_down_dptr_q8_kernel<<<grid, threads, q8_smem_bytes(cols), moex_launch_stream()>>>(
+  dim3 grid((d_model + 15) / 16, n_experts);
+  const size_t smem = sizeof(ExpertDispatch) + q8_smem_bytes(cols);
+  expert_group_down_dptr_q8_kernel<<<grid, threads, smem, moex_launch_stream()>>>(
       type, dispatch, xd_g, xq_g, outs, n_experts, d_model, cols, row_bytes);
 }
 

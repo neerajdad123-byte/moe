@@ -52,6 +52,10 @@ class Forward {
   // use this path; absolute ms are still sync-inflated when prof != nullptr.
   bool gpu_dispatch = false;
 
+  // llama.cpp-style Q8 activation path for expert GEMVs (and later QKV).
+  // Must be on for BOTH Phase 0 discovery and Phase 1 so pin sets match.
+  bool use_q8_experts = true;
+
   // CUDA graph replay for gpu_dispatch decode (llama.cpp-style). Requires
   // gpu_dispatch, no force_route/prof/debug. token_id/pos live in d_args_ so
   // the captured graph stays topology-stable across tokens.
@@ -83,8 +87,10 @@ class Forward {
   float* group_gate_buf_ = nullptr;   // [top_k * d_ff]
   float* group_expert_out_ = nullptr; // [top_k * d_model]
   // Global Q8 activations (llama.cpp-style once-per-use quantize).
-  float* q8_d_model_ = nullptr;       // [d_model/32]
-  int8_t* q8_q_model_ = nullptr;      // [d_model]
+  // Sized for max(d_model, q_dim) — attn_out GEMV uses q_dim=4096 on this model.
+  float* q8_d_model_ = nullptr;       // [q8_act_cols_/32]
+  int8_t* q8_q_model_ = nullptr;      // [q8_act_cols_]
+  int q8_act_cols_ = 0;
   float* q8_d_ff_ = nullptr;          // [top_k * d_ff/32]
   int8_t* q8_q_ff_ = nullptr;         // [top_k * d_ff]
   ExpertDispatch* d_dispatch_ = nullptr;

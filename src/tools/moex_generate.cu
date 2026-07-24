@@ -120,6 +120,7 @@ int main(int argc, char** argv) {
   std::printf("cuda_graph:   %s\n",
               use_gpu_dispatch ? "ON for Phase 1 warm passes (capture then replay)"
                                : "off");
+  std::printf("q8_experts:   ON (global Q8 gate/up/down; pin+decode matched)\n");
   std::printf("model:  %s\n", path);
   std::printf("config: layers=%u experts=%u top_k=%u d_model=%u\n", c.n_layers,
               c.n_experts, c.n_experts_used, c.d_model);
@@ -330,8 +331,80 @@ int main(int argc, char** argv) {
                 per_tok(prof.embed_ms), per_tok(prof.attn_ms),
                 per_tok(prof.router_ms), per_tok(prof.experts_ms),
                 per_tok(prof.final_ms));
+    std::printf("\n--- DEEP SUB-PHASE ms/token (sync-inflated; relative shares) ---\n");
+    std::printf("ATTENTION breakdown:\n");
+    std::printf("  attn_norm          %.3f\n", per_tok(prof.attn_norm_ms));
+    std::printf("  quantize_attn      %.3f\n", per_tok(prof.quantize_attn_ms));
+    std::printf("  q_proj             %.3f\n", per_tok(prof.q_proj_ms));
+    std::printf("  k_proj             %.3f\n", per_tok(prof.k_proj_ms));
+    std::printf("  v_proj             %.3f\n", per_tok(prof.v_proj_ms));
+    std::printf("  rope+q/k_norm      %.3f\n", per_tok(prof.rope_ms));
+    std::printf("  kv_store           %.3f\n", per_tok(prof.kv_store_ms));
+    std::printf("  gqa_attn           %.3f\n", per_tok(prof.gqa_ms));
+    std::printf("  attn_out+residual  %.3f\n", per_tok(prof.attn_out_ms));
+    std::printf("ROUTER breakdown:\n");
+    std::printf("  ffn_norm (pre)     %.3f  (counted in experts coarse)\n",
+                per_tok(prof.ffn_norm_ms));
+    std::printf("  router_gemv        %.3f\n", per_tok(prof.router_gemv_ms));
+    std::printf("  router_topk        %.3f\n", per_tok(prof.router_topk_ms));
+    std::printf("EXPERTS breakdown:\n");
+    std::printf("  quantize_model     %.3f\n", per_tok(prof.quantize_model_ms));
+    std::printf("  gate_up_silu       %.3f\n", per_tok(prof.gate_up_ms));
+    std::printf("  quantize_ff        %.3f\n", per_tok(prof.quantize_ff_ms));
+    std::printf("  down               %.3f\n", per_tok(prof.down_ms));
+    std::printf("  residual           %.3f\n", per_tok(prof.residual_ms));
+    std::printf("FINAL breakdown:\n");
+    std::printf("  final_norm         %.3f\n", per_tok(prof.final_norm_ms));
+    std::printf("  logits_gemv        %.3f\n", per_tok(prof.logits_ms));
+    std::printf("  sample+D2H         %.3f\n", per_tok(prof.sample_ms));
+    const double deep_sum =
+        per_tok(prof.embed_ms) + per_tok(prof.attn_norm_ms) +
+        per_tok(prof.quantize_attn_ms) + per_tok(prof.q_proj_ms) +
+        per_tok(prof.k_proj_ms) + per_tok(prof.v_proj_ms) +
+        per_tok(prof.rope_ms) + per_tok(prof.kv_store_ms) +
+        per_tok(prof.gqa_ms) + per_tok(prof.attn_out_ms) +
+        per_tok(prof.ffn_norm_ms) + per_tok(prof.router_gemv_ms) +
+        per_tok(prof.router_topk_ms) + per_tok(prof.quantize_model_ms) +
+        per_tok(prof.gate_up_ms) + per_tok(prof.quantize_ff_ms) +
+        per_tok(prof.down_ms) + per_tok(prof.residual_ms) +
+        per_tok(prof.final_norm_ms) + per_tok(prof.logits_ms) +
+        per_tok(prof.sample_ms);
+    std::printf("deep_sum ms/token:   %.3f  (vs wall mean %.3f; gap=sync/overhead)\n",
+                deep_sum, avg_wall);
     std::printf("host sync ms/token: router %.3f | logits/sample %.3f\n",
                 per_tok(prof.router_sync_ms), per_tok(prof.logits_sync_ms));
+    FILE* deep = std::fopen("build/profile_deep.csv", "wb");
+    if (deep) {
+      std::fprintf(deep,
+                   "bucket,ms_per_token,pct_of_deep_sum\n");
+      auto row = [&](const char* name, double ms) {
+        std::fprintf(deep, "%s,%.6f,%.2f\n", name, ms,
+                     deep_sum > 0 ? 100.0 * ms / deep_sum : 0.0);
+      };
+      row("embed", per_tok(prof.embed_ms));
+      row("attn_norm", per_tok(prof.attn_norm_ms));
+      row("quantize_attn", per_tok(prof.quantize_attn_ms));
+      row("q_proj", per_tok(prof.q_proj_ms));
+      row("k_proj", per_tok(prof.k_proj_ms));
+      row("v_proj", per_tok(prof.v_proj_ms));
+      row("rope", per_tok(prof.rope_ms));
+      row("kv_store", per_tok(prof.kv_store_ms));
+      row("gqa_attn", per_tok(prof.gqa_ms));
+      row("attn_out", per_tok(prof.attn_out_ms));
+      row("ffn_norm", per_tok(prof.ffn_norm_ms));
+      row("router_gemv", per_tok(prof.router_gemv_ms));
+      row("router_topk", per_tok(prof.router_topk_ms));
+      row("quantize_model", per_tok(prof.quantize_model_ms));
+      row("gate_up", per_tok(prof.gate_up_ms));
+      row("quantize_ff", per_tok(prof.quantize_ff_ms));
+      row("down", per_tok(prof.down_ms));
+      row("residual", per_tok(prof.residual_ms));
+      row("final_norm", per_tok(prof.final_norm_ms));
+      row("logits", per_tok(prof.logits_ms));
+      row("sample", per_tok(prof.sample_ms));
+      std::fclose(deep);
+      std::printf("deep sub-phase CSV: build/profile_deep.csv\n");
+    }
     std::printf("transfers: H2D %llu B/%d calls | D2H %llu B/%d calls | D2D %llu B/%d calls\n",
                 (unsigned long long)(h2d_bytes - hbytes_before),
                 h2d_calls - hcalls_before, (unsigned long long)prof.d2h_bytes,

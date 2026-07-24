@@ -12,7 +12,7 @@
 namespace moex {
 
 // SoA Q8 activation: d[nblk] scales + q[cols] int8 values (cols = 32*nblk).
-inline size_t q8_smem_bytes(int cols) {
+__host__ __device__ inline size_t q8_smem_bytes(int cols) {
   return (size_t)(cols / 32) * sizeof(float) + (size_t)cols;
 }
 

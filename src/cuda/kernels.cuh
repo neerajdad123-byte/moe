@@ -295,7 +295,7 @@ __device__ __forceinline__ float warp_reduce_sum_f(float v) {
   return v;
 }
 
-// One Q4_K superblock × Q8 acts (1 elem/lane). Kept for reference/tests.
+// One Q4_K superblock × Q8 acts (1 elem/lane). Reference / fallback.
 __device__ __forceinline__ float dot_sb_q4k_q8_lane(const uint8_t* p,
                                                      const float* xd,
                                                      const int8_t* xq,
@@ -319,38 +319,58 @@ __device__ __forceinline__ float dot_sb_q4k_q8_lane(const uint8_t* p,
   return acc;
 }
 
-// Q4_K×Q8 MMVQ-style: 8 lanes × __dp4a(4) per group (same scale), then
-// warp-sum. Clean-room algorithm (GGUF Q4_K group map + dp4a), not a copy.
-__device__ __forceinline__ float dot_sb_q4k_q8_dp4a(const uint8_t* p,
+// Partial Q4_K×Q8_1 MMVQ-style dot for one superblock.
+// iqs ∈ {0,2,...,30}: 16 threads cover all 256 elems via __dp4a.
+// Clean-room (GGUF Q4_K qs layout + Q8 SoA scales); not a source copy.
+__device__ __forceinline__ float vec_dot_q4k_q8_iqs(const uint8_t* p,
                                                      const float* xd,
                                                      const int8_t* xq,
-                                                     int lane) {
+                                                     int iqs) {
   const float d = rd_h(p);
   const float dmin = rd_h(p + 2);
   const uint8_t* scales = p + 4;
-  const uint8_t* q = p + 16;
-  float acc = 0.0f;
-  if (lane < 8) {
+  const uint8_t* qs = p + 16;
+  // 4 thread-pairs hit bq8_offset ∈ {0,2,4,6}; each covers two Q8 groups.
+  const int bq8_offset = 2 * ((iqs / 2) / 4);
+  const int* q4 = (const int*)(qs + 16 * bq8_offset + 4 * ((iqs / 2) % 4));
+  const int v0 = q4[0];
+  const int v1 = q4[4];
+  float sumf_d = 0.0f;
+  float sumf_m = 0.0f;
 #pragma unroll
-    for (int g = 0; g < 8; ++g) {
-      uint8_t sc, m;
-      scale_min_k4(g, scales, &sc, &m);
-      int v = 0, u = 0;
-#pragma unroll
-      for (int k = 0; k < 4; ++k) {
-        const int li = lane * 4 + k;
-        const uint8_t b = q[(g >> 1) * 32 + li];
-        const int nib = (g & 1) ? (b >> 4) : (b & 0x0F);
-        reinterpret_cast<int8_t*>(&v)[k] = (int8_t)nib;
-        reinterpret_cast<int8_t*>(&u)[k] = xq[g * 32 + li];
-      }
-      const int ip = moex_dp4a(v, u, 0);
-      const int is = moex_dp4a(0x01010101, u, 0);
-      const float d8 = xd[g];
-      acc += d * (float)sc * d8 * (float)ip - dmin * (float)m * d8 * (float)is;
-    }
+  for (int i = 0; i < 2; ++i) {
+    const int g = bq8_offset + i;
+    uint8_t sc, m;
+    scale_min_k4(g, scales, &sc, &m);
+    const float d8 = xd[g];
+    const int* q8 = (const int*)(xq + g * 32) + ((iqs / 2) % 4);
+    const int u0 = q8[0];
+    const int u1 = q8[4];
+    const int v0i = (v0 >> (4 * i)) & 0x0F0F0F0F;
+    const int v1i = (v1 >> (4 * i)) & 0x0F0F0F0F;
+    const int dot1 = moex_dp4a(v1i, u1, moex_dp4a(v0i, u0, 0));
+    const int dot2 =
+        moex_dp4a(0x01010101, u1, moex_dp4a(0x01010101, u0, 0));
+    sumf_d += d8 * (float)(dot1 * (int)sc);
+    sumf_m += d8 * (float)(dot2 * (int)m);
   }
-  return acc;  // caller warp-reduces once across superblocks
+  return d * sumf_d - dmin * sumf_m;
+}
+
+// Full-warp Q4_K×Q8 over nsb superblocks (cols = 256*nsb). Lanes 0..15 and
+// 16..31 stride odd/even superblocks (llama.cpp MMVQ 1-warp pattern).
+__device__ __forceinline__ float row_dot_q4k_q8_mmvq(const uint8_t* row,
+                                                      const float* xd,
+                                                      const int8_t* xq,
+                                                      int nsb, int lane) {
+  float acc = 0.0f;
+  const int iqs = 2 * (lane & 15);
+#pragma unroll 1
+  for (int sb = lane >> 4; sb < nsb; sb += 2) {
+    acc += vec_dot_q4k_q8_iqs(row + (size_t)sb * BQ4_K, xd + sb * 8,
+                              xq + sb * 256, iqs);
+  }
+  return acc;
 }
 
 // Q5_K: same grouping as Q4_K plus the high bit from qh[lane], mask 1<<g.
@@ -403,7 +423,7 @@ __device__ __forceinline__ float dot_sb_q6k_lane(const uint8_t* p,
   return acc;
 }
 
-// Q6_K × Q8 acts with dp4a on the four (q,x) pairs per half that share a lane.
+// Q6_K × Q8 acts with per-lane int products (fallback / reference).
 __device__ __forceinline__ float dot_sb_q6k_q8_lane(const uint8_t* p,
                                                      const float* xd,
                                                      const int8_t* xq,
@@ -425,16 +445,71 @@ __device__ __forceinline__ float dot_sb_q6k_q8_lane(const uint8_t* p,
     const int q2 = (int)((qlh[lane + 32] & 0x0F) | (((qhh[lane] >> 2) & 3) << 4)) - 32;
     const int q3 = (int)((qlh[lane] >> 4) | (((qhh[lane] >> 4) & 3) << 4)) - 32;
     const int q4 = (int)((qlh[lane + 32] >> 4) | (((qhh[lane] >> 6) & 3) << 4)) - 32;
-    // q8 blocks: elems [0,32), [32,64), [64,96), [96,128) → xd indices 0..3
     const int8_t x1 = xqh[lane + 0];
     const int8_t x2 = xqh[lane + 32];
     const int8_t x3 = xqh[lane + 64];
     const int8_t x4 = xqh[lane + 96];
-    // Per-term scales differ across the four q6 slots — int products + float scale.
     acc += d * (float)sch[is + 0] * xdh[0] * (float)(q1 * (int)x1);
     acc += d * (float)sch[is + 2] * xdh[1] * (float)(q2 * (int)x2);
     acc += d * (float)sch[is + 4] * xdh[2] * (float)(q3 * (int)x3);
     acc += d * (float)sch[is + 6] * xdh[3] * (float)(q4 * (int)x4);
+  }
+  return acc;
+}
+
+__device__ __forceinline__ int moex_get_int_b2(const void* x, int i32) {
+  const uint16_t* x16 = (const uint16_t*)x;
+  return (int)x16[2 * i32] | ((int)x16[2 * i32 + 1] << 16);
+}
+
+__device__ __forceinline__ int moex_get_int_b4(const void* x, int i32) {
+  return ((const int*)x)[i32];
+}
+
+// Partial Q6_K×Q8 MMVQ-style dot. iqs ∈ 0..31 (all warp lanes). Clean-room.
+__device__ __forceinline__ float vec_dot_q6k_q8_iqs(const uint8_t* p,
+                                                     const float* xd,
+                                                     const int8_t* xq,
+                                                     int iqs) {
+  const uint8_t* ql = p;
+  const uint8_t* qh = p + 128;
+  const int8_t* sc_base = (const int8_t*)(p + 192);
+  const float d = rd_h(p + 208);
+  constexpr int QI6 = 32;  // QK_K/(4*QR6_K)
+  const int bq8_offset =
+      2 * 2 * (iqs / (QI6 / 2)) + (iqs % (QI6 / 2)) / (QI6 / 4);
+  const int scale_offset =
+      (QI6 / 4) * (iqs / (QI6 / 2)) + (iqs % (QI6 / 2)) / (QI6 / 8);
+  const int vh_shift = 2 * ((iqs % (QI6 / 2)) / (QI6 / 4));
+  const int vl = moex_get_int_b2(ql, iqs);
+  const int vh =
+      moex_get_int_b2(qh, (QI6 / 4) * (iqs / (QI6 / 2)) + iqs % (QI6 / 4)) >>
+      vh_shift;
+  const int8_t* scales = sc_base + scale_offset;
+  float sumf = 0.0f;
+#pragma unroll
+  for (int i = 0; i < 2; ++i) {
+    const int sc = (int)scales[4 * i];
+    const int vil = (vl >> (4 * i)) & 0x0F0F0F0F;
+    const int vih = ((vh >> (4 * i)) << 4) & 0x30303030;
+    const int vi = __vsubss4(vil | vih, 0x20202020);
+    const int q8_blk = bq8_offset + 2 * i;
+    const int u = moex_get_int_b4(xq + q8_blk * 32, iqs % 8);
+    const float d8 = xd[q8_blk];
+    sumf += d8 * (float)(moex_dp4a(vi, u, 0) * sc);
+  }
+  return d * sumf;
+}
+
+__device__ __forceinline__ float row_dot_q6k_q8_mmvq(const uint8_t* row,
+                                                      const float* xd,
+                                                      const int8_t* xq,
+                                                      int nsb, int lane) {
+  float acc = 0.0f;
+#pragma unroll 1
+  for (int sb = 0; sb < nsb; ++sb) {
+    acc += vec_dot_q6k_q8_iqs(row + (size_t)sb * BQ6_K, xd + sb * 8,
+                              xq + sb * 256, lane);
   }
   return acc;
 }

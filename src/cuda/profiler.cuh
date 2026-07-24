@@ -86,6 +86,19 @@ struct StepProf {
 
   // --- GPU phase accumulators (ms, summed over the timed run) ---
   double embed_ms = 0, attn_ms = 0, router_ms = 0, experts_ms = 0, final_ms = 0;
+
+  // --- Deep sub-phase breakdown (ms). Profile-only; sync-inflated like phases.
+  // Attention internals:
+  double attn_norm_ms = 0, q_proj_ms = 0, k_proj_ms = 0, v_proj_ms = 0;
+  double rope_ms = 0, kv_store_ms = 0, gqa_ms = 0, attn_out_ms = 0;
+  double quantize_attn_ms = 0;
+  // MoE internals:
+  double ffn_norm_ms = 0, router_gemv_ms = 0, router_topk_ms = 0;
+  double quantize_model_ms = 0, gate_up_ms = 0, quantize_ff_ms = 0;
+  double down_ms = 0, residual_ms = 0;
+  // Final internals:
+  double final_norm_ms = 0, logits_ms = 0, sample_ms = 0;
+
   // --- host sync-point accumulators (ms) ---
   double router_sync_ms = 0;  // router logits D2H + host softmax/top-k
   double logits_sync_ms = 0;  // logits D2H + argmax + final device sync
@@ -121,6 +134,12 @@ struct StepProf {
 
   void reset_run() {
     embed_ms = attn_ms = router_ms = experts_ms = final_ms = 0;
+    attn_norm_ms = q_proj_ms = k_proj_ms = v_proj_ms = 0;
+    rope_ms = kv_store_ms = gqa_ms = attn_out_ms = quantize_attn_ms = 0;
+    ffn_norm_ms = router_gemv_ms = router_topk_ms = 0;
+    quantize_model_ms = gate_up_ms = quantize_ff_ms = 0;
+    down_ms = residual_ms = 0;
+    final_norm_ms = logits_ms = sample_ms = 0;
     router_sync_ms = logits_sync_ms = 0;
     d2h_bytes = h2d_bytes = d2d_bytes = 0;
     d2h_calls = h2d_calls = d2d_calls = 0;

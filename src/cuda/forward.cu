@@ -281,8 +281,10 @@ Forward::Forward(const DeviceModel& dm, const ModelConfig& cfg, uint32_t max_ctx
   alloc(&expert_out_, cfg.d_model);
   alloc(&group_gate_buf_, (size_t)cfg.n_experts_used * cfg.d_ff_expert);
   alloc(&group_expert_out_, (size_t)cfg.n_experts_used * cfg.d_model);
-  MOEX_CUDA(cudaMalloc(&q8_d_model_, (size_t)(cfg.d_model / 32) * sizeof(float)));
-  MOEX_CUDA(cudaMalloc(&q8_q_model_, (size_t)cfg.d_model));
+  q8_act_cols_ = (int)std::max(cfg.d_model, cfg.q_dim());
+  MOEX_CUDA(cudaMalloc(&q8_d_model_,
+                       (size_t)(q8_act_cols_ / 32) * sizeof(float)));
+  MOEX_CUDA(cudaMalloc(&q8_q_model_, (size_t)q8_act_cols_));
   MOEX_CUDA(cudaMalloc(&q8_d_ff_,
                        (size_t)cfg.n_experts_used * (cfg.d_ff_expert / 32) *
                            sizeof(float)));
@@ -469,20 +471,50 @@ int Forward::step(int token_id, int pos, std::vector<int>* route_out,
     rmsnorm_kernel<<<1, threads, threads * sizeof(float), moex_launch_stream()>>>(
         x_, (const float*)dl.attn_norm.dptr, xn_, D, c.rms_eps);
     hit("rmsnorm");
+    if (pf) phase(&pf->attn_norm_ms);
 
     if (dbgl) dbg("l0.attn_norm", xn_, D);
     wprobe("attn_norm", xn_, D);
 
-    // One launch for Q/K/V while preserving their distinct GGUF layouts:
-    // Q4_K (Q), Q8_0 (K), and Q6_K (V) in this model.
-    launch_qkv_q(
-        gt(dl.attn_q.type), (const uint8_t*)dl.attn_q.dptr,
-        (int)(dl.attn_q.nbytes / c.q_dim()), gt(dl.attn_k.type),
-        (const uint8_t*)dl.attn_k.dptr, (int)(dl.attn_k.nbytes / c.kv_dim()),
-        gt(dl.attn_v.type), (const uint8_t*)dl.attn_v.dptr,
-        (int)(dl.attn_v.nbytes / c.kv_dim()), xn_, q_, k_, v_, c.q_dim(),
-        c.kv_dim(), D);
-    hit("qkv_fused");
+    // Q: dedicated Q4_K×Q8 MMVQ (2 rows/warp). K/V: float (K is Q8_0).
+    if (use_q8_experts && gt(dl.attn_q.type) == GT_Q4_K) {
+      launch_quantize_q8_1(xn_, q8_d_model_, q8_q_model_, D);
+      hit("quantize_q8_attn");
+      if (pf) phase(&pf->quantize_attn_ms);
+      launch_gemv_q4k_q8_rpb2((const uint8_t*)dl.attn_q.dptr, q8_d_model_,
+                              q8_q_model_, q_, c.q_dim(), D,
+                              (int)(dl.attn_q.nbytes / c.q_dim()));
+      hit("q_proj_q8");
+      if (pf) phase(&pf->q_proj_ms);
+      gemv_q<<<blocks(c.kv_dim() * 32, threads), threads, gemv_smem_bytes(D),
+               moex_launch_stream()>>>(
+          gt(dl.attn_k.type), (const uint8_t*)dl.attn_k.dptr, xn_, k_,
+          c.kv_dim(), D, (int)(dl.attn_k.nbytes / c.kv_dim()));
+      hit("k_proj");
+      if (pf) phase(&pf->k_proj_ms);
+      if (type_uses_q8_dot(gt(dl.attn_v.type))) {
+        launch_gemv_q8(gt(dl.attn_v.type), (const uint8_t*)dl.attn_v.dptr,
+                       q8_d_model_, q8_q_model_, v_, c.kv_dim(), D,
+                       (int)(dl.attn_v.nbytes / c.kv_dim()));
+      } else {
+        gemv_q<<<blocks(c.kv_dim() * 32, threads), threads, gemv_smem_bytes(D),
+                 moex_launch_stream()>>>(
+            gt(dl.attn_v.type), (const uint8_t*)dl.attn_v.dptr, xn_, v_,
+            c.kv_dim(), D, (int)(dl.attn_v.nbytes / c.kv_dim()));
+      }
+      hit("v_proj");
+      if (pf) phase(&pf->v_proj_ms);
+    } else {
+      launch_qkv_q(
+          gt(dl.attn_q.type), (const uint8_t*)dl.attn_q.dptr,
+          (int)(dl.attn_q.nbytes / c.q_dim()), gt(dl.attn_k.type),
+          (const uint8_t*)dl.attn_k.dptr, (int)(dl.attn_k.nbytes / c.kv_dim()),
+          gt(dl.attn_v.type), (const uint8_t*)dl.attn_v.dptr,
+          (int)(dl.attn_v.nbytes / c.kv_dim()), xn_, q_, k_, v_, c.q_dim(),
+          c.kv_dim(), D);
+      hit("qkv_fused");
+      if (pf) phase(&pf->q_proj_ms);  // fused QKV charged to q_proj bucket
+    }
     account_gemv(dl.attn_q.nbytes, c.q_dim(), D);
     account_gemv(dl.attn_k.nbytes, c.kv_dim(), D);
     account_gemv(dl.attn_v.nbytes, c.kv_dim(), D);
@@ -498,6 +530,7 @@ int Forward::step(int token_id, int pos, std::vector<int>* route_out,
         k_, (const float*)dl.attn_k_norm.dptr, c.head_dim, &d_args_->pos,
         c.rms_eps, c.rope_base);
     hit("head_rmsnorm_rope");
+    if (pf) phase(&pf->rope_ms);
 
     // Store K/V into cache.
     float* kc = kcache_ + (size_t)l * kv_stride_layer_();
@@ -509,6 +542,7 @@ int Forward::step(int token_id, int pos, std::vector<int>* route_out,
     if (pf) {
       pf->d2d_bytes += 2ull * c.kv_dim() * sizeof(float);
       pf->d2d_calls += 1;
+      phase(&pf->kv_store_ms);
     }
 
     if (dbgl) dbg("l0.q(after rope)", q_, c.q_dim());
@@ -521,31 +555,57 @@ int Forward::step(int token_id, int pos, std::vector<int>* route_out,
         q_, kc, vc, attn_out_, c.n_head, c.n_head_kv, c.head_dim, &d_args_->pos,
         attn_scale);
     hit("gqa_attn");
+    if (pf) phase(&pf->gqa_ms);
     if (dbgl) dbg("l0.attn_out", attn_out_, c.q_dim());
     wprobe("attn_out", attn_out_, c.q_dim());
 
-    // Fused output projection plus residual.
-    launch_gemv_q_residual(
-        gt(dl.attn_output.type), (const uint8_t*)dl.attn_output.dptr, attn_out_,
-        x_, D, c.q_dim(), (int)(dl.attn_output.nbytes / D));
+    // Fused output projection plus residual (Q4_K × Q8 MMVQ when enabled).
+    if (use_q8_experts && type_uses_q8_dot(gt(dl.attn_output.type))) {
+      launch_quantize_q8_1(attn_out_, q8_d_model_, q8_q_model_, c.q_dim());
+      hit("quantize_q8_attn_out");
+      launch_gemv_q_residual_q8(
+          gt(dl.attn_output.type), (const uint8_t*)dl.attn_output.dptr,
+          q8_d_model_, q8_q_model_, x_, D, c.q_dim(),
+          (int)(dl.attn_output.nbytes / D));
+    } else {
+      launch_gemv_q_residual(
+          gt(dl.attn_output.type), (const uint8_t*)dl.attn_output.dptr,
+          attn_out_, x_, D, c.q_dim(), (int)(dl.attn_output.nbytes / D));
+    }
     hit("gemv_attn_out_residual");
     account_gemv(dl.attn_output.nbytes, D, c.q_dim());
     if (dbgl) dbg("l0.x(after attn)", x_, D);
     wprobe("x_postattn", x_, D);
-    if (pf) { ev2 = pf->pool.mark(); phase(&pf->attn_ms); }
+    if (pf) {
+      phase(&pf->attn_out_ms);
+      ev2 = pf->pool.mark();
+      // Coarse attn = sum of fine buckets this layer already added into.
+      pf->attn_ms = pf->attn_norm_ms + pf->quantize_attn_ms + pf->q_proj_ms +
+                    pf->k_proj_ms + pf->v_proj_ms + pf->rope_ms +
+                    pf->kv_store_ms + pf->gqa_ms + pf->attn_out_ms;
+    }
 
     // --- MoE block ---
     rmsnorm_kernel<<<1, threads, threads * sizeof(float), moex_launch_stream()>>>(
         x_, (const float*)dl.ffn_norm.dptr, xn_, D, c.rms_eps);
     hit("rmsnorm");
+    if (pf) phase(&pf->ffn_norm_ms);
     wprobe("ffn_norm", xn_, D);
 
     // Router logits = Wr . xn  (F32 weights [n_experts x d_model])
-    gemv_q<<<blocks(c.n_experts * 32, threads), threads, gemv_smem_bytes(D), moex_launch_stream()>>>( 
-        gt(dl.router.type), (const uint8_t*)dl.router.dptr, xn_,
-        router_logits_, c.n_experts, D, (int)(dl.router.nbytes / c.n_experts));
+    if (gt(dl.router.type) == GT_F32) {
+      launch_gemv_f32((const float*)dl.router.dptr, xn_, router_logits_,
+                      (int)c.n_experts, D);
+    } else {
+      gemv_q<<<blocks(c.n_experts * 32, threads), threads, gemv_smem_bytes(D),
+               moex_launch_stream()>>>(
+          gt(dl.router.type), (const uint8_t*)dl.router.dptr, xn_,
+          router_logits_, c.n_experts, D,
+          (int)(dl.router.nbytes / c.n_experts));
+    }
     hit("gemv_router");
     account_gemv(dl.router.nbytes, c.n_experts, D);
+    if (pf) phase(&pf->router_gemv_ms);
     if (dbgl) dbg("l0.router_logits", router_logits_, c.n_experts);
     if (pf) ev3 = pf->pool.mark();
 
@@ -565,21 +625,42 @@ int Forward::step(int token_id, int pos, std::vector<int>* route_out,
           d_miss_ctr_);
       hit("router_topk8_dispatch");
       if (pf) {
-        cudaDeviceSynchronize();
-        pf->router_ms += ms_since(pf->tp);
-        pf->tp = Clock::now();
+        phase(&pf->router_topk_ms);
+        pf->router_ms = pf->router_gemv_ms + pf->router_topk_ms;
       }
-      // Float experts (correct routes / 100% pin). dp4a Q8 gate is coded but
-      // packing still drifts routes (was ~68% hit) — fix before enabling.
-      launch_expert_group_gate_up_silu_dptr(
-          gu_type_by_layer_[l], d_gdispatch_, xn_, group_gate_buf_,
-          (int)c.n_experts_used, c.d_ff_expert, D, gu_rowbytes_by_layer_[l]);
-      hit("expert_group_gate_up_silu_dptr");
-      launch_expert_group_down_dptr(
-          dn_type_by_layer_[l], d_gdispatch_, group_gate_buf_,
-          group_expert_out_, (int)c.n_experts_used, D, c.d_ff_expert,
-          dn_rowbytes_by_layer_[l]);
-      hit("expert_group_down_dptr");
+      if (use_q8_experts) {
+        launch_quantize_q8_1(xn_, q8_d_model_, q8_q_model_, D);
+        hit("quantize_q8_model");
+        if (pf) phase(&pf->quantize_model_ms);
+        launch_expert_group_gate_up_silu_dptr_q8(
+            gu_type_by_layer_[l], d_gdispatch_, q8_d_model_, q8_q_model_,
+            group_gate_buf_, (int)c.n_experts_used, c.d_ff_expert, D,
+            gu_rowbytes_by_layer_[l]);
+        hit("expert_group_gate_up_silu_dptr");
+        if (pf) phase(&pf->gate_up_ms);
+        launch_quantize_q8_1_batch(group_gate_buf_, q8_d_ff_, q8_q_ff_,
+                                   c.d_ff_expert, (int)c.n_experts_used);
+        hit("quantize_q8_ff");
+        if (pf) phase(&pf->quantize_ff_ms);
+        launch_expert_group_down_dptr_q8(
+            dn_type_by_layer_[l], d_gdispatch_, q8_d_ff_, q8_q_ff_,
+            group_expert_out_, (int)c.n_experts_used, D, c.d_ff_expert,
+            dn_rowbytes_by_layer_[l]);
+        hit("expert_group_down_dptr");
+        if (pf) phase(&pf->down_ms);
+      } else {
+        launch_expert_group_gate_up_silu_dptr(
+            gu_type_by_layer_[l], d_gdispatch_, xn_, group_gate_buf_,
+            (int)c.n_experts_used, c.d_ff_expert, D, gu_rowbytes_by_layer_[l]);
+        hit("expert_group_gate_up_silu_dptr");
+        if (pf) phase(&pf->gate_up_ms);
+        launch_expert_group_down_dptr(
+            dn_type_by_layer_[l], d_gdispatch_, group_gate_buf_,
+            group_expert_out_, (int)c.n_experts_used, D, c.d_ff_expert,
+            dn_rowbytes_by_layer_[l]);
+        hit("expert_group_down_dptr");
+        if (pf) phase(&pf->down_ms);
+      }
       launch_expert_group_residual_dptr(d_gdispatch_, group_expert_out_, x_,
                                         (int)c.n_experts_used, D);
       hit("expert_group_residual_dptr");
@@ -592,8 +673,11 @@ int Forward::step(int token_id, int pos, std::vector<int>* route_out,
           account_gemv((uint64_t)dn_rowbytes_by_layer_[l] * D, D,
                        c.d_ff_expert);
         }
+        phase(&pf->residual_ms);
         ev4 = pf->pool.mark();
-        phase(&pf->experts_ms);
+        pf->experts_ms = pf->ffn_norm_ms + pf->quantize_model_ms +
+                         pf->gate_up_ms + pf->quantize_ff_ms + pf->down_ms +
+                         pf->residual_ms;
       }
     } else {
     // Router softmax + top-k ON GPU; host receives one 64 B RouteTopK copy
@@ -688,19 +772,44 @@ int Forward::step(int token_id, int pos, std::vector<int>* route_out,
         account_gemv(de.up.nbytes, c.d_ff_expert, D);
         account_gemv(de.down.nbytes, D, c.d_ff_expert);
       }
-      launch_expert_group_gate_up_silu(gu_type, disp, xn_, group_gate_buf_,
-                                       (int)c.n_experts_used, c.d_ff_expert, D,
-                                       gu_row_bytes);
-      hit("expert_group_gate_up_silu");
-      launch_expert_group_down(dn_type, disp, group_gate_buf_,
-                               group_expert_out_, (int)c.n_experts_used, D,
-                               c.d_ff_expert, dn_row_bytes);
-      hit("expert_group_down");
-      launch_expert_group_residual(disp, group_expert_out_, x_,
-                                   (int)c.n_experts_used, D);
+      // Same Q8 path as gpu_dispatch so Phase 0 pin set matches Phase 1.
+      *h_dispatch_ = disp;
+      MOEX_CUDA(cudaMemcpy(d_gdispatch_, h_dispatch_, sizeof(ExpertDispatch),
+                           cudaMemcpyHostToDevice));
+      if (use_q8_experts) {
+        launch_quantize_q8_1(xn_, q8_d_model_, q8_q_model_, D);
+        hit("quantize_q8_model");
+        launch_expert_group_gate_up_silu_dptr_q8(
+            gu_type, d_gdispatch_, q8_d_model_, q8_q_model_, group_gate_buf_,
+            (int)c.n_experts_used, c.d_ff_expert, D, gu_row_bytes);
+        hit("expert_group_gate_up_silu");
+        launch_quantize_q8_1_batch(group_gate_buf_, q8_d_ff_, q8_q_ff_,
+                                   c.d_ff_expert, (int)c.n_experts_used);
+        hit("quantize_q8_ff");
+        launch_expert_group_down_dptr_q8(
+            dn_type, d_gdispatch_, q8_d_ff_, q8_q_ff_, group_expert_out_,
+            (int)c.n_experts_used, D, c.d_ff_expert, dn_row_bytes);
+        hit("expert_group_down");
+      } else {
+        launch_expert_group_gate_up_silu(gu_type, disp, xn_, group_gate_buf_,
+                                         (int)c.n_experts_used, c.d_ff_expert, D,
+                                         gu_row_bytes);
+        hit("expert_group_gate_up_silu");
+        launch_expert_group_down(dn_type, disp, group_gate_buf_,
+                                 group_expert_out_, (int)c.n_experts_used, D,
+                                 c.d_ff_expert, dn_row_bytes);
+        hit("expert_group_down");
+      }
+      launch_expert_group_residual_dptr(d_gdispatch_, group_expert_out_, x_,
+                                        (int)c.n_experts_used, D);
       hit("expert_group_residual");
     }
-    if (pf) { ev4 = pf->pool.mark(); phase(&pf->experts_ms); }
+    if (pf) {
+      phase(&pf->residual_ms);
+      ev4 = pf->pool.mark();
+      pf->experts_ms = pf->ffn_norm_ms + pf->quantize_model_ms + pf->gate_up_ms +
+                       pf->quantize_ff_ms + pf->down_ms + pf->residual_ms;
+    }
     }  // else (non-gpu_dispatch path)
     if (debug_on()) {  // per-layer: catch first non-finite AND any launch error
       cudaError_t e1 = cudaDeviceSynchronize();
@@ -719,12 +828,23 @@ int Forward::step(int token_id, int pos, std::vector<int>* route_out,
   rmsnorm_kernel<<<1, threads, threads * sizeof(float), moex_launch_stream()>>>(
       x_, (const float*)dm_.output_norm().dptr, xn_, D, c.rms_eps);
   hit("rmsnorm");
+  if (pf) phase(&pf->final_norm_ms);
   dbg("final_norm", xn_, D);
-  gemv_q<<<blocks(c.vocab_size * 32, threads), threads, gemv_smem_bytes(D), moex_launch_stream()>>>(
-      gt(dm_.output().type), (const uint8_t*)dm_.output().dptr, xn_, logits_,
-      c.vocab_size, D, (int)(dm_.output().nbytes / c.vocab_size));
+  if (use_q8_experts && type_uses_q8_dot(gt(dm_.output().type))) {
+    launch_quantize_q8_1(xn_, q8_d_model_, q8_q_model_, D);
+    hit("quantize_q8_logits");
+    launch_gemv_q8(gt(dm_.output().type), (const uint8_t*)dm_.output().dptr,
+                   q8_d_model_, q8_q_model_, logits_, c.vocab_size, D,
+                   (int)(dm_.output().nbytes / c.vocab_size));
+  } else {
+    gemv_q<<<blocks(c.vocab_size * 32, threads), threads, gemv_smem_bytes(D),
+             moex_launch_stream()>>>(
+        gt(dm_.output().type), (const uint8_t*)dm_.output().dptr, xn_, logits_,
+        c.vocab_size, D, (int)(dm_.output().nbytes / c.vocab_size));
+  }
   hit("gemv_logits");
   account_gemv(dm_.output().nbytes, c.vocab_size, D);
+  if (pf) phase(&pf->logits_ms);
   dbg("final_logits", logits_, (int)c.vocab_size);
   if (pf) ev5 = pf->pool.mark();
 
@@ -758,8 +878,8 @@ int Forward::step(int token_id, int pos, std::vector<int>* route_out,
     pf->d2h_bytes += sizeof(int);
     pf->d2h_calls += 1;
     pf->logits_sync_ms += ms_since(t_ls);
-    pf->final_ms += ms_since(pf->tp);
-    pf->tp = Clock::now();
+    phase(&pf->sample_ms);
+    pf->final_ms = pf->final_norm_ms + pf->logits_ms + pf->sample_ms;
     pf->sample_vram();
   }
 
