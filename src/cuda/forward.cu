@@ -569,8 +569,8 @@ int Forward::step(int token_id, int pos, std::vector<int>* route_out,
         pf->router_ms += ms_since(pf->tp);
         pf->tp = Clock::now();
       }
-      // Proven float expert path. Global-Q8/dp4a fused gate/up still illegal-
-      // accesses on this GPU (kept in gemv.cuh off the default path).
+      // Float experts (100% pin match). Q8/MMVQ path is wired but needs real
+      // dp4a packing before it beats this ceiling.
       launch_expert_group_gate_up_silu_dptr(
           gu_type_by_layer_[l], d_gdispatch_, xn_, group_gate_buf_,
           (int)c.n_experts_used, c.d_ff_expert, D, gu_rowbytes_by_layer_[l]);

@@ -17,7 +17,7 @@ __device__ __forceinline__ float warp_reduce_sum(float v) {
   return v;
 }
 
-// Smem: float xs only for non-Q8 types. Q8 expert path uses q8_smem_bytes().
+// Smem: float xs only (legacy helpers that don't embed ExpertDispatch).
 inline size_t gemv_smem_bytes(int cols) {
   return (size_t)cols * sizeof(float);
 }
@@ -79,7 +79,7 @@ __device__ __forceinline__ float row_dot_q8(int type, const uint8_t* row,
   return warp_reduce_sum(acc);
 }
 
-__device__ __forceinline__ bool type_uses_q8_dot(int type) {
+__host__ __device__ __forceinline__ bool type_uses_q8_dot(int type) {
   return type == GT_Q4_K || type == GT_Q6_K;
 }
 
@@ -281,6 +281,16 @@ struct ExpertDispatch {
   float weight[8];
 };
 
+// Dynamic smem layouts for dptr expert kernels (ExpertDispatch lives in
+// dynamic smem so Q8 quantize cannot clobber a static-shared copy).
+inline size_t gemv_smem_bytes_dispatch(int cols) {
+  return sizeof(ExpertDispatch) + (size_t)cols * sizeof(float);
+}
+inline size_t gemv_smem_bytes_q8(int cols) {
+  return sizeof(ExpertDispatch) + (size_t)cols * sizeof(float) +
+         q8_smem_bytes(cols);
+}
+
 // The dispatch table is passed BY VALUE for the host-built-dispatch call
 // sites (kernel params live in constant memory, broadcast-cached — no
 // per-thread global read, which is why grouped dispatch used to lose to 16
@@ -379,22 +389,23 @@ __global__ void expert_group_residual_kernel(const ExpertDispatch d,
 __global__ void expert_group_gate_up_silu_dptr_kernel(
     int type, const ExpertDispatch* dispatch, const float* x, float* gates,
     int n_experts, int d_ff, int cols, int row_bytes) {
+  // Dynamic smem: [ExpertDispatch | xs] (float path; Q8 uses *_q8_kernel).
   extern __shared__ char raw[];
-  __shared__ ExpertDispatch ds;
-  if (threadIdx.x == 0) ds = *dispatch;
-  float* xs;
-  float* xd;
-  int8_t* xq;
-  stage_activations(raw, x, cols, xs, xd, xq, false);
+  ExpertDispatch* ds = reinterpret_cast<ExpertDispatch*>(raw);
+  float* xs = reinterpret_cast<float*>(ds + 1);
+  if (threadIdx.x == 0) *ds = *dispatch;
+  for (int i = threadIdx.x; i < cols; i += blockDim.x) xs[i] = x[i];
+  __syncthreads();
   const int expert = blockIdx.y;
   if (expert >= n_experts) return;
   const int lane = threadIdx.x & 31;
   const int row = blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
   if (row >= d_ff) return;
-  const float g = row_dot(type, ds.gate[expert] + (size_t)row * row_bytes, xs,
-                          cols, lane);
-  const float u = row_dot(type, ds.up[expert] + (size_t)row * row_bytes, xs,
-                          cols, lane);
+  const uint8_t* Wg = ds->gate[expert];
+  const uint8_t* Wu = ds->up[expert];
+  if (!Wg || !Wu) return;
+  const float g = row_dot(type, Wg + (size_t)row * row_bytes, xs, cols, lane);
+  const float u = row_dot(type, Wu + (size_t)row * row_bytes, xs, cols, lane);
   if (lane == 0)
     gates[(size_t)expert * d_ff + row] = (g / (1.0f + expf(-g))) * u;
 }
@@ -403,25 +414,28 @@ __global__ void expert_group_gate_up_silu_dptr_q8_kernel(
     int type, const ExpertDispatch* dispatch, const float* xd_g,
     const int8_t* xq_g, float* gates, int n_experts, int d_ff, int cols,
     int row_bytes) {
-  // Global-Q8 smem stage + Q4_K/Q6_K×Q8 dot (not on default path yet —
-  // fused variant illegal-accessed on RTX 4050/WDDM during bring-up).
+  // Dynamic smem: [ExpertDispatch | xd | xq] — no float xs (llama.cpp-style).
   extern __shared__ char raw[];
-  __shared__ ExpertDispatch ds;
-  if (threadIdx.x == 0) ds = *dispatch;
-  float* xd;
-  int8_t* xq;
-  stage_q8_smem(raw, xd_g, xq_g, cols, xd, xq);
+  ExpertDispatch* ds = reinterpret_cast<ExpertDispatch*>(raw);
+  float* xd = reinterpret_cast<float*>(ds + 1);
+  int8_t* xq = reinterpret_cast<int8_t*>(xd + cols / 32);
+  if (threadIdx.x == 0) *ds = *dispatch;
+  const int nblk = cols >> 5;
+  for (int i = threadIdx.x; i < nblk; i += blockDim.x) xd[i] = xd_g[i];
+  for (int i = threadIdx.x; i < cols; i += blockDim.x) xq[i] = xq_g[i];
+  __syncthreads();
   const int expert = blockIdx.y;
   if (expert >= n_experts) return;
   const int lane = threadIdx.x & 31;
   const int row = blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
   if (row >= d_ff) return;
+  const uint8_t* Wg = ds->gate[expert];
+  const uint8_t* Wu = ds->up[expert];
+  if (!Wg || !Wu) return;
   const float g =
-      row_dot_q8(type, ds.gate[expert] + (size_t)row * row_bytes, xd, xq, cols,
-                 lane);
+      row_dot_q8(type, Wg + (size_t)row * row_bytes, xd, xq, cols, lane);
   const float u =
-      row_dot_q8(type, ds.up[expert] + (size_t)row * row_bytes, xd, xq, cols,
-                 lane);
+      row_dot_q8(type, Wu + (size_t)row * row_bytes, xd, xq, cols, lane);
   if (lane == 0)
     gates[(size_t)expert * d_ff + row] = (g / (1.0f + expf(-g))) * u;
 }
@@ -430,20 +444,21 @@ __global__ void expert_group_down_dptr_kernel(
     int type, const ExpertDispatch* dispatch, const float* gates, float* outs,
     int n_experts, int d_model, int cols, int row_bytes) {
   extern __shared__ char raw[];
-  __shared__ ExpertDispatch ds;
-  if (threadIdx.x == 0) ds = *dispatch;
+  ExpertDispatch* ds = reinterpret_cast<ExpertDispatch*>(raw);
+  float* xs = reinterpret_cast<float*>(ds + 1);
+  if (threadIdx.x == 0) *ds = *dispatch;
   const int expert = blockIdx.y;
-  float* xs;
-  float* xd;
-  int8_t* xq;
-  stage_activations(raw, gates + (size_t)(expert < n_experts ? expert : 0) * cols,
-                    cols, xs, xd, xq, false);
+  const float* src =
+      gates + (size_t)(expert < n_experts ? expert : 0) * cols;
+  for (int i = threadIdx.x; i < cols; i += blockDim.x) xs[i] = src[i];
+  __syncthreads();
   if (expert >= n_experts) return;
   const int lane = threadIdx.x & 31;
   const int row = blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
   if (row >= d_model) return;
-  const float v = row_dot(type, ds.down[expert] + (size_t)row * row_bytes, xs,
-                          cols, lane);
+  const uint8_t* Wd = ds->down[expert];
+  if (!Wd) return;
+  const float v = row_dot(type, Wd + (size_t)row * row_bytes, xs, cols, lane);
   if (lane == 0) outs[(size_t)expert * d_model + row] = v;
 }
 
@@ -515,7 +530,9 @@ inline void launch_expert_group_gate_up_silu_dptr(
     int n_experts, int d_ff, int cols, int row_bytes) {
   constexpr int threads = 256;
   dim3 grid((d_ff + 7) / 8, n_experts);
-  expert_group_gate_up_silu_dptr_kernel<<<grid, threads, gemv_smem_bytes(cols), moex_launch_stream()>>>(
+  expert_group_gate_up_silu_dptr_kernel<<<grid, threads,
+                                          gemv_smem_bytes_dispatch(cols),
+                                          moex_launch_stream()>>>(
       type, dispatch, x, gates, n_experts, d_ff, cols, row_bytes);
 }
 
@@ -525,7 +542,9 @@ inline void launch_expert_group_gate_up_silu_dptr_q8(
     int row_bytes) {
   constexpr int threads = 256;
   dim3 grid((d_ff + 7) / 8, n_experts);
-  expert_group_gate_up_silu_dptr_q8_kernel<<<grid, threads, q8_smem_bytes(cols), moex_launch_stream()>>>(
+  const size_t smem = sizeof(ExpertDispatch) + q8_smem_bytes(cols);
+  expert_group_gate_up_silu_dptr_q8_kernel<<<grid, threads, smem,
+                                             moex_launch_stream()>>>(
       type, dispatch, xd_g, xq_g, gates, n_experts, d_ff, cols, row_bytes);
 }
 
@@ -535,7 +554,8 @@ inline void launch_expert_group_down_dptr(int type, const ExpertDispatch* dispat
                                           int row_bytes) {
   constexpr int threads = 256;
   dim3 grid((d_model + 7) / 8, n_experts);
-  expert_group_down_dptr_kernel<<<grid, threads, gemv_smem_bytes(cols), moex_launch_stream()>>>(
+  expert_group_down_dptr_kernel<<<grid, threads, gemv_smem_bytes_dispatch(cols),
+                                  moex_launch_stream()>>>(
       type, dispatch, gates, outs, n_experts, d_model, cols, row_bytes);
 }
 

@@ -290,9 +290,7 @@ __device__ __forceinline__ void quantize_activation_q8(const float* x, int cols,
   }
 }
 
-// One Q4_K superblock × Q8 acts. Same lane map as float path (lane = elem in
-// each group of 32); reconstruct x ≈ d8*q8 then MAC. Safe clean-room first win
-// (global quantize + int8 smem); full MMVQ iqs/dp4a packing can land next.
+// One Q4_K superblock × Q8 acts. Int nibble×q8 product, float scales.
 __device__ __forceinline__ float dot_sb_q4k_q8_lane(const uint8_t* p,
                                                      const float* xd,
                                                      const int8_t* xq,
@@ -308,8 +306,10 @@ __device__ __forceinline__ float dot_sb_q4k_q8_lane(const uint8_t* p,
     scale_min_k4(g, scales, &sc, &m);
     const uint8_t b = q[(g >> 1) * 32 + lane];
     const int nib = (g & 1) ? (b >> 4) : (b & 0x0F);
-    const float x = xd[g] * (float)xq[g * 32 + lane];
-    acc += (d * (float)sc * (float)nib - dmin * (float)m) * x;
+    const int q8 = (int)xq[g * 32 + lane];
+    const float d8 = xd[g];
+    acc += d * (float)sc * d8 * (float)(nib * q8) -
+           dmin * (float)m * d8 * (float)q8;
   }
   return acc;
 }
