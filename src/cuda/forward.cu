@@ -8,6 +8,7 @@
 
 #include "cuda/cuda_common.h"
 #include "cuda/gemv.cuh"
+#include "cuda/mmvq.cuh"
 #include "cuda/kernels.cuh"
 
 namespace moex {
@@ -54,10 +55,12 @@ __global__ void head_rmsnorm_kernel(float* v, const float* w, int head_dim,
 // Fuse per-head RMSNorm directly into RoPE. Q and K use independent
 // launches, exactly like before, but remove the intermediate kernel boundary.
 __global__ void head_rmsnorm_rope_kernel(float* v, const float* w, int head_dim,
-                                         int pos, float eps, float base) {
+                                         const int* pos_ptr, float eps,
+                                         float base) {
   extern __shared__ float sh[];
   const int head = blockIdx.x;
   const int t = threadIdx.x;
+  const int pos = *pos_ptr;
   float* h = v + head * head_dim;
   float local = 0.0f;
   for (int i = t; i < head_dim; i += blockDim.x) local += h[i] * h[i];
@@ -100,9 +103,10 @@ __global__ void rope_kernel(float* v, int n_heads, int head_dim, int pos,
 
 // Copy K,V for this token into the layer cache at slot `pos`.
 __global__ void kv_store_kernel(const float* k, const float* v, float* kcache,
-                                float* vcache, int kv_dim, int pos) {
+                                float* vcache, int kv_dim, const int* pos_ptr) {
   int i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= kv_dim) return;
+  const int pos = *pos_ptr;
   kcache[(size_t)pos * kv_dim + i] = k[i];
   vcache[(size_t)pos * kv_dim + i] = v[i];
 }
@@ -113,12 +117,13 @@ __global__ void kv_store_kernel(const float* k, const float* v, float* kcache,
 __global__ void gqa_attention_kernel(const float* q, const float* kcache,
                                      const float* vcache, float* out,
                                      int n_head, int n_head_kv, int head_dim,
-                                     int pos, float scale) {
+                                     const int* pos_ptr, float scale) {
   const int qh = blockIdx.x;
   const int lane = threadIdx.x;  // 0..31
   const int half_ratio = n_head / n_head_kv;
   const int kvh = qh / half_ratio;
   const int kv_dim = n_head_kv * head_dim;
+  const int pos = *pos_ptr;
 
   extern __shared__ float qs[];
   for (int i = lane; i < head_dim; i += 32) qs[i] = q[qh * head_dim + i];
@@ -181,10 +186,11 @@ __global__ void add_kernel(float* x, const float* y, int n) {
 }
 
 // embedding lookup: dequantize row `token` of token_embd into x[d_model].
-__global__ void embed_kernel(int type, const uint8_t* W, int token, float* x,
-                             int d_model, int row_bytes) {
+__global__ void embed_kernel(int type, const uint8_t* W, const int* token_ptr,
+                             float* x, int d_model, int row_bytes) {
   // one warp dequantizes the row cooperatively (reuse row_dot-like decode).
   int lane = threadIdx.x & 31;
+  const int token = *token_ptr;
   const uint8_t* row = W + (size_t)token * row_bytes;
   // Each lane decodes superblocks and writes directly.
   if (type == GT_Q4_K || type == GT_Q6_K || type == GT_Q5_K) {
@@ -275,6 +281,13 @@ Forward::Forward(const DeviceModel& dm, const ModelConfig& cfg, uint32_t max_ctx
   alloc(&expert_out_, cfg.d_model);
   alloc(&group_gate_buf_, (size_t)cfg.n_experts_used * cfg.d_ff_expert);
   alloc(&group_expert_out_, (size_t)cfg.n_experts_used * cfg.d_model);
+  MOEX_CUDA(cudaMalloc(&q8_d_model_, (size_t)(cfg.d_model / 32) * sizeof(float)));
+  MOEX_CUDA(cudaMalloc(&q8_q_model_, (size_t)cfg.d_model));
+  MOEX_CUDA(cudaMalloc(&q8_d_ff_,
+                       (size_t)cfg.n_experts_used * (cfg.d_ff_expert / 32) *
+                           sizeof(float)));
+  MOEX_CUDA(cudaMalloc(&q8_q_ff_,
+                       (size_t)cfg.n_experts_used * cfg.d_ff_expert));
   MOEX_CUDA(cudaMalloc(&d_dispatch_, sizeof(ExpertDispatch)));
   MOEX_CUDA(cudaMallocHost(&h_dispatch_, sizeof(ExpertDispatch)));
   alloc(&logits_, cfg.vocab_size);
@@ -290,6 +303,8 @@ Forward::Forward(const DeviceModel& dm, const ModelConfig& cfg, uint32_t max_ctx
   MOEX_CUDA(cudaMalloc(&d_miss_ctr_, sizeof(unsigned long long)));
   MOEX_CUDA(cudaMemset(d_hit_ctr_, 0, sizeof(unsigned long long)));
   MOEX_CUDA(cudaMemset(d_miss_ctr_, 0, sizeof(unsigned long long)));
+  MOEX_CUDA(cudaMalloc(&d_args_, sizeof(DecodeArgs)));
+  MOEX_CUDA(cudaStreamCreateWithFlags(&stream_, cudaStreamNonBlocking));
   h_logits_ = (float*)malloc((size_t)cfg.vocab_size * sizeof(float));
   h_router_ = (float*)malloc((size_t)cfg.n_experts * sizeof(float));
   last_route_.assign((size_t)cfg.n_layers * cfg.n_experts_used, -1);
@@ -312,6 +327,8 @@ Forward::Forward(const DeviceModel& dm, const ModelConfig& cfg, uint32_t max_ctx
 }
 
 Forward::~Forward() {
+  destroy_cuda_graph_();
+  if (stream_) cudaStreamDestroy(stream_);
   for (float* p : {x_, xn_, q_, k_, v_, attn_out_, tmp_, router_logits_,
                    gate_buf_, up_buf_, expert_out_, group_gate_buf_,
                    group_expert_out_, logits_, kcache_, vcache_}) {
@@ -319,7 +336,9 @@ Forward::~Forward() {
   }
   for (void* p : {(void*)argmax_part_v_, (void*)argmax_part_i_,
                   (void*)d_argmax_, (void*)d_route_, (void*)d_gdispatch_,
-                  (void*)d_hit_ctr_, (void*)d_miss_ctr_}) {
+                  (void*)d_hit_ctr_, (void*)d_miss_ctr_, (void*)q8_d_model_,
+                  (void*)q8_q_model_, (void*)q8_d_ff_, (void*)q8_q_ff_,
+                  (void*)d_args_}) {
     if (p) cudaFree(p);
   }
   if (h_route_) cudaFreeHost(h_route_);
@@ -327,6 +346,13 @@ Forward::~Forward() {
   if (h_dispatch_) cudaFreeHost(h_dispatch_);
   free(h_logits_);
   free(h_router_);
+}
+
+void Forward::destroy_cuda_graph_() {
+  if (graph_exec_) {
+    cudaGraphExecDestroy(graph_exec_);
+    graph_exec_ = nullptr;
+  }
 }
 
 void Forward::read_hit_miss_counters(unsigned long long* hits,
@@ -390,10 +416,39 @@ int Forward::step(int token_id, int pos, std::vector<int>* route_out,
     ev0 = pf->pool.mark();
   }
 
+  // token_id / pos via device args so a captured CUDA graph stays stable.
+  DecodeArgs ha{token_id, pos};
+
+  const bool graphable = use_cuda_graph && gpu_dispatch && !force_route &&
+                         !pf && !debug_on() && !route_out && !weight_out;
+
+  if (graphable && graph_exec_) {
+    MOEX_CUDA(cudaMemcpyAsync(d_args_, &ha, sizeof(ha), cudaMemcpyHostToDevice,
+                              stream_));
+    MOEX_CUDA(cudaGraphLaunch(graph_exec_, stream_));
+    MOEX_CUDA(cudaStreamSynchronize(stream_));
+    int best = 0;
+    MOEX_CUDA(cudaMemcpy(&best, d_argmax_, sizeof(int), cudaMemcpyDeviceToHost));
+    return best;
+  }
+
+  // Non-graph (and first capture): keep default stream so Phase 0 host
+  // cudaMemcpy round-trips stay ordered vs kernels.
+  moex_launch_stream() = 0;
+  MOEX_CUDA(cudaMemcpy(d_args_, &ha, sizeof(ha), cudaMemcpyHostToDevice));
+
+  bool capturing = false;
+  if (graphable && !graph_exec_) {
+    moex_launch_stream() = stream_;
+    MOEX_CUDA(cudaStreamBeginCapture(stream_, cudaStreamCaptureModeRelaxed));
+    capturing = true;
+  }
+
   // Embedding: x = token_embd[token]
-  embed_kernel<<<1, 32>>>(gt(dm_.token_embd().type),
-                          (const uint8_t*)dm_.token_embd().dptr, token_id, x_,
-                          D, (int)(dm_.token_embd().nbytes / c.vocab_size));
+  embed_kernel<<<1, 32, 0, moex_launch_stream()>>>(
+      gt(dm_.token_embd().type), (const uint8_t*)dm_.token_embd().dptr,
+      &d_args_->token_id, x_, D,
+      (int)(dm_.token_embd().nbytes / c.vocab_size));
   hit("embed");
   account_gemv(dm_.token_embd().nbytes / c.vocab_size, 1, D);
   dbg("embed", x_, D);
@@ -411,7 +466,7 @@ int Forward::step(int token_id, int pos, std::vector<int>* route_out,
 
     // --- attention block ---
     wprobe("in.x", x_, D);
-    rmsnorm_kernel<<<1, threads, threads * sizeof(float)>>>(
+    rmsnorm_kernel<<<1, threads, threads * sizeof(float), moex_launch_stream()>>>(
         x_, (const float*)dl.attn_norm.dptr, xn_, D, c.rms_eps);
     hit("rmsnorm");
 
@@ -433,20 +488,23 @@ int Forward::step(int token_id, int pos, std::vector<int>* route_out,
     account_gemv(dl.attn_v.nbytes, c.kv_dim(), D);
 
     // Fuse per-head q/k RMSNorm with RoPE.
-    head_rmsnorm_rope_kernel<<<c.n_head, 128, 128 * sizeof(float)>>>(
-        q_, (const float*)dl.attn_q_norm.dptr, c.head_dim, pos, c.rms_eps,
-        c.rope_base);
+    head_rmsnorm_rope_kernel<<<c.n_head, 128, 128 * sizeof(float),
+                               moex_launch_stream()>>>(
+        q_, (const float*)dl.attn_q_norm.dptr, c.head_dim, &d_args_->pos,
+        c.rms_eps, c.rope_base);
     hit("head_rmsnorm_rope");
-    head_rmsnorm_rope_kernel<<<c.n_head_kv, 128, 128 * sizeof(float)>>>(
-        k_, (const float*)dl.attn_k_norm.dptr, c.head_dim, pos, c.rms_eps,
-        c.rope_base);
+    head_rmsnorm_rope_kernel<<<c.n_head_kv, 128, 128 * sizeof(float),
+                               moex_launch_stream()>>>(
+        k_, (const float*)dl.attn_k_norm.dptr, c.head_dim, &d_args_->pos,
+        c.rms_eps, c.rope_base);
     hit("head_rmsnorm_rope");
 
     // Store K/V into cache.
     float* kc = kcache_ + (size_t)l * kv_stride_layer_();
     float* vc = vcache_ + (size_t)l * kv_stride_layer_();
-    kv_store_kernel<<<blocks(c.kv_dim(), threads), threads>>>(
-        k_, v_, kc, vc, c.kv_dim(), pos);
+    kv_store_kernel<<<blocks(c.kv_dim(), threads), threads, 0,
+                      moex_launch_stream()>>>(k_, v_, kc, vc, c.kv_dim(),
+                                              &d_args_->pos);
     hit("kv_store");
     if (pf) {
       pf->d2d_bytes += 2ull * c.kv_dim() * sizeof(float);
@@ -458,8 +516,9 @@ int Forward::step(int token_id, int pos, std::vector<int>* route_out,
     wprobe("k_postrope", k_, c.kv_dim());
 
     // Attention: one warp per head (shuffle reduce, no atomics).
-    gqa_attention_kernel<<<c.n_head, 32, (size_t)c.head_dim * sizeof(float)>>>(
-        q_, kc, vc, attn_out_, c.n_head, c.n_head_kv, c.head_dim, pos,
+    gqa_attention_kernel<<<c.n_head, 32, (size_t)c.head_dim * sizeof(float),
+                           moex_launch_stream()>>>(
+        q_, kc, vc, attn_out_, c.n_head, c.n_head_kv, c.head_dim, &d_args_->pos,
         attn_scale);
     hit("gqa_attn");
     if (dbgl) dbg("l0.attn_out", attn_out_, c.q_dim());
@@ -476,13 +535,13 @@ int Forward::step(int token_id, int pos, std::vector<int>* route_out,
     if (pf) { ev2 = pf->pool.mark(); phase(&pf->attn_ms); }
 
     // --- MoE block ---
-    rmsnorm_kernel<<<1, threads, threads * sizeof(float)>>>(
+    rmsnorm_kernel<<<1, threads, threads * sizeof(float), moex_launch_stream()>>>(
         x_, (const float*)dl.ffn_norm.dptr, xn_, D, c.rms_eps);
     hit("rmsnorm");
     wprobe("ffn_norm", xn_, D);
 
     // Router logits = Wr . xn  (F32 weights [n_experts x d_model])
-    gemv_q<<<blocks(c.n_experts * 32, threads), threads, gemv_smem_bytes(D)>>>( 
+    gemv_q<<<blocks(c.n_experts * 32, threads), threads, gemv_smem_bytes(D), moex_launch_stream()>>>( 
         gt(dl.router.type), (const uint8_t*)dl.router.dptr, xn_,
         router_logits_, c.n_experts, D, (int)(dl.router.nbytes / c.n_experts));
     hit("gemv_router");
@@ -500,7 +559,7 @@ int Forward::step(int token_id, int pos, std::vector<int>* route_out,
       // setup — the extra launch cost more than the D2H it removed). See
       // Forward::gpu_dispatch doc comment for the residency contract.
       const uint32_t layer_base = l * c.n_experts;
-      router_topk8_dispatch_kernel<<<1, 128>>>(
+      router_topk8_dispatch_kernel<<<1, 128, 0, moex_launch_stream()>>>(
           router_logits_, (int)c.n_experts, (int)c.n_experts_used, d_route_,
           dm_.device_ptr_table(), layer_base, d_gdispatch_, d_hit_ctr_,
           d_miss_ctr_);
@@ -510,6 +569,8 @@ int Forward::step(int token_id, int pos, std::vector<int>* route_out,
         pf->router_ms += ms_since(pf->tp);
         pf->tp = Clock::now();
       }
+      // Proven float expert path (global-Q8/dp4a fused kernels still illegal-
+      // access on this GPU — graphs are the next ceiling lever).
       launch_expert_group_gate_up_silu_dptr(
           gu_type_by_layer_[l], d_gdispatch_, xn_, group_gate_buf_,
           (int)c.n_experts_used, c.d_ff_expert, D, gu_rowbytes_by_layer_[l]);
@@ -563,7 +624,7 @@ int Forward::step(int token_id, int pos, std::vector<int>* route_out,
       }
       for (uint32_t j = 0; j < c.n_experts_used; ++j) sel_w[j] /= (float)sel_sum;
     } else {
-      router_topk8_kernel<<<1, 128>>>(router_logits_, (int)c.n_experts,
+      router_topk8_kernel<<<1, 128, 0, moex_launch_stream()>>>(router_logits_, (int)c.n_experts,
                                       (int)c.n_experts_used, d_route_);
       hit("router_topk8");
       MOEX_CUDA(cudaMemcpy(h_route_, d_route_, sizeof(RouteTopK),
@@ -655,11 +716,11 @@ int Forward::step(int token_id, int pos, std::vector<int>* route_out,
 
   // Final norm + logits.
   dbg("prefinal.x", x_, D);
-  rmsnorm_kernel<<<1, threads, threads * sizeof(float)>>>(
+  rmsnorm_kernel<<<1, threads, threads * sizeof(float), moex_launch_stream()>>>(
       x_, (const float*)dm_.output_norm().dptr, xn_, D, c.rms_eps);
   hit("rmsnorm");
   dbg("final_norm", xn_, D);
-  gemv_q<<<blocks(c.vocab_size * 32, threads), threads, gemv_smem_bytes(D)>>>(
+  gemv_q<<<blocks(c.vocab_size * 32, threads), threads, gemv_smem_bytes(D), moex_launch_stream()>>>(
       gt(dm_.output().type), (const uint8_t*)dm_.output().dptr, xn_, logits_,
       c.vocab_size, D, (int)(dm_.output().nbytes / c.vocab_size));
   hit("gemv_logits");
@@ -671,12 +732,26 @@ int Forward::step(int token_id, int pos, std::vector<int>* route_out,
   // argmax over 151,936 logits, then a 4-byte D2H — replaces a 608 KB logits
   // copy + host scan every token.
   auto t_ls = Clock::now();
-  argmax_stage1_kernel<<<argmax_nblocks_, 256>>>(logits_, (int)c.vocab_size,
+  argmax_stage1_kernel<<<argmax_nblocks_, 256, 0, moex_launch_stream()>>>(logits_, (int)c.vocab_size,
                                                  argmax_part_v_, argmax_part_i_);
   hit("argmax_stage1");
-  argmax_stage2_kernel<<<1, 256>>>(argmax_part_v_, argmax_part_i_,
+  argmax_stage2_kernel<<<1, 256, 0, moex_launch_stream()>>>(argmax_part_v_, argmax_part_i_,
                                    argmax_nblocks_, d_argmax_);
   hit("argmax_stage2");
+
+  if (capturing) {
+    cudaGraph_t g = nullptr;
+    MOEX_CUDA(cudaStreamEndCapture(stream_, &g));
+    MOEX_CUDA(cudaGraphInstantiate(&graph_exec_, g, nullptr, nullptr, 0));
+    MOEX_CUDA(cudaGraphDestroy(g));
+    // Capture does not execute — run the graph once for this token.
+    MOEX_CUDA(cudaMemcpyAsync(d_args_, &ha, sizeof(ha), cudaMemcpyHostToDevice,
+                              stream_));
+    MOEX_CUDA(cudaGraphLaunch(graph_exec_, stream_));
+    MOEX_CUDA(cudaStreamSynchronize(stream_));
+  }
+  moex_launch_stream() = 0;
+
   int best = 0;
   MOEX_CUDA(cudaMemcpy(&best, d_argmax_, sizeof(int), cudaMemcpyDeviceToHost));
   if (pf) {

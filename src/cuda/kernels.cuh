@@ -11,6 +11,13 @@
 
 namespace moex {
 
+// Current launch stream for graph capture (0 = default stream). Set by
+// Forward::step around a decode body so gemv/mmvq helpers join the capture.
+inline cudaStream_t& moex_launch_stream() {
+  static cudaStream_t s = 0;
+  return s;
+}
+
 // ---- fp16 -> f32 (device) --------------------------------------------------
 __device__ __forceinline__ float half_to_f32(uint16_t h) {
   const uint32_t sign = (uint32_t)(h & 0x8000) << 16;
@@ -283,7 +290,9 @@ __device__ __forceinline__ void quantize_activation_q8(const float* x, int cols,
   }
 }
 
-// One Q4_K superblock × Q8 acts. 32 lanes: 4 threads × 8 elems per group.
+// One Q4_K superblock × Q8 acts. Same lane map as float path (lane = elem in
+// each group of 32); reconstruct x ≈ d8*q8 then MAC. Safe clean-room first win
+// (global quantize + int8 smem); full MMVQ iqs/dp4a packing can land next.
 __device__ __forceinline__ float dot_sb_q4k_q8_lane(const uint8_t* p,
                                                      const float* xd,
                                                      const int8_t* xq,
@@ -292,32 +301,17 @@ __device__ __forceinline__ float dot_sb_q4k_q8_lane(const uint8_t* p,
   const float dmin = rd_h(p + 2);
   const uint8_t* scales = p + 4;
   const uint8_t* q = p + 16;
-  const int g = lane >> 2;          // 0..7
-  const int e0 = (lane & 3) << 3;   // 0,8,16,24
-  uint8_t sc, m;
-  scale_min_k4(g, scales, &sc, &m);
-  const float ds = d * (float)sc * xd[g];
-  const float dms = dmin * (float)m * xd[g];
-  int sumi = 0;
-  int sumx = 0;
+  float acc = 0.0f;
 #pragma unroll
-  for (int pass = 0; pass < 2; ++pass) {
-    const int base = e0 + (pass << 2);
-    int vi = 0;
-    int ui = 0;
-#pragma unroll
-    for (int k = 0; k < 4; ++k) {
-      const int idx = base + k;
-      const uint8_t b = q[(g >> 1) * 32 + idx];
-      const int nib = (g & 1) ? (b >> 4) : (b & 0x0F);
-      const int8_t xqi = xq[g * 32 + idx];
-      vi |= (nib & 0xff) << (8 * k);
-      ui |= ((int)(uint8_t)xqi) << (8 * k);
-      sumx += (int)xqi;
-    }
-    sumi = moex_dp4a(vi, ui, sumi);
+  for (int g = 0; g < 8; ++g) {
+    uint8_t sc, m;
+    scale_min_k4(g, scales, &sc, &m);
+    const uint8_t b = q[(g >> 1) * 32 + lane];
+    const int nib = (g & 1) ? (b >> 4) : (b & 0x0F);
+    const float x = xd[g] * (float)xq[g * 32 + lane];
+    acc += (d * (float)sc * (float)nib - dmin * (float)m) * x;
   }
-  return ds * (float)sumi - dms * (float)sumx;
+  return acc;
 }
 
 // Q5_K: same grouping as Q4_K plus the high bit from qh[lane], mask 1<<g.

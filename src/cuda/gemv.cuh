@@ -8,6 +8,7 @@
 
 #include "cuda/device_model.h"  // GpuExpertPtr
 #include "cuda/kernels.cuh"
+#include "cuda/mmvq.cuh"
 
 namespace moex {
 
@@ -16,14 +17,9 @@ __device__ __forceinline__ float warp_reduce_sum(float v) {
   return v;
 }
 
-// Smem bytes for float staging (+ Q8 side buffers when Q8 dots are enabled).
+// Smem: float xs only for non-Q8 types. Q8 expert path uses q8_smem_bytes().
 inline size_t gemv_smem_bytes(int cols) {
-  size_t bytes = (size_t)cols * sizeof(float);
-  // Always reserve Q8 side buffers — qkv stages with want_q8=true for the
-  // Q4_K/Q6_K legs even when type_uses_q8_dot is currently false, and the
-  // quantize write must not overrun dynamic smem.
-  bytes += (size_t)(cols / 32) * sizeof(float) + (size_t)cols;
-  return bytes;
+  return (size_t)cols * sizeof(float);
 }
 
 // Dot one output row with float x (F32 / Q8_0 / Q5_K / legacy).
@@ -84,11 +80,7 @@ __device__ __forceinline__ float row_dot_q8(int type, const uint8_t* row,
 }
 
 __device__ __forceinline__ bool type_uses_q8_dot(int type) {
-  // Q8+dp4a path is compiled in but disabled by default: on this 4050 /
-  // WDDM setup the extra quantize + lower occupancy lost to the float path
-  // on expert FFN widths. Re-enable after ncu proves a win.
-  (void)type;
-  return false;
+  return type == GT_Q4_K || type == GT_Q6_K;
 }
 
 // Stage float x then (for Q4_K/Q6_K) quantize to Q8 side buffers.
@@ -118,8 +110,7 @@ __global__ void gemv_q_multiwarp(int type, const uint8_t* W, const float* x,
   float* xs;
   float* xd;
   int8_t* xq;
-  const bool q8 = type_uses_q8_dot(type);
-  stage_activations(raw, x, cols, xs, xd, xq, q8);
+  stage_activations(raw, x, cols, xs, xd, xq, false);
 
   constexpr int nwarps = 4;
   const int row = blockIdx.x;
@@ -132,15 +123,11 @@ __global__ void gemv_q_multiwarp(int type, const uint8_t* W, const float* x,
   if (type == GT_Q4_K) {
     const int nsb = cols / 256;
     for (int sb = warp; sb < nsb; sb += nwarps)
-      acc += q8 ? dot_sb_q4k_q8_lane(wrow + (size_t)sb * BQ4_K, xd + sb * 8,
-                                     xq + sb * 256, lane)
-                : dot_sb_q4k_lane(wrow + (size_t)sb * BQ4_K, xs + sb * 256, lane);
+      acc += dot_sb_q4k_lane(wrow + (size_t)sb * BQ4_K, xs + sb * 256, lane);
   } else if (type == GT_Q6_K) {
     const int nsb = cols / 256;
     for (int sb = warp; sb < nsb; sb += nwarps)
-      acc += q8 ? dot_sb_q6k_q8_lane(wrow + (size_t)sb * BQ6_K, xd + sb * 8,
-                                     xq + sb * 256, lane)
-                : dot_sb_q6k_lane(wrow + (size_t)sb * BQ6_K, xs + sb * 256, lane);
+      acc += dot_sb_q6k_lane(wrow + (size_t)sb * BQ6_K, xs + sb * 256, lane);
   } else if (type == GT_Q8_0) {
     const int nb = cols / 32;
     for (int b = threadIdx.x; b < nb; b += blockDim.x) {
@@ -157,7 +144,6 @@ __global__ void gemv_q_multiwarp(int type, const uint8_t* W, const float* x,
     const float* w = (const float*)wrow;
     for (int i = threadIdx.x; i < cols; i += blockDim.x) acc += w[i] * xs[i];
   } else {
-    // Fallback: one warp does the whole row; others idle.
     if (warp == 0) acc = row_dot(type, wrow, xs, cols, lane);
   }
   acc = warp_reduce_sum(acc);
@@ -177,15 +163,11 @@ __global__ void gemv_q(int type, const uint8_t* W, const float* x, float* y,
   float* xs;
   float* xd;
   int8_t* xq;
-  const bool q8 = type_uses_q8_dot(type);
-  stage_activations(raw, x, cols, xs, xd, xq, q8);
-
+  stage_activations(raw, x, cols, xs, xd, xq, false);
   const int warp = blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
   const int lane = threadIdx.x & 31;
   if (warp >= rows) return;
-  const uint8_t* row = W + (size_t)warp * row_bytes;
-  const float r = q8 ? row_dot_q8(type, row, xd, xq, cols, lane)
-                     : row_dot(type, row, xs, cols, lane);
+  const float r = row_dot(type, W + (size_t)warp * row_bytes, xs, cols, lane);
   if (lane == 0) y[warp] = r;
 }
 
@@ -199,17 +181,12 @@ __global__ void qkv_q_kernel(
   float* xs;
   float* xd;
   int8_t* xq;
-  // Q is Q4_K, V is Q6_K, K is Q8_0 — only build Q8 side if dots use it.
-  stage_activations(raw, x, cols, xs, xd, xq,
-                    type_uses_q8_dot(q_type) || type_uses_q8_dot(v_type));
+  // QKV stays on float path for now; expert FFN uses global Q8 (mmvq.cuh).
+  stage_activations(raw, x, cols, xs, xd, xq, false);
   const int lane = threadIdx.x & 31;
   const int row = blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
   if (row < q_rows) {
-    const float out = type_uses_q8_dot(q_type)
-                          ? row_dot_q8(q_type, Wq + (size_t)row * q_row_bytes, xd,
-                                       xq, cols, lane)
-                          : row_dot(q_type, Wq + (size_t)row * q_row_bytes, xs,
-                                    cols, lane);
+    const float out = row_dot(q_type, Wq + (size_t)row * q_row_bytes, xs, cols, lane);
     if (lane == 0) q[row] = out;
   } else if (row < q_rows + kv_rows) {
     const int r = row - q_rows;
@@ -217,11 +194,7 @@ __global__ void qkv_q_kernel(
     if (lane == 0) k[r] = out;
   } else if (row < q_rows + 2 * kv_rows) {
     const int r = row - q_rows - kv_rows;
-    const float out = type_uses_q8_dot(v_type)
-                          ? row_dot_q8(v_type, Wv + (size_t)r * v_row_bytes, xd,
-                                       xq, cols, lane)
-                          : row_dot(v_type, Wv + (size_t)r * v_row_bytes, xs,
-                                    cols, lane);
+    const float out = row_dot(v_type, Wv + (size_t)r * v_row_bytes, xs, cols, lane);
     if (lane == 0) v[r] = out;
   }
 }
@@ -233,7 +206,7 @@ inline void launch_qkv_q(int q_type, const uint8_t* Wq, int q_row_bytes,
                          int q_rows, int kv_rows, int cols) {
   constexpr int threads = 256;
   const int total_rows = q_rows + 2 * kv_rows;
-  qkv_q_kernel<<<(total_rows + 7) / 8, threads, gemv_smem_bytes(cols)>>>(
+  qkv_q_kernel<<<(total_rows + 7) / 8, threads, gemv_smem_bytes(cols), moex_launch_stream()>>>(
       q_type, Wq, q_row_bytes, k_type, Wk, k_row_bytes, v_type, Wv,
       v_row_bytes, x, q, k, v, q_rows, kv_rows, cols);
 }
@@ -246,22 +219,18 @@ __global__ void gemv_q_residual(int type, const uint8_t* W, const float* in,
   float* xs;
   float* xd;
   int8_t* xq;
-  const bool q8 = type_uses_q8_dot(type);
-  stage_activations(raw, in, cols, xs, xd, xq, q8);
+  stage_activations(raw, in, cols, xs, xd, xq, false);
   const int lane = threadIdx.x & 31;
   const int row = blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
   if (row >= rows) return;
-  const float out = q8 ? row_dot_q8(type, W + (size_t)row * row_bytes, xd, xq,
-                                    cols, lane)
-                       : row_dot(type, W + (size_t)row * row_bytes, xs, cols,
-                                 lane);
+  const float out = row_dot(type, W + (size_t)row * row_bytes, xs, cols, lane);
   if (lane == 0) x[row] += out;
 }
 
 inline void launch_gemv_q_residual(int type, const uint8_t* W, const float* in,
                                    float* x, int rows, int cols, int row_bytes) {
   constexpr int threads = 256;
-  gemv_q_residual<<<(rows + 7) / 8, threads, gemv_smem_bytes(cols)>>>(
+  gemv_q_residual<<<(rows + 7) / 8, threads, gemv_smem_bytes(cols), moex_launch_stream()>>>(
       type, W, in, x, rows, cols, row_bytes);
 }
 
@@ -275,19 +244,12 @@ __global__ void expert_gate_up_silu_kernel(int type, const uint8_t* Wg,
   float* xs;
   float* xd;
   int8_t* xq;
-  const bool q8 = type_uses_q8_dot(type);
-  stage_activations(raw, x, cols, xs, xd, xq, q8);
+  stage_activations(raw, x, cols, xs, xd, xq, false);
   const int lane = threadIdx.x & 31;
   const int row = blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
   if (row >= d_ff) return;
-  const float g = q8 ? row_dot_q8(type, Wg + (size_t)row * row_bytes, xd, xq,
-                                  cols, lane)
-                     : row_dot(type, Wg + (size_t)row * row_bytes, xs, cols,
-                               lane);
-  const float u = q8 ? row_dot_q8(type, Wu + (size_t)row * row_bytes, xd, xq,
-                                  cols, lane)
-                     : row_dot(type, Wu + (size_t)row * row_bytes, xs, cols,
-                               lane);
+  const float g = row_dot(type, Wg + (size_t)row * row_bytes, xs, cols, lane);
+  const float u = row_dot(type, Wu + (size_t)row * row_bytes, xs, cols, lane);
   if (lane == 0) gate[row] = (g / (1.0f + expf(-g))) * u;
 }
 
@@ -301,15 +263,11 @@ __global__ void expert_down_residual_kernel(int type, const uint8_t* Wd,
   float* xs;
   float* xd;
   int8_t* xq;
-  const bool q8 = type_uses_q8_dot(type);
-  stage_activations(raw, gate, cols, xs, xd, xq, q8);
+  stage_activations(raw, gate, cols, xs, xd, xq, false);
   const int lane = threadIdx.x & 31;
   const int row = blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
   if (row >= d_model) return;
-  const float acc = q8 ? row_dot_q8(type, Wd + (size_t)row * row_bytes, xd, xq,
-                                    cols, lane)
-                       : row_dot(type, Wd + (size_t)row * row_bytes, xs, cols,
-                                 lane);
+  const float acc = row_dot(type, Wd + (size_t)row * row_bytes, xs, cols, lane);
   if (lane == 0) x[row] += w * acc;
 }
 
@@ -373,23 +331,16 @@ __global__ void expert_group_gate_up_silu_kernel(
   float* xs;
   float* xd;
   int8_t* xq;
-  const bool q8 = type_uses_q8_dot(type);
-  stage_activations(raw, x, cols, xs, xd, xq, q8);
+  stage_activations(raw, x, cols, xs, xd, xq, false);
   const int expert = blockIdx.y;
   if (expert >= n_experts) return;
   const int lane = threadIdx.x & 31;
   const int row = blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
   if (row >= d_ff) return;
-  const float g =
-      q8 ? row_dot_q8(type, d.gate[expert] + (size_t)row * row_bytes, xd, xq,
-                      cols, lane)
-         : row_dot(type, d.gate[expert] + (size_t)row * row_bytes, xs, cols,
-                   lane);
-  const float u =
-      q8 ? row_dot_q8(type, d.up[expert] + (size_t)row * row_bytes, xd, xq,
-                      cols, lane)
-         : row_dot(type, d.up[expert] + (size_t)row * row_bytes, xs, cols,
-                   lane);
+  const float g = row_dot(type, d.gate[expert] + (size_t)row * row_bytes, xs,
+                          cols, lane);
+  const float u = row_dot(type, d.up[expert] + (size_t)row * row_bytes, xs,
+                          cols, lane);
   if (lane == 0)
     gates[(size_t)expert * d_ff + row] = (g / (1.0f + expf(-g))) * u;
 }
@@ -403,16 +354,12 @@ __global__ void expert_group_down_kernel(
   int8_t* xq;
   const int expert = blockIdx.y;
   if (expert >= n_experts) return;
-  const bool q8 = type_uses_q8_dot(type);
-  stage_activations(raw, gates + (size_t)expert * cols, cols, xs, xd, xq, q8);
+  stage_activations(raw, gates + (size_t)expert * cols, cols, xs, xd, xq, false);
   const int lane = threadIdx.x & 31;
   const int row = blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
   if (row >= d_model) return;
-  const float v =
-      q8 ? row_dot_q8(type, d.down[expert] + (size_t)row * row_bytes, xd, xq,
-                      cols, lane)
-         : row_dot(type, d.down[expert] + (size_t)row * row_bytes, xs, cols,
-                   lane);
+  const float v = row_dot(type, d.down[expert] + (size_t)row * row_bytes, xs,
+                          cols, lane);
   if (lane == 0) outs[(size_t)expert * d_model + row] = v;
 }
 
@@ -438,23 +385,43 @@ __global__ void expert_group_gate_up_silu_dptr_kernel(
   float* xs;
   float* xd;
   int8_t* xq;
-  const bool q8 = type_uses_q8_dot(type);
-  stage_activations(raw, x, cols, xs, xd, xq, q8);
+  stage_activations(raw, x, cols, xs, xd, xq, false);
+  const int expert = blockIdx.y;
+  if (expert >= n_experts) return;
+  const int lane = threadIdx.x & 31;
+  const int row = blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
+  if (row >= d_ff) return;
+  const float g = row_dot(type, ds.gate[expert] + (size_t)row * row_bytes, xs,
+                          cols, lane);
+  const float u = row_dot(type, ds.up[expert] + (size_t)row * row_bytes, xs,
+                          cols, lane);
+  if (lane == 0)
+    gates[(size_t)expert * d_ff + row] = (g / (1.0f + expf(-g))) * u;
+}
+
+__global__ void expert_group_gate_up_silu_dptr_q8_kernel(
+    int type, const ExpertDispatch* dispatch, const float* xd_g,
+    const int8_t* xq_g, float* gates, int n_experts, int d_ff, int cols,
+    int row_bytes) {
+  // Global-Q8 smem stage + Q4_K/Q6_K×Q8 dot (not on default path yet —
+  // fused variant illegal-accessed on RTX 4050/WDDM during bring-up).
+  extern __shared__ char raw[];
+  __shared__ ExpertDispatch ds;
+  if (threadIdx.x == 0) ds = *dispatch;
+  float* xd;
+  int8_t* xq;
+  stage_q8_smem(raw, xd_g, xq_g, cols, xd, xq);
   const int expert = blockIdx.y;
   if (expert >= n_experts) return;
   const int lane = threadIdx.x & 31;
   const int row = blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
   if (row >= d_ff) return;
   const float g =
-      q8 ? row_dot_q8(type, ds.gate[expert] + (size_t)row * row_bytes, xd, xq,
-                      cols, lane)
-         : row_dot(type, ds.gate[expert] + (size_t)row * row_bytes, xs, cols,
-                   lane);
+      row_dot_q8(type, ds.gate[expert] + (size_t)row * row_bytes, xd, xq, cols,
+                 lane);
   const float u =
-      q8 ? row_dot_q8(type, ds.up[expert] + (size_t)row * row_bytes, xd, xq,
-                      cols, lane)
-         : row_dot(type, ds.up[expert] + (size_t)row * row_bytes, xs, cols,
-                   lane);
+      row_dot_q8(type, ds.up[expert] + (size_t)row * row_bytes, xd, xq, cols,
+                 lane);
   if (lane == 0)
     gates[(size_t)expert * d_ff + row] = (g / (1.0f + expf(-g))) * u;
 }
@@ -469,18 +436,37 @@ __global__ void expert_group_down_dptr_kernel(
   float* xs;
   float* xd;
   int8_t* xq;
-  const bool q8 = type_uses_q8_dot(type);
   stage_activations(raw, gates + (size_t)(expert < n_experts ? expert : 0) * cols,
-                    cols, xs, xd, xq, q8);
+                    cols, xs, xd, xq, false);
   if (expert >= n_experts) return;
   const int lane = threadIdx.x & 31;
   const int row = blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
   if (row >= d_model) return;
-  const float v =
-      q8 ? row_dot_q8(type, ds.down[expert] + (size_t)row * row_bytes, xd, xq,
-                      cols, lane)
-         : row_dot(type, ds.down[expert] + (size_t)row * row_bytes, xs, cols,
-                   lane);
+  const float v = row_dot(type, ds.down[expert] + (size_t)row * row_bytes, xs,
+                          cols, lane);
+  if (lane == 0) outs[(size_t)expert * d_model + row] = v;
+}
+
+__global__ void expert_group_down_dptr_q8_kernel(
+    int type, const ExpertDispatch* dispatch, const float* xd_g,
+    const int8_t* xq_g, float* outs, int n_experts, int d_model, int cols,
+    int row_bytes) {
+  extern __shared__ char raw[];
+  __shared__ ExpertDispatch ds;
+  if (threadIdx.x == 0) ds = *dispatch;
+  const int expert = blockIdx.y;
+  const int nblk = cols >> 5;
+  float* xd;
+  int8_t* xq;
+  stage_q8_smem(raw, xd_g + (size_t)(expert < n_experts ? expert : 0) * nblk,
+                xq_g + (size_t)(expert < n_experts ? expert : 0) * cols, cols, xd,
+                xq);
+  if (expert >= n_experts) return;
+  const int lane = threadIdx.x & 31;
+  const int row = blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
+  if (row >= d_model) return;
+  const float v = row_dot_q8(type, ds.down[expert] + (size_t)row * row_bytes, xd,
+                             xq, cols, lane);
   if (lane == 0) outs[(size_t)expert * d_model + row] = v;
 }
 
@@ -502,7 +488,7 @@ inline void launch_expert_group_gate_up_silu(
     int n_experts, int d_ff, int cols, int row_bytes) {
   constexpr int threads = 256;
   dim3 grid((d_ff + 7) / 8, n_experts);
-  expert_group_gate_up_silu_kernel<<<grid, threads, gemv_smem_bytes(cols)>>>(
+  expert_group_gate_up_silu_kernel<<<grid, threads, gemv_smem_bytes(cols), moex_launch_stream()>>>(
       type, dispatch, x, gates, n_experts, d_ff, cols, row_bytes);
 }
 
@@ -512,7 +498,7 @@ inline void launch_expert_group_down(int type, const ExpertDispatch& dispatch,
                                      int row_bytes) {
   constexpr int threads = 256;
   dim3 grid((d_model + 7) / 8, n_experts);
-  expert_group_down_kernel<<<grid, threads, gemv_smem_bytes(cols)>>>(
+  expert_group_down_kernel<<<grid, threads, gemv_smem_bytes(cols), moex_launch_stream()>>>(
       type, dispatch, gates, outs, n_experts, d_model, cols, row_bytes);
 }
 
@@ -520,7 +506,7 @@ inline void launch_expert_group_residual(const ExpertDispatch& dispatch,
                                          const float* outs, float* x,
                                          int n_experts, int d_model) {
   constexpr int threads = 256;
-  expert_group_residual_kernel<<<(d_model + threads - 1) / threads, threads>>>(
+  expert_group_residual_kernel<<<(d_model + threads - 1) / threads, threads, 0, moex_launch_stream()>>>(
       dispatch, outs, x, n_experts, d_model);
 }
 
@@ -529,8 +515,18 @@ inline void launch_expert_group_gate_up_silu_dptr(
     int n_experts, int d_ff, int cols, int row_bytes) {
   constexpr int threads = 256;
   dim3 grid((d_ff + 7) / 8, n_experts);
-  expert_group_gate_up_silu_dptr_kernel<<<grid, threads, gemv_smem_bytes(cols)>>>(
+  expert_group_gate_up_silu_dptr_kernel<<<grid, threads, gemv_smem_bytes(cols), moex_launch_stream()>>>(
       type, dispatch, x, gates, n_experts, d_ff, cols, row_bytes);
+}
+
+inline void launch_expert_group_gate_up_silu_dptr_q8(
+    int type, const ExpertDispatch* dispatch, const float* xd_g,
+    const int8_t* xq_g, float* gates, int n_experts, int d_ff, int cols,
+    int row_bytes) {
+  constexpr int threads = 256;
+  dim3 grid((d_ff + 7) / 8, n_experts);
+  expert_group_gate_up_silu_dptr_q8_kernel<<<grid, threads, q8_smem_bytes(cols), moex_launch_stream()>>>(
+      type, dispatch, xd_g, xq_g, gates, n_experts, d_ff, cols, row_bytes);
 }
 
 inline void launch_expert_group_down_dptr(int type, const ExpertDispatch* dispatch,
@@ -539,15 +535,25 @@ inline void launch_expert_group_down_dptr(int type, const ExpertDispatch* dispat
                                           int row_bytes) {
   constexpr int threads = 256;
   dim3 grid((d_model + 7) / 8, n_experts);
-  expert_group_down_dptr_kernel<<<grid, threads, gemv_smem_bytes(cols)>>>(
+  expert_group_down_dptr_kernel<<<grid, threads, gemv_smem_bytes(cols), moex_launch_stream()>>>(
       type, dispatch, gates, outs, n_experts, d_model, cols, row_bytes);
+}
+
+inline void launch_expert_group_down_dptr_q8(
+    int type, const ExpertDispatch* dispatch, const float* xd_g,
+    const int8_t* xq_g, float* outs, int n_experts, int d_model, int cols,
+    int row_bytes) {
+  constexpr int threads = 256;
+  dim3 grid((d_model + 7) / 8, n_experts);
+  expert_group_down_dptr_q8_kernel<<<grid, threads, q8_smem_bytes(cols), moex_launch_stream()>>>(
+      type, dispatch, xd_g, xq_g, outs, n_experts, d_model, cols, row_bytes);
 }
 
 inline void launch_expert_group_residual_dptr(const ExpertDispatch* dispatch,
                                               const float* outs, float* x,
                                               int n_experts, int d_model) {
   constexpr int threads = 256;
-  expert_group_residual_dptr_kernel<<<(d_model + threads - 1) / threads, threads>>>(
+  expert_group_residual_dptr_kernel<<<(d_model + threads - 1) / threads, threads, 0, moex_launch_stream()>>>(
       dispatch, outs, x, n_experts, d_model);
 }
 
@@ -713,7 +719,7 @@ inline void launch_gemv_q(int type, const uint8_t* W, const float* x, float* y,
                           int rows, int cols, int row_bytes) {
   constexpr int threads = 256;
   const int nblocks = (rows + 7) / 8;
-  gemv_q<<<nblocks, threads, gemv_smem_bytes(cols)>>>(
+  gemv_q<<<nblocks, threads, gemv_smem_bytes(cols), moex_launch_stream()>>>(
       type, W, x, y, rows, cols, row_bytes);
 }
 
@@ -723,7 +729,7 @@ inline void launch_expert_gate_up_silu(int type, const uint8_t* Wg,
                                        int row_bytes) {
   constexpr int threads = 256;
   const int nblocks = (d_ff + 7) / 8;
-  expert_gate_up_silu_kernel<<<nblocks, threads, gemv_smem_bytes(cols)>>>(
+  expert_gate_up_silu_kernel<<<nblocks, threads, gemv_smem_bytes(cols), moex_launch_stream()>>>(
       type, Wg, Wu, x, gate, d_ff, cols, row_bytes);
 }
 
@@ -732,7 +738,7 @@ inline void launch_expert_down_residual(int type, const uint8_t* Wd,
                                         int d_model, int cols, int row_bytes) {
   constexpr int threads = 256;
   const int nblocks = (d_model + 7) / 8;
-  expert_down_residual_kernel<<<nblocks, threads, gemv_smem_bytes(cols)>>>(
+  expert_down_residual_kernel<<<nblocks, threads, gemv_smem_bytes(cols), moex_launch_stream()>>>(
       type, Wd, gate, x, w, d_model, cols, row_bytes);
 }
 

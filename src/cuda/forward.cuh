@@ -51,10 +51,20 @@ class Forward {
   // force_route != nullptr (deterministic-replay debug path). Profiling may
   // use this path; absolute ms are still sync-inflated when prof != nullptr.
   bool gpu_dispatch = false;
+
+  // CUDA graph replay for gpu_dispatch decode (llama.cpp-style). Requires
+  // gpu_dispatch, no force_route/prof/debug. token_id/pos live in d_args_ so
+  // the captured graph stays topology-stable across tokens.
+  bool use_cuda_graph = false;
   void read_hit_miss_counters(unsigned long long* hits, unsigned long long* misses) const;
   void reset_hit_miss_counters();
 
  private:
+  struct DecodeArgs {
+    int token_id;
+    int pos;
+  };
+
   const DeviceModel& dm_;
   ModelConfig cfg_;
   uint32_t max_ctx_;
@@ -72,6 +82,11 @@ class Forward {
   float* expert_out_ = nullptr;
   float* group_gate_buf_ = nullptr;   // [top_k * d_ff]
   float* group_expert_out_ = nullptr; // [top_k * d_model]
+  // Global Q8 activations (llama.cpp-style once-per-use quantize).
+  float* q8_d_model_ = nullptr;       // [d_model/32]
+  int8_t* q8_q_model_ = nullptr;      // [d_model]
+  float* q8_d_ff_ = nullptr;          // [top_k * d_ff/32]
+  int8_t* q8_q_ff_ = nullptr;         // [top_k * d_ff]
   ExpertDispatch* d_dispatch_ = nullptr;
   ExpertDispatch* h_dispatch_ = nullptr;  // pinned host staging
   float* logits_ = nullptr;
@@ -95,6 +110,11 @@ class Forward {
   std::vector<int> gu_type_by_layer_, dn_type_by_layer_;
   std::vector<int> gu_rowbytes_by_layer_, dn_rowbytes_by_layer_;
 
+  // CUDA graph state
+  DecodeArgs* d_args_ = nullptr;
+  cudaStream_t stream_ = nullptr;
+  cudaGraphExec_t graph_exec_ = nullptr;
+
   std::vector<int> last_route_;
   float* h_logits_ = nullptr;
   int* h_topk_idx_ = nullptr;
@@ -104,6 +124,8 @@ class Forward {
   uint64_t kv_stride_layer_() const {
     return (uint64_t)max_ctx_ * cfg_.kv_dim();
   }
+
+  void destroy_cuda_graph_();
 };
 
 }  // namespace moex

@@ -117,6 +117,9 @@ int main(int argc, char** argv) {
   std::printf("gpu_dispatch: %s (Phase 1 + profile; Phase 0 discovery always\n"
               "  uses the host round-trip path for reactive pin)\n",
               use_gpu_dispatch ? "ON — zero host round trips per layer" : "off");
+  std::printf("cuda_graph:   %s\n",
+              use_gpu_dispatch ? "ON for Phase 1 warm passes (capture then replay)"
+                               : "off");
   std::printf("model:  %s\n", path);
   std::printf("config: layers=%u experts=%u top_k=%u d_model=%u\n", c.n_layers,
               c.n_experts, c.n_experts_used, c.d_model);
@@ -215,6 +218,7 @@ int main(int argc, char** argv) {
     // Brand-new Forward = empty KV, same DeviceModel (experts stay resident).
     Forward fwd(dm, c, max_ctx, man);
     fwd.gpu_dispatch = use_gpu_dispatch;
+    fwd.use_cuda_graph = use_gpu_dispatch;
     long hits = 0, miss = 0;
     int h2d_before = h2d_calls;
     uint64_t b_before = h2d_bytes;
@@ -308,6 +312,7 @@ int main(int argc, char** argv) {
     StepProf prof;
     fprof.prof = &prof;
     fprof.gpu_dispatch = use_gpu_dispatch;
+    fprof.use_cuda_graph = false;  // graphs off while profiling
     long phits = 0, pmiss = 0;
     fprof.ensure_experts = make_probe(&phits, &pmiss);
     int hcalls_before = h2d_calls;
