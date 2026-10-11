@@ -1,0 +1,6 @@
+build/
+ref/golden/
+__pycache__/
+*.exe
+*.obj
+*.pdb
