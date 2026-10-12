@@ -1,6 +1,6 @@
 # MoEx v2 — build plan
 
-Fresh CUDA engine for **Qwen3.6-35B-A3B** (`D:\models\qwen36_i4_gs64`, colibri int4 gs64 container)
+Fresh CUDA engine for **Qwen3.6-35B-A3B** (`C:\models\qwen36_i4_gs64`, NVMe SSD, colibri int4 gs64 container)
 on an RTX 4050 Laptop (6 GB, 188 GB/s measured, PCIe 4.0 x8), i7-13650HX, 24 GB DDR5-4800.
 
 Goal: fastest exact batch-1 decode on this box, beating llama.cpp / ik_llama / colibri on the same model.
@@ -33,8 +33,9 @@ Dense int8 → ~75 tok/s ceiling; dense int4 → ~110. So dense requantization i
 ## Build list
 
 ### Phase 0 — ground truth
-- [ ] P0.1 `ref/qwen36_ref.py`: container loader + full fp32 forward (DeltaNet, gated attention, MoE). Sanity: greedy text is coherent.
-- [ ] P0.2 Golden dumps: per-op inputs/outputs for one prompt (`ref/golden/*.bin`), route traces per token.
+- [x] P0.1 `ref/qwen36_ref.py`: container loader + full fp32 forward (DeltaNet, gated attention, MoE). Sanity: greedy text is coherent.
+- [x] P0.2 Golden dumps: per-op inputs/outputs for one prompt (`ref/golden/*.bin`), route traces per token.
+  Regenerate: `python ref/qwen36_ref.py "The capital of France is" --n 8 --dump ref/golden --routes ref/golden/routes.jsonl`
 
 ### Phase 1 — kernels (each: unit test vs golden + bench)
 - [ ] K1 RMSNorm (1+w), fused residual-add variant
@@ -76,3 +77,5 @@ Dense int8 → ~75 tok/s ceiling; dense int4 → ~110. So dense requantization i
 
 | Item | Correct | Bench | Notes |
 |---|---|---|---|
+| P0.1 ref | greedy: "The capital of France is" → " Paris.\nThe capital of France is Paris." | 0.34 tok/s (oracle only) | not yet cross-checked against colibri logits |
+| P0.2 golden | 12 positions, 5678 files, 66 MB | — | stateful ops are tested by chaining positions 0..11 |
