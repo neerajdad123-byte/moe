@@ -38,15 +38,15 @@ Dense int8 → ~75 tok/s ceiling; dense int4 → ~110. So dense requantization i
   Regenerate: `python ref/qwen36_ref.py "The capital of France is" --n 8 --dump ref/golden --routes ref/golden/routes.jsonl`
 
 ### Phase 1 — kernels (each: unit test vs golden + bench)
-- [ ] K1 RMSNorm (1+w), fused residual-add variant
-- [ ] K2 Dense GEMV F16 (x fp32 → y fp32)
-- [ ] K3 Router: gate GEMV 256 + softmax + top-8
-- [ ] K4 Expert int4 gs64: fused gate+up+SiLU·mul, then down with weighted sum over k experts
-- [ ] K5 Shared expert + sigmoid gate (reuses K2)
-- [ ] K6 q/k per-head RMSNorm + partial RoPE + KV-cache append
-- [ ] K7 Decode attention: GQA, head_dim 256, softmax, output gate
-- [ ] K8 DeltaNet decode: conv1d ring + SiLU, l2norm, gates (beta, g), recurrent state update, gated RMSNorm
-- [ ] K9 lm_head GEMV + argmax (sampling later)
+- [x] K1 RMSNorm (1+w), fused residual-add variant
+- [x] K2 Dense GEMV F16 (x fp32 → y fp32)
+- [x] K3 Router: gate GEMV 256 + softmax + top-8
+- [x] K4 Expert int4 gs64: fused gate+up+SiLU·mul, then down with weighted sum over k experts
+- [x] K5 Shared expert + sigmoid gate (reuses K2)
+- [x] K6 q/k per-head RMSNorm + partial RoPE + KV-cache append
+- [x] K7 Decode attention: GQA, head_dim 256, softmax, output gate
+- [x] K8 DeltaNet decode: conv1d ring + SiLU, l2norm, gates (beta, g), recurrent state update, gated RMSNorm
+- [x] K9 lm_head GEMV + argmax (sampling later)
 
 ### Phase 2 — engine (all-GPU correctness)
 - [ ] E1 Loader: mmap safetensors, RAM budget, upload trunk to VRAM
@@ -79,3 +79,14 @@ Dense int8 → ~75 tok/s ceiling; dense int4 → ~110. So dense requantization i
 |---|---|---|---|
 | P0.1 ref | greedy: "The capital of France is" → " Paris.\nThe capital of France is Paris." | 0.34 tok/s (oracle only) | not yet cross-checked against colibri logits |
 | P0.2 golden | 12 positions, 5678 files, 66 MB | — | stateful ops are tested by chaining positions 0..11 |
+| K1 rmsnorm | exact (0 err) | 9 µs | launch-bound; fuse later |
+| K2 gemv F16 | rel 2e-7 | qkv 155 GB/s (83%), out_proj 131 (70%), lm_head 163 (87%) | L2 flushed before every timed run |
+| K3 router | top-8 ids identical L0/L3/L39 | 21 µs | |
+| K4 experts int4 | moe_out rel 1e-7 | 8 experts 0.146 ms, 97 GB/s (51%) | main upgrade target (U2) |
+| K5 shared expert | (in moe_out) | 71 µs, 89 GB/s | 6 launches; fuse/graph later |
+| K6+K7 attention | rel 5e-7 over 12 chained positions | layer 0.337 ms (86%); core T=4096 45 GB/s | split-K needed for long context |
+| K8 DeltaNet | rel 5e-7 over 12 chained positions | layer 0.430 ms (88%); core 32 µs | state column held in registers |
+| K9 argmax | 12/12 | 20 µs | |
+
+**Phase 1 roll-up (all experts resident, F16 dense):** 30×0.430 + 10×0.337 + 40×0.255 (router+experts+shared+norms) + 6.25 (lm_head)
+≈ **32.8 ms/token → ~30 tok/s** before fusion/graphs. Dense F16 is ~70% of it, which makes U1 (int8/int4 dense) the biggest lever.

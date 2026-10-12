@@ -198,6 +198,168 @@ __global__ void gated_add_k(float* __restrict__ out, const float* __restrict__ s
     if (i < n) out[i] += sh[i] / (1.f + __expf(-gate_logit[0]));
 }
 
+// ---- K6: per-head RMSNorm(1+w) + partial RoPE, then append k/v to the cache ----
+// q: [H][2*HD] (query ++ gate per head, from q_proj) -> query written to qo [H][HD].
+// k, v: [KV][HD]. Cache layout [KV][max_t][HD] fp32.
+// shortcut: fp32 KV cache (exact vs reference); F16/int8 KV when long contexts need the VRAM.
+constexpr int AHD = 256;
+__global__ void qk_norm_rope_k(const float* __restrict__ q, const float* __restrict__ k, const float* __restrict__ v,
+                               const half* __restrict__ qn, const half* __restrict__ kn,
+                               float* __restrict__ qo, float* __restrict__ Kc, float* __restrict__ Vc,
+                               int H, int KV, int pos, int max_t, int rot, float theta, float eps) {
+    __shared__ float t[AHD];
+    int hh = blockIdx.x, d = threadIdx.x;  // blocks [0,H) query heads, [H,H+KV) key heads
+    bool isq = hh < H;
+    float x = isq ? q[hh * 2 * AHD + d] : k[(hh - H) * AHD + d];
+    float r = rsqrtf(block_sum(x * x) / AHD + eps);
+    x = x * r * (1.f + __half2float((isq ? qn : kn)[d]));
+    t[d] = x;
+    __syncthreads();
+    int h2 = rot / 2;
+    if (d < rot) {
+        int j = d < h2 ? d : d - h2;
+        float ang = (float)pos * powf(theta, -2.f * j / rot);
+        float cs = cosf(ang), sn = sinf(ang);
+        x = d < h2 ? t[d] * cs - t[d + h2] * sn : t[d] * cs + t[d - h2] * sn;
+    }
+    if (isq) qo[hh * AHD + d] = x;
+    else {
+        size_t o = ((size_t)(hh - H) * max_t + pos) * AHD + d;
+        Kc[o] = x;
+        Vc[o] = v[(hh - H) * AHD + d];
+    }
+}
+
+// ---- K7: decode attention, one block (256 threads = head dim) per query head ----
+// ctx = softmax(q.K^T / sqrt(HD)) V over t in [0, T); out = ctx * sigmoid(gate).
+// shortcut: whole score row in shared memory (T <= ~24k with opt-in smem); split-K when contexts grow.
+__global__ void attn_decode_k(const float* __restrict__ qo, const float* __restrict__ q_gate,
+                              const float* __restrict__ Kc, const float* __restrict__ Vc,
+                              float* __restrict__ out, int H, int KV, int T, int max_t) {
+    extern __shared__ float sc[];  // [T]
+    __shared__ __align__(16) float qs[AHD];
+    int h = blockIdx.x, kvh = h / (H / KV), tid = threadIdx.x, lane = tid & 31, wid = tid >> 5;
+    qs[tid] = qo[h * AHD + tid];
+    __syncthreads();
+    const float* K = Kc + (size_t)kvh * max_t * AHD;
+    const float* V = Vc + (size_t)kvh * max_t * AHD;
+    const float scale = rsqrtf((float)AHD);
+    for (int t = wid; t < T; t += blockDim.x / 32) {  // warp per key, 8 dims per lane
+        const float4* kr = reinterpret_cast<const float4*>(K + (size_t)t * AHD) + lane * 2;
+        const float4* qr = reinterpret_cast<const float4*>(qs) + lane * 2;
+        float4 a = kr[0], b = kr[1], qa = qr[0], qb = qr[1];
+        float s = warp_sum(a.x * qa.x + a.y * qa.y + a.z * qa.z + a.w * qa.w + b.x * qb.x + b.y * qb.y + b.z * qb.z + b.w * qb.w);
+        if (lane == 0) sc[t] = s * scale;
+    }
+    __syncthreads();
+    float m = -INFINITY;
+    for (int t = tid; t < T; t += blockDim.x) m = fmaxf(m, sc[t]);
+    for (int o = 16; o; o >>= 1) m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, o));
+    __shared__ float red[32];
+    if (lane == 0) red[wid] = m;
+    __syncthreads();
+    m = red[0]; for (int i = 1; i < blockDim.x / 32; i++) m = fmaxf(m, red[i]);
+    float s = 0.f;
+    for (int t = tid; t < T; t += blockDim.x) { float e = __expf(sc[t] - m); sc[t] = e; s += e; }
+    float inv = 1.f / block_sum(s);  // block_sum syncs, so sc[] is complete after it
+    float acc = 0.f;
+    for (int t = 0; t < T; t++) acc += sc[t] * V[(size_t)t * AHD + tid];
+    float g = q_gate[h * 2 * AHD + AHD + tid];
+    out[h * AHD + tid] = acc * inv / (1.f + __expf(-g));
+}
+
+inline void attn_decode(const float* q, const float* k, const float* v, const half* qn, const half* kn,
+                        float* qo, float* Kc, float* Vc, float* out, int H, int KV, int pos, int max_t,
+                        int rot, float theta, float eps, cudaStream_t st = 0) {
+    qk_norm_rope_k<<<H + KV, AHD, 0, st>>>(q, k, v, qn, kn, qo, Kc, Vc, H, KV, pos, max_t, rot, theta, eps);
+    int T = pos + 1;
+    attn_decode_k<<<H, AHD, T * sizeof(float), st>>>(qo, q, Kc, Vc, out, H, KV, T, max_t);
+}
+
+// ---- K8: Gated DeltaNet decode ----
+// Conv: causal depthwise conv (kernel CK) over C channels with a carried ring [C][CK-1], then SiLU.
+__global__ void dn_conv_k(const float* __restrict__ qkv, const half* __restrict__ w, float* __restrict__ ring,
+                          float* __restrict__ out, int C, int CKn) {
+    int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= C) return;
+    float* rg = ring + (size_t)c * (CKn - 1);
+    const half* wc = w + (size_t)c * CKn;
+    float x = qkv[c], acc = __half2float(wc[CKn - 1]) * x;
+    for (int i = 0; i < CKn - 1; i++) acc += __half2float(wc[i]) * rg[i];
+    for (int i = 0; i < CKn - 2; i++) rg[i] = rg[i + 1];
+    rg[CKn - 2] = x;
+    out[c] = acc / (1.f + __expf(-acc));
+}
+
+// Recurrence + gated RMSNorm. One block per value head, thread = value column (DV threads),
+// the state column S[:, v] lives in registers: S is read once and written once per token.
+constexpr int DNK = 128, DNV = 128;
+__global__ void dn_recur_k(const float* __restrict__ conv, const float* __restrict__ z,
+                           const float* __restrict__ a, const float* __restrict__ b,
+                           const half* __restrict__ A_log, const half* __restrict__ dt_bias,
+                           const half* __restrict__ nw, float* __restrict__ S, float* __restrict__ o,
+                           int VH, int KH, float eps) {
+    __shared__ float qs[DNK], ks[DNK];
+    int h = blockIdx.x, v = threadIdx.x, kh = h / (VH / KH);
+    const float* qin = conv + kh * DNK;
+    const float* kin = conv + KH * DNK + kh * DNK;
+    float vin = conv[2 * KH * DNK + h * DNV + v];
+    float qv = qin[v], kv_ = kin[v];  // DNK == DNV == blockDim
+    float qn = sqrtf(block_sum(qv * qv) + 1e-6f), kn = sqrtf(block_sum(kv_ * kv_) + 1e-6f);
+    qs[v] = qv / qn * rsqrtf((float)DNK);
+    ks[v] = kv_ / kn;
+    float beta = 1.f / (1.f + __expf(-b[h]));
+    float ax = a[h] + __half2float(dt_bias[h]);
+    float sp = ax > 20.f ? ax : log1pf(expf(ax));
+    float eg = expf(-expf(__half2float(A_log[h])) * sp);
+    __syncthreads();
+    float* Sh = S + (size_t)h * DNK * DNV;
+    float col[DNK];
+    float kvs = 0.f;
+#pragma unroll
+    for (int i = 0; i < DNK; i++) { col[i] = Sh[i * DNV + v] * eg; kvs += ks[i] * col[i]; }
+    float delta = (vin - kvs) * beta, out = 0.f;
+#pragma unroll
+    for (int i = 0; i < DNK; i++) { col[i] += ks[i] * delta; out += qs[i] * col[i]; Sh[i * DNV + v] = col[i]; }
+    float r = rsqrtf(block_sum(out * out) / DNV + eps);
+    float zz = z[h * DNV + v];
+    o[h * DNV + v] = out * r * __half2float(nw[v]) * (zz / (1.f + __expf(-zz)));
+}
+
+inline void deltanet_core(const float* qkv, const float* z, const float* a, const float* b,
+                          const half* conv_w, const half* A_log, const half* dt_bias, const half* nw,
+                          float* ring, float* S, float* conv_scratch, float* o,
+                          int C, int CKn, int VH, int KH, float eps, cudaStream_t st = 0) {
+    dn_conv_k<<<(C + 255) / 256, 256, 0, st>>>(qkv, conv_w, ring, conv_scratch, C, CKn);
+    dn_recur_k<<<VH, DNV, 0, st>>>(conv_scratch, z, a, b, A_log, dt_bias, nw, S, o, VH, KH, eps);
+}
+
+// ---- K9: argmax over n floats (ties -> lower index), two passes ----
+// xi: candidate indices for x (second pass), or null for x's own positions.
+__global__ void argmax_k(const float* __restrict__ x, const int* __restrict__ xi, int n, float* __restrict__ pv, int* __restrict__ pi) {
+    __shared__ float sv[32]; __shared__ int si[32];
+    float bv = -INFINITY; int bi = 0x7fffffff;
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x)
+        if (x[i] > bv) { bv = x[i]; bi = xi ? xi[i] : i; }
+    for (int o = 16; o; o >>= 1) {
+        float ov = __shfl_xor_sync(0xffffffffu, bv, o); int oi = __shfl_xor_sync(0xffffffffu, bi, o);
+        if (ov > bv || (ov == bv && oi < bi)) { bv = ov; bi = oi; }
+    }
+    int lane = threadIdx.x & 31, wid = threadIdx.x >> 5;
+    if (lane == 0) { sv[wid] = bv; si[wid] = bi; }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        for (int i = 1; i < blockDim.x / 32; i++) if (sv[i] > bv || (sv[i] == bv && si[i] < bi)) { bv = sv[i]; bi = si[i]; }
+        pv[blockIdx.x] = bv; pi[blockIdx.x] = bi;
+    }
+}
+// sv: scratch of ARGMAX_BLOCKS+1 floats, si: ARGMAX_BLOCKS ints; the winning index lands in out[0]
+constexpr int ARGMAX_BLOCKS = 160;
+inline void argmax(const float* x, int n, float* sv, int* si, int* out, cudaStream_t st = 0) {
+    argmax_k<<<ARGMAX_BLOCKS, 256, 0, st>>>(x, nullptr, n, sv, si);
+    argmax_k<<<1, 256, 0, st>>>(sv, si, ARGMAX_BLOCKS, sv + ARGMAX_BLOCKS, out);
+}
+
 // Shared expert added into `out`. Weights F16: gate/up [SI,H], down [H,SI], sgate [1,H].
 // scratch: >= 2*SI + H + 1 floats.
 inline void shared_expert_add(const half* Wg, const half* Wu, const half* Wd, const half* Wsg,
