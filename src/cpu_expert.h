@@ -2,6 +2,7 @@
 #pragma once
 #include <immintrin.h>
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <functional>
 #include <thread>
@@ -19,7 +20,10 @@ struct CpuPool {
     const std::function<void(int)>* fn = nullptr;
     int n = 0;
 
-    explicit CpuPool(int threads) {
+    // spin = false: idle workers sleep instead of spinning (for a pool used only now and then, so its idle
+    // threads don't take cores from the hot pool; costs up to ~200 us of wake-up latency)
+    bool spin;
+    explicit CpuPool(int threads, bool spin_ = true) : spin(spin_) {
         for (int i = 0; i < threads - 1; i++) th.emplace_back([this] { worker(); });  // caller is the last worker
     }
     ~CpuPool() { quit = true; gen++; for (auto& t : th) t.join(); }
@@ -32,7 +36,9 @@ struct CpuPool {
         while (true) {
             int spins = 0;
             while (gen.load(std::memory_order_acquire) == seen) {
-                if (++spins < 20000) _mm_pause(); else std::this_thread::yield();
+                if (++spins < 20000) _mm_pause();
+                else if (spin) std::this_thread::yield();
+                else std::this_thread::sleep_for(std::chrono::microseconds(200));
             }
             seen++;  // main never starts job g+1 before every worker finished job g
             if (quit) return;

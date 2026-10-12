@@ -323,8 +323,10 @@ struct Engine {
         size_t fr, tot; CK(cudaMemGetInfo(&fr, &tot));
         const size_t reserve = 320ull << 20;
         nslots = (int)((fr - std::min(fr, reserve)) / EXPERT_BYTES);
-        if (nslots < 2 * TOPK) { fprintf(stderr, "only %d expert slots fit; need >= %d\n", nslots, 2 * TOPK); exit(1); }
+        nres = (int)((carve_prefill(nullptr) + EXPERT_BYTES - 1) / EXPERT_BYTES);
+        if (nslots < nres + 2 * TOPK) { fprintf(stderr, "only %d expert slots fit; need >= %d\n", nslots, 2 * TOPK); exit(1); }
         CK(cudaMalloc(&arena, (size_t)nslots * EXPERT_BYTES));
+        carve_prefill(arena + (size_t)(nslots - nres) * EXPERT_BYTES);
         slot_of.assign(NL * E, -1); owner.assign(nslots, -1); last.assign(nslots, 0);
         ready.assign(nslots, 0); inflight.assign(nslots, 0);
         auto mapped = [](auto** hp, auto** dp, size_t bytes) {
@@ -417,7 +419,7 @@ struct Engine {
     static constexpr int STREAM_MIN = 2;  // an expert used by one token is cheaper on the CPU than over PCIe
     uint8_t* stage_p = nullptr;   // VRAM, 2 * SB slots
     uint8_t* hstage = nullptr;    // pinned host, 2 * SB slots
-    CpuPool cpool{4};             // staging copies, concurrent with the CPU experts on cpu.pool
+    CpuPool cpool{4, false};      // staging copies, concurrent with the CPU experts on cpu.pool; sleeps when idle
     cudaEvent_t ev_hfree[2];
     cudaStream_t cpp;
     cudaEvent_t ev_copied[2], ev_free[2];
@@ -425,19 +427,44 @@ struct Engine {
         CK(cudaHostAlloc((void**)hp, n * sizeof(T), cudaHostAllocMapped));
         CK(cudaHostGetDevicePointer((void**)dp, *hp, 0));
     }
-    void alloc_prefill() {
+    // Prefill's device scratch and staging slots live in the last nres slots of the expert arena: during decode
+    // they are ordinary cache slots, a prefill evicts them first (measured: as separate allocations they cost
+    // ~90 slots and decode 54 -> 52 tok/s). base == nullptr only measures.
+    int nres = 0;
+    size_t carve_prefill(uint8_t* base) {
         const int LQ = AH * 2 * AHD + 2 * AKV * AHD, LB = DC + DVH * DNV + 2 * DVH;
-        Xc = falloc((size_t)CH * D); hc = falloc((size_t)CH * D); tmpc = falloc((size_t)CH * D); moec = falloc((size_t)CH * D);
-        qkvc = falloc((size_t)CH * LQ); bigc = falloc((size_t)CH * LB); convc = falloc((size_t)CH * DC); oc = falloc((size_t)CH * DVH * DNV);
-        qoc = falloc((size_t)CH * AH * AHD); agc = falloc((size_t)CH * AH * AHD); lgc = falloc((size_t)CH * E); rwc = falloc((size_t)CH * TOPK);
-        actp = falloc((size_t)CH * TOPK * EI); ypair = falloc((size_t)CH * TOPK * D);
-        shgu = falloc((size_t)CH * 2 * SI); sha = falloc((size_t)CH * SI); shs = falloc((size_t)CH * D); shl = falloc(CH);
-        CK(cudaMalloc(&ridxc, CH * TOPK * 4));
+        size_t off = 0;
+        auto f = [&](float*& p, size_t n) { if (base) p = (float*)(base + off); off += (n * 4 + 255) & ~(size_t)255; };
+        f(Xc, (size_t)CH * D); f(hc, (size_t)CH * D); f(tmpc, (size_t)CH * D); f(moec, (size_t)CH * D);
+        f(qkvc, (size_t)CH * LQ); f(bigc, (size_t)CH * LB); f(convc, (size_t)CH * DC); f(oc, (size_t)CH * DVH * DNV);
+        f(qoc, (size_t)CH * AH * AHD); f(agc, (size_t)CH * AH * AHD); f(lgc, (size_t)CH * E); f(rwc, (size_t)CH * TOPK);
+        f(actp, (size_t)CH * TOPK * EI); f(ypair, (size_t)CH * TOPK * D);
+        f(shgu, (size_t)CH * 2 * SI); f(sha, (size_t)CH * SI); f(shs, (size_t)CH * D); f(shl, CH);
+        float* ri; f(ri, (size_t)CH * TOPK); if (base) ridxc = (int*)ri;
+        if (base) stage_p = base + off;
+        return off + (size_t)2 * SB * EXPERT_BYTES;
+    }
+    void claim_prefill_slots() {
+        while (true) {  // no admission copy may still be on its way into these slots
+            { std::lock_guard<std::mutex> g(mu); if (todo.empty()) break; }
+            std::this_thread::sleep_for(std::chrono::microseconds(100));
+        }
+        CK(cudaStreamSynchronize(cp));
+        poll_admissions();
+        for (int s = nslots - nres; s < nslots; s++) {
+            if (owner[s] >= 0) { slot_of[owner[s]] = -1; if (ready[s]) table_set(owner[s], nullptr); owner[s] = -1; }
+            ready[s] = 0; inflight[s] = 1;  // admit() skips them until released
+        }
+        flush_table();
+    }
+    void release_prefill_slots() {
+        for (int s = nslots - nres; s < nslots; s++) { inflight[s] = 0; last[s] = 0; }
+    }
+    void alloc_prefill() {
         mapped_alloc(&rows_h, &rows_d, (size_t)CH * D); mapped_alloc(&rwc_h, &rwc_d, (size_t)CH * TOPK);
         mapped_alloc(&ycpu_h, &ycpu_d, (size_t)CH * D); mapped_alloc(&ridxc_h, &ridxc_d, (size_t)CH * TOPK);
         mapped_alloc(&items_h, &items_d, (size_t)E); mapped_alloc(&pairs_h, &pairs_d, (size_t)CH * TOPK);
         ypair_cpu.resize((size_t)CH * TOPK * D);
-        CK(cudaMalloc(&stage_p, (size_t)2 * SB * EXPERT_BYTES));
         CK(cudaMallocHost(&hstage, (size_t)2 * SB * EXPERT_BYTES));
         CK(cudaStreamCreateWithFlags(&cpp, cudaStreamNonBlocking));
         for (int i = 0; i < 2; i++) {
@@ -454,6 +481,7 @@ struct Engine {
     int prefill(const int* ids, int n, int pos0) {
         const int LQ = AH * 2 * AHD + 2 * AKV * AHD, LB = DC + DVH * DNV + 2 * DVH;
         int next = -1;
+        claim_prefill_slots();
         double pt0 = now(), pt[5] = {};
         unsigned long pf0 = page_faults();
         long long sn0 = streamed_n;
@@ -580,6 +608,7 @@ struct Engine {
                 next = ids_h[0];
             }
         }
+        release_prefill_slots();
         fprintf(stderr, "[prefill] %d tok in %.2f s = %.1f tok/s | host: gpu-wait %.2f  streaming-wait %.2f  cpu-experts %.2f s | streamed %lld experts"
                 " | copier: wait-dma %.2f  memcpy %.2f s | page faults %lu\n",
                 n, now() - pt0, n / (now() - pt0), pt[0], pt[1], pt[2], streamed_n - sn0, pt[3], pt[4], page_faults() - pf0);
