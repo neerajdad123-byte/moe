@@ -3,6 +3,7 @@
 #include <cuda_fp16.h>
 #include <mma.h>
 #include <cstdint>
+#include <algorithm>
 
 #define CK(x) do { cudaError_t e_ = (x); if (e_ != cudaSuccess) { \
     fprintf(stderr, "CUDA %s at %s:%d\n", cudaGetErrorString(e_), __FILE__, __LINE__); exit(1); } } while (0)
@@ -127,16 +128,24 @@ __global__ void quantize_rows_i8_k(const half* __restrict__ W, int8_t* __restric
     if (threadIdx.x == 0) s[blockIdx.x] = sc;
 }
 
-// A dense matrix in whichever form it was loaded: F16 (exact) or int8 + row scales.
+// A dense matrix in whichever form it was loaded: F16 (exact), int8 + row scales, or int4 gs64 + group scales
+// (the experts' format: low nibble first, s is [O][I/64]).
 struct Mat {
     const half* f16 = nullptr;
     const int8_t* q = nullptr;
     const float* s = nullptr;
+    const uint8_t* q4 = nullptr;
 };
+
+template <int WARPS>
+__global__ void gemv_q4_k(const uint8_t* __restrict__ Q, const float* __restrict__ s, const float* __restrict__ x,
+                          float* __restrict__ y, int I, int O);
+inline int persistent_blocks();
 
 inline void gemv(const Mat& m, const float* x, float* y, int I, int O, cudaStream_t st = 0) {
     constexpr int WARPS = 8;
-    if (m.q) gemv_i8<WARPS, 1>(m.q, m.s, x, y, I, O, st);
+    if (m.q4) gemv_q4_k<WARPS><<<std::min(persistent_blocks(), (O + WARPS - 1) / WARPS), WARPS * 32, (I + I / 8) * 4, st>>>(m.q4, m.s, x, y, I, O);
+    else if (m.q) gemv_i8<WARPS, 1>(m.q, m.s, x, y, I, O, st);
     else gemv_f16(m.f16, x, y, I, O, st);
 }
 
@@ -144,7 +153,7 @@ inline void gemv(const Mat& m, const float* x, float* y, int I, int O, cudaStrea
 // Weights are int8 (exact in fp16: they are integers; the row scale is applied after the fp32 accumulation)
 // or F16. Activations are rounded to fp16. Block tile 64 rows x 64 tokens x 32 K, 4 warps of 32x32.
 // Requires I % 32 == 0.
-template <typename WT>
+template <typename WT, bool Q4 = false>
 __global__ void gemm_wmma_k(const WT* __restrict__ W, const float* __restrict__ s, const float* __restrict__ X,
                             float* __restrict__ Y, int S, int I, int O) {
     using namespace nvcuda;
@@ -157,7 +166,15 @@ __global__ void gemm_wmma_k(const WT* __restrict__ W, const float* __restrict__ 
     for (int k0 = 0; k0 < I; k0 += BK) {
         for (int e = threadIdx.x; e < BM * BK; e += blockDim.x) {
             int r = e / BK, k = e % BK, o = o0 + r, t = s0 + r;
-            As[r * LD + k] = o < O ? __float2half((float)W[(size_t)o * I + k0 + k]) : __float2half(0.f);
+            float wv = 0.f;
+            if (o < O) {
+                if constexpr (Q4) {  // int4 gs64: the group scale goes into the tile (no row scale afterwards)
+                    size_t i = (size_t)o * I + k0 + k;
+                    int b = reinterpret_cast<const uint8_t*>(W)[i >> 1], v = (i & 1) ? b >> 4 : b & 0xF;
+                    wv = (float)(v - ((v & 8) << 1)) * s[(size_t)o * (I / 64) + ((k0 + k) >> 6)];
+                } else wv = (float)W[(size_t)o * I + k0 + k];
+            }
+            As[r * LD + k] = __float2half(wv);
             Bs[r * LD + k] = t < S ? __float2half(X[(size_t)t * I + k0 + k]) : __float2half(0.f);
         }
         __syncthreads();
@@ -176,14 +193,15 @@ __global__ void gemm_wmma_k(const WT* __restrict__ W, const float* __restrict__ 
     __syncwarp();
     for (int e = threadIdx.x & 31; e < 32 * 32; e += 32) {
         int r = e / 32, n = e % 32, o = o0 + wm + r, t = s0 + wn + n;
-        if (o < O && t < S) Y[(size_t)t * O + o] = cs[e] * (s ? s[o] : 1.f);
+        if (o < O && t < S) Y[(size_t)t * O + o] = cs[e] * (s && !Q4 ? s[o] : 1.f);
     }
 }
 
 // Y[S][O] = X[S][I] . W^T for a dense matrix in either form.
 inline void gemm(const Mat& m, const float* X, float* Y, int S, int I, int O, cudaStream_t st = 0) {
     dim3 grid((O + 63) / 64, (S + 63) / 64);
-    if (m.q) gemm_wmma_k<int8_t><<<grid, 128, 0, st>>>(m.q, m.s, X, Y, S, I, O);
+    if (m.q4) gemm_wmma_k<uint8_t, true><<<grid, 128, 0, st>>>(m.q4, m.s, X, Y, S, I, O);
+    else if (m.q) gemm_wmma_k<int8_t><<<grid, 128, 0, st>>>(m.q, m.s, X, Y, S, I, O);
     else gemm_wmma_k<half><<<grid, 128, 0, st>>>(m.f16, nullptr, X, Y, S, I, O);
 }
 
@@ -229,7 +247,7 @@ inline void router_topk(const float* logits, int E, int K, bool norm, int* idx, 
 // ---- K4: routed experts, int4 gs64 symmetric ----
 // Slot layout (= container): [gate IxH | up IxH | down HxI] packed int4 (low nibble first),
 // then f32 scales [gate Ix(H/64) | up Ix(H/64) | down Hx(I/64)].
-constexpr int EH = 2048, EI = 512, EGS = 64;
+constexpr int EH = 2048, EI = 512, EGS = 64, EGS_DENSE = 64;
 constexpr size_t EXPERT_Q_BYTES = (size_t)3 * EH * EI / 2;                           // 1,572,864
 constexpr size_t EXPERT_BYTES = EXPERT_Q_BYTES + (size_t)3 * EI * (EH / EGS) * 4;   // + 196,608
 
@@ -256,6 +274,44 @@ __device__ __forceinline__ float dot32_i4(uint4 u, const float* __restrict__ x) 
 // stride that puts every lane on the same banks. Padding 4 floats per 32 shifts each lane by one 16-byte bank group.
 __device__ __forceinline__ int xpad(int i) { return i + (i >> 5) * 4; }
 __host__ __device__ constexpr int xpad_size(int n) { return n + n / 8; }
+
+// ---- K11: int4 gs64 dense GEMV. x in padded shared memory (loaded once per block of a persistent grid),
+// one warp per row at a time; a 16-byte load is 32 weights = half a scale group. Requires I % 64 == 0.
+template <int WARPS>
+__global__ void gemv_q4_k(const uint8_t* __restrict__ Q, const float* __restrict__ s, const float* __restrict__ x,
+                          float* __restrict__ y, int I, int O) {
+    extern __shared__ __align__(16) float xs[];  // [xpad_size(I)]
+    for (int i = threadIdx.x; i < I; i += blockDim.x) xs[xpad(i)] = x[i];
+    __syncthreads();
+    const int lane = threadIdx.x & 31, G = I / EGS_DENSE;
+    for (int row = blockIdx.x * WARPS + (threadIdx.x >> 5); row < O; row += gridDim.x * WARPS) {
+        const uint4* wr = reinterpret_cast<const uint4*>(Q + (size_t)row * (I / 2));
+        const float* sr = s + (size_t)row * G;
+        float acc = 0.f;
+#pragma unroll 2
+        for (int c = lane; c < I / 32; c += 32) acc += dot32_i4(__ldcs(wr + c), xs + 36 * c) * sr[c >> 1];
+        acc = warp_sum(acc);
+        if (lane == 0) y[row] = acc;
+    }
+}
+
+// F16 [O,I] -> int4 gs64 symmetric (scale = group absmax / 7, values clamped to [-8,7]). One block per row,
+// one thread per 64-element group.
+__global__ void quantize_rows_q4_k(const half* __restrict__ W, uint8_t* __restrict__ Q, float* __restrict__ s, int I) {
+    const half* wr = W + (size_t)blockIdx.x * I;
+    for (int g = threadIdx.x; g < I / 64; g += blockDim.x) {
+        float m = 0.f;
+        for (int i = 0; i < 64; i++) m = fmaxf(m, fabsf(__half2float(wr[g * 64 + i])));
+        float sc = m > 0.f ? m / 7.f : 1.f;
+        uint8_t* qr = Q + (size_t)blockIdx.x * (I / 2) + g * 32;
+        for (int i = 0; i < 64; i += 2) {
+            int a = max(-8, min(7, __float2int_rn(__half2float(wr[g * 64 + i]) / sc)));
+            int b = max(-8, min(7, __float2int_rn(__half2float(wr[g * 64 + i + 1]) / sc)));
+            qr[i / 2] = (uint8_t)((a & 0xF) | ((b & 0xF) << 4));
+        }
+        s[(size_t)blockIdx.x * (I / 64) + g] = sc;
+    }
+}
 
 // Persistent grid: enough blocks to fill the GPU once, each loading its shared inputs once and then
 // looping over rows (a block per 8 rows re-read the 8-16 KB of inputs ~500 times per layer).

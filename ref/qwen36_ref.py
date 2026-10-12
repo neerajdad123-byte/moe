@@ -176,7 +176,9 @@ class Qwen36Ref:
         logits = self.mv(w["mlp.gate.weight"], x)
         probs = torch.softmax(logits, -1)
         val, idx = torch.topk(probs, c["topk"])
-        if c.get("norm_topk_prob"):
+        # Renormalize the top-k weights: the HF config omits norm_topk_prob and the Qwen3.5-MoE default is true
+        # (colibri's meta says false; with false the model degenerates into loops, llama.cpp normalizes).
+        if os.environ.get("REF_NO_NORM_TOPK") is None:
             val = val / val.sum()
         out = torch.zeros_like(x)
         for e, wt in zip(idx.tolist(), val.tolist()):
@@ -194,7 +196,7 @@ class Qwen36Ref:
     def step(self, tok, dump_dir=None):
         """One token through the model. Returns fp32 logits [vocab]."""
         def dump(name, t):
-            if dump_dir:
+            if dump_dir and (not self.logits_only or name == "logits"):
                 fn = f"p{self.pos:03d}_" + (f"L{cur:02d}_" if cur is not None else "") + name + ".bin"
                 t.detach().cpu().contiguous().numpy().tofile(os.path.join(dump_dir, fn))
         cur = None
@@ -225,6 +227,7 @@ def main():
     ap.add_argument("--n", type=int, default=16)
     ap.add_argument("--dump", help="directory for golden per-op dumps (every position)")
     ap.add_argument("--routes", help="write per-token routes (jsonl)")
+    ap.add_argument("--logits-only", action="store_true", help="with --dump: only the logits (long evaluation sets)")
     a = ap.parse_args()
     from tokenizers import Tokenizer
     tk = Tokenizer.from_file(os.path.join(MODEL, "tokenizer.json"))
@@ -234,6 +237,7 @@ def main():
         json.dump({"prompt": a.prompt, "ids": ids}, open(os.path.join(a.dump, "meta.json"), "w"))
     t0 = time.time()
     m = Qwen36Ref()
+    m.logits_only = a.logits_only
     print(f"loaded in {time.time() - t0:.1f}s, prompt ids {ids}")
     rf = open(a.routes, "w") if a.routes else None
     out = []
@@ -247,6 +251,8 @@ def main():
             out.append(int(logits.argmax()))
             print(repr(tk.decode(out)), flush=True)
     print(f"{(len(ids) + a.n - 1) / (time.time() - t0):.2f} tok/s (reference, not a benchmark)")
+    if a.dump:  # every token fed, so an engine can be teacher-forced through the same sequence
+        json.dump({"prompt": a.prompt, "ids": ids + out[:-1], "n_prompt": len(ids)}, open(os.path.join(a.dump, "meta.json"), "w"))
 
 
 if __name__ == "__main__":

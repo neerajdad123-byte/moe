@@ -30,6 +30,9 @@ constexpr int D = 2048, NL = 40, E = 256, TOPK = 8, SI = 512, V = 248320;
 constexpr int AH = 16, AKV = 2, ROT = 64;            // attention
 constexpr int DC = 8192, DVH = 32, DKH = 16, CONVK = 4;  // DeltaNet
 constexpr float EPS = 1e-6f, THETA = 1e7f;
+// Top-8 router weights renormalized to sum to 1: the HF config omits norm_topk_prob, the Qwen3.5-MoE default is
+// true, and llama.cpp normalizes for this architecture (colibri's converter wrote false into its meta).
+static bool NORM_TOPK = !getenv("MOEX_NO_NORM_TOPK");
 static bool is_attn(int l) { return l % 4 == 3; }
 
 struct LayerW {
@@ -235,27 +238,36 @@ struct Engine {
         CK(cudaMemcpy(d, C.map(n), s.bytes, cudaMemcpyHostToDevice));
         return d;
     }
-    // Row-concatenation of matrices with the same input width I, as F16 or int8 + per-row scales.
-    Mat wmat(std::initializer_list<std::pair<std::string, int64_t>> parts, int64_t I) {
+    // Dense matrix groups stored int4 gs64 instead of int8 (--q4 dn_in,dn_out,attn_qkv,attn_o,sh_gu,sh_d,lm_head).
+    std::string q4groups;
+    bool is_q4(const char* g) const {
+        std::string l = "," + q4groups + ",";
+        return !f16 && l.find("," + std::string(g) + ",") != std::string::npos;
+    }
+    // Row-concatenation of matrices with the same input width I, as F16, int8 + per-row scales, or int4 gs64.
+    Mat wmat(std::initializer_list<std::pair<std::string, int64_t>> parts, int64_t I, const char* group) {
+        const bool q4 = is_q4(group);
         int64_t O = 0;
         for (auto& [n, rows] : parts) {
             if ((int64_t)C.at(n).bytes != rows * I * 2) { fprintf(stderr, "shape mismatch %s\n", n.c_str()); exit(1); }
             O += rows;
         }
-        half* f = nullptr; int8_t* q = nullptr; float* sc = nullptr;
+        half* f = nullptr; int8_t* q = nullptr; float* sc = nullptr; uint8_t* p4 = nullptr;
         if (f16) CK(cudaMalloc(&f, O * I * 2));
+        else if (q4) { CK(cudaMalloc(&p4, O * I / 2)); CK(cudaMalloc(&sc, O * (I / 64) * 4)); }
         else { CK(cudaMalloc(&q, O * I)); CK(cudaMalloc(&sc, O * 4)); }
         int64_t off = 0;
         for (auto& [n, rows] : parts) {
             if (f16) CK(cudaMemcpy(f + off * I, C.map(n), rows * I * 2, cudaMemcpyHostToDevice));
             else {  // the synchronous copy also orders qtmp's reuse after the previous quantize
                 CK(cudaMemcpy(qtmp, C.map(n), rows * I * 2, cudaMemcpyHostToDevice));
-                quantize_rows_i8_k<<<(int)rows, 256>>>(qtmp, q + off * I, sc + off, (int)I);
+                if (q4) quantize_rows_q4_k<<<(int)rows, 64>>>(qtmp, p4 + off * I / 2, sc + off * (I / 64), (int)I);
+                else quantize_rows_i8_k<<<(int)rows, 256>>>(qtmp, q + off * I, sc + off, (int)I);
                 CK(cudaGetLastError());
             }
             off += rows;
         }
-        return {f, q, sc};
+        return {f, q, sc, p4};
     }
     static float* falloc(size_t n, bool zero = false) {
         float* d; CK(cudaMalloc(&d, n * 4)); if (zero) CK(cudaMemset(d, 0, n * 4)); return d;
@@ -265,7 +277,7 @@ struct Engine {
         double t0 = now();
         embed = (const half*)C.map("model.embed_tokens.weight");
         if (!f16) CK(cudaMalloc(&qtmp, (size_t)V * D * 2));  // largest matrix
-        lm_head = wmat({{"lm_head.weight", V}}, D);
+        lm_head = wmat({{"lm_head.weight", V}}, D, "lm_head");
         norm = wup("model.norm.weight", D);
         L.resize(NL);
         for (int i = 0; i < NL; i++) {
@@ -274,13 +286,13 @@ struct Engine {
             w.in_ln = wup(p + "input_layernorm.weight", D);
             w.post_ln = wup(p + "post_attention_layernorm.weight", D);
             w.router = wup(m + "gate.weight", (int64_t)E * D);
-            w.sh_gu = wmat({{m + "shared_expert.gate_proj.weight", SI}, {m + "shared_expert.up_proj.weight", SI}}, D);
-            w.sh_d = wmat({{m + "shared_expert.down_proj.weight", D}}, SI);
+            w.sh_gu = wmat({{m + "shared_expert.gate_proj.weight", SI}, {m + "shared_expert.up_proj.weight", SI}}, D, "sh_gu");
+            w.sh_d = wmat({{m + "shared_expert.down_proj.weight", D}}, SI, "sh_d");
             w.sh_gate = wup(m + "shared_expert_gate.weight", D);
             if (is_attn(i)) {
                 std::string a = p + "self_attn.";
-                w.attn_qkv = wmat({{a + "q_proj.weight", AH * 2 * AHD}, {a + "k_proj.weight", AKV * AHD}, {a + "v_proj.weight", AKV * AHD}}, D);
-                w.o = wmat({{a + "o_proj.weight", D}}, AH * AHD);
+                w.attn_qkv = wmat({{a + "q_proj.weight", AH * 2 * AHD}, {a + "k_proj.weight", AKV * AHD}, {a + "v_proj.weight", AKV * AHD}}, D, "attn_qkv");
+                w.o = wmat({{a + "o_proj.weight", D}}, AH * AHD, "attn_o");
                 w.qn = wup(a + "q_norm.weight", AHD);
                 w.kn = wup(a + "k_norm.weight", AHD);
                 w.K = falloc((size_t)AKV * ctx * AHD);
@@ -288,8 +300,8 @@ struct Engine {
             } else {
                 std::string a = p + "linear_attn.";
                 w.dn_in = wmat({{a + "in_proj_qkv.weight", DC}, {a + "in_proj_z.weight", DVH * DNV},
-                                {a + "in_proj_a.weight", DVH}, {a + "in_proj_b.weight", DVH}}, D);
-                w.out = wmat({{a + "out_proj.weight", D}}, DVH * DNV);
+                                {a + "in_proj_a.weight", DVH}, {a + "in_proj_b.weight", DVH}}, D, "dn_in");
+                w.out = wmat({{a + "out_proj.weight", D}}, DVH * DNV, "dn_out");
                 w.conv = wup(a + "conv1d.weight", (int64_t)DC * CONVK);
                 w.nw = wup(a + "norm.weight", DNV);
                 w.alog = wup(a + "A_log", DVH);
@@ -347,7 +359,7 @@ struct Engine {
         loader = std::thread([this] { loader_main(); });
         capture_graphs();
         fprintf(stderr, "[load] %.1f s, dense %s, %d expert slots (%.2f GB, %.1f%% of %d experts), ctx %d\n",
-                now() - t0, f16 ? "F16" : "int8", nslots, nslots * (double)EXPERT_BYTES / 1e9, 100.0 * nslots / (NL * E), NL * E, ctx);
+                now() - t0, f16 ? "F16" : q4groups.empty() ? "int8" : ("int8, int4: " + q4groups).c_str(), nslots, nslots * (double)EXPERT_BYTES / 1e9, 100.0 * nslots / (NL * E), NL * E, ctx);
     }
 
     // New conversation: recurrent state back to zero (KV rows are overwritten position by position).
@@ -377,7 +389,7 @@ struct Engine {
         }
         rmsnorm(x, tmp, w.post_ln, h, D, EPS, 1, cs);
         gemv_f16(w.router, h, scr, D, E, cs);
-        router_topk(scr, E, TOPK, false, ridx, rw, cs);
+        router_topk(scr, E, TOPK, NORM_TOPK, ridx, rw, cs);
         export_route_k<<<(D + 255) / 256, 256, 0, cs>>>(h, ridx, rw, h_hd, ids_hd, w_hd, D, TOPK);
         CK(cudaEventRecordWithFlags(ev_route, cs, cudaEventRecordExternal));  // host-visible even from a graph
         // hits from the device slot table, then resident experts + shared expert, no host in the loop
@@ -508,7 +520,7 @@ struct Engine {
                 }
                 rmsnorm(Xc, tmpc, w.post_ln, hc, D, EPS, T, cs);
                 for (int t = 0; t < T; t++) gemv_f16(w.router, hc + (size_t)t * D, lgc + (size_t)t * E, D, E, cs);  // fp32 routing, as decode
-                router_topk(lgc, E, TOPK, false, ridxc, rwc, cs, T);
+                router_topk(lgc, E, TOPK, NORM_TOPK, ridxc, rwc, cs, T);
                 export_route_k<<<(T * D + 255) / 256, 256, 0, cs>>>(hc, ridxc, rwc, rows_d, ridxc_d, rwc_d, T * D, T * TOPK);
                 double w0 = now();
                 CK(cudaStreamSynchronize(cs));
@@ -691,6 +703,7 @@ int main(int argc, char** argv) {
     int n = 32, ctx = 2048;
     std::string check, batch, trace_path;
     bool prof = false, f16 = false, use_prefill = true;
+    std::string q4groups;
     for (int i = 1; i < argc; i++) {
         std::string s = argv[i];
         auto next = [&] { if (i + 1 >= argc) { fprintf(stderr, "%s needs a value\n", s.c_str()); exit(2); } return std::string(argv[++i]); };
@@ -702,6 +715,7 @@ int main(int argc, char** argv) {
         else if (s == "--profile") prof = true;
         else if (s == "--f16") f16 = true;
         else if (s == "--no-prefill") use_prefill = false;
+        else if (s == "--q4") q4groups = next();
         else if (s == "--batch") batch = next();
         else if (s == "--trace") trace_path = next();
         else { fprintf(stderr, "unknown arg %s\n", s.c_str()); return 2; }
@@ -716,12 +730,18 @@ int main(int argc, char** argv) {
     if (ids.empty() && batch.empty()) { fprintf(stderr, "usage: moex --ids 1,2,3 [--n N] | --batch ids.txt | --check ref/golden\n"); return 2; }
 
     Engine eng(model, ctx);
-    eng.f16 = f16;
+    eng.f16 = f16; eng.q4groups = q4groups;
     eng.load();
 
     if (!check.empty()) {
-        int pos = 0, tok = ids[0], bad = 0; double worst = 0, worst_kl = 0;
-        const int np = (int)ids.size();
+        int pos = 0, tok = ids[0], bad = 0, scored = 0; double worst = 0, worst_kl = 0, sum_kl = 0;
+        int np = (int)ids.size();  // teacher forcing: every id in meta.json is fed; the prompt part is prefilled
+        {
+            FILE* f = fopen((check + "/meta.json").c_str(), "rb");
+            std::string m(1 << 20, 0); m.resize(fread(m.data(), 1, m.size(), f)); fclose(f);
+            size_t k = m.find("\"n_prompt\"");
+            if (k != std::string::npos) np = std::stoi(m.substr(m.find(':', k) + 1));
+        }
         if (use_prefill) pos = np - 1;  // the prompt runs as one prefill; compare from its last position on
         for (;; pos++) {
             auto ref = read_f32(check + "/p" + std::string(pos < 10 ? "00" : pos < 100 ? "0" : "") + std::to_string(pos) + "_logits.bin");
@@ -736,14 +756,19 @@ int main(int argc, char** argv) {
             for (int i = 0; i < V; i++) { zr += exp(ref[i] - mr); zg += exp(got[i] - mg); }
             for (int i = 0; i < V; i++) { double lp = ref[i] - mr - log(zr), lq = got[i] - mg - log(zg); kl += exp(lp) * (lp - lq); }
             worst = std::max(worst, err / mx); worst_kl = std::max(worst_kl, kl); bad += id != rid;
+            sum_kl += kl; scored++;
             fprintf(stderr, "  pos %2d tok %6d  logits rel %.3e  KL %.2e  argmax %6d ref %6d %s\n", pos, tok, err / mx, kl, id, rid, id == rid ? "" : "MISMATCH");
-            tok = pos + 1 < np ? ids[pos + 1] : id;
+            tok = pos + 1 < (int)ids.size() ? ids[pos + 1] : id;
         }
-        // F16 must be numerically identical; int8 is judged by distribution drift (KL) and greedy agreement
-        // (prefill rounds activations to fp16 on tensor cores, so only the token-by-token F16 path is held to exactness)
-        bool ok = pos > 0 && bad == 0 && (f16 && !use_prefill ? worst < 1e-4 : f16 ? worst_kl < 1e-5 : worst_kl < 0.02);
-        fprintf(stderr, "[check] %s, %d positions, worst logits rel %.3e, worst KL %.2e, argmax mismatches %d -> %s\n",
-                f16 ? "F16" : "int8", pos, worst, worst_kl, bad, ok ? "PASS" : "FAIL");
+        // F16 must be numerically identical (prefill rounds activations to fp16 on tensor cores, so only the
+        // token-by-token F16 path is held to exactness). Quantized weights are judged statistically: mean KL and
+        // top-1 agreement (an int8 model legitimately flips a near-tie now and then).
+        const double mean_kl = scored ? sum_kl / scored : 1e9, agree = scored ? 1.0 - (double)bad / scored : 0;
+        bool ok = scored > 0 && (f16 && !use_prefill ? worst < 1e-4 && bad == 0 : f16 ? worst_kl < 1e-5 && bad == 0
+                                                                                   : mean_kl < 5e-3 && agree >= 0.97);
+        fprintf(stderr, "[check] %s, %d positions, mean KL %.2e, worst KL %.2e, worst logits rel %.3e, top-1 agreement %.1f%% (%d mismatch) -> %s\n",
+                f16 ? "F16" : q4groups.empty() ? "int8" : ("int8 + int4 " + q4groups).c_str(), scored, mean_kl, worst_kl, worst,
+                100 * agree, bad, ok ? "PASS" : "FAIL");
         return ok ? 0 : 1;
     }
 

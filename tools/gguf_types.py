@@ -37,10 +37,16 @@ kv = {}
 for _ in range(nkv):
     k = rstr(); kv[k] = rval(rd("I"))
 print(f"GGUF v{ver}, {nt} tensors; file_type={kv.get('general.file_type')}")
+if "--meta" in sys.argv:
+    for k, v in kv.items():
+        if not k.startswith("tokenizer.ggml.") or not isinstance(v, list):
+            print(f"  kv {k} = {v if not isinstance(v, str) or len(v) < 120 else v[:120] + '...'}")
 by_kind = collections.defaultdict(collections.Counter)
 for _ in range(nt):
-    name = rstr(); nd = rd("I"); dims = [rd("Q") for _ in range(nd)]; t = rd("I"); rd("Q")
+    name = rstr(); nd = rd("I"); dims = [rd("Q") for _ in range(nd)]; t = rd("I"); off = rd("Q")
     kind = ".".join(p for p in name.split(".") if not p.isdigit())
     by_kind[kind][TYPES.get(t, str(t))] += 1
+    if "--meta" in sys.argv and (name.startswith("blk.0.") or name.startswith("blk.3.") or not name.startswith("blk.")):
+        print(f"  t {name:36s} {TYPES.get(t, t):6s} dims {dims} off {off}")
 for kind in sorted(by_kind):
     print(f"  {kind:40s} {dict(by_kind[kind])}")

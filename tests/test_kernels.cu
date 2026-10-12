@@ -139,7 +139,7 @@ int main(int argc, char** argv) {
             float* h = up(golden(pf + std::string("moe_in")));
             gemv_f16(Wr, h, logits, D, E);
             check((std::string(pf) + "router logits").c_str(), down(logits, E), golden(pf + std::string("router_logits")), 1e-5f);
-            router_topk(logits, E, K, false, idx, w);
+            router_topk(logits, E, K, true, idx, w);
             std::vector<int> gi(K); CK(cudaMemcpy(gi.data(), idx, K * 4, cudaMemcpyDeviceToHost));
             auto ri = golden(pf + std::string("route_idx"));  // int32 bits read as float
             bool same = !memcmp(gi.data(), ri.data(), K * 4);
@@ -165,7 +165,7 @@ int main(int argc, char** argv) {
             shared_expert_add({Wgu}, {Wd}, Ws, h, out, scr, D, SI);
             check((std::string(pf) + "routed+shared -> moe_out").c_str(), down(out, D), golden(pf + std::string("moe_out")), 1e-5f);
             if (L == 0) {
-                bench("router gemv 256x2048 + topk", 256.0 * D * 2, [&] { gemv_f16(Wr, h, logits, D, E); router_topk(logits, E, K, false, idx, w); });
+                bench("router gemv 256x2048 + topk", 256.0 * D * 2, [&] { gemv_f16(Wr, h, logits, D, E); router_topk(logits, E, K, true, idx, w); });
                 bench("experts x8 int4 gs64", (double)K * EXPERT_BYTES, [&] { experts_forward(slots, w, K, h, act, out); });
                 const double gu_b = K * (EXPERT_Q_BYTES * 2.0 / 3 + 2.0 * EI * (D / 64) * 4), dn_b = K * (EXPERT_Q_BYTES / 3.0 + D * (EI / 64) * 4.0);
                 bench("  gate_up only", gu_b, [&] { expert_gate_up_k<8><<<persistent_blocks(), 256>>>(slots, K, nullptr, h, act); });
@@ -290,6 +290,50 @@ int main(int argc, char** argv) {
             printf("  %-34s int8-vs-F16 rel %.3e (quantization drift)\n", nm.c_str(), e / mx);
             bench((nm + " int8").c_str(), (double)cs.O * cs.I + cs.O * 4.0, [&] { gemv({nullptr, q, s}, xd, y, cs.I, cs.O); }, cs.O > 100000 ? 20 : 50);
             for (void* p : {(void*)W, (void*)q, (void*)s, (void*)xd, (void*)y, (void*)yf}) CK(cudaFree(p));
+        }
+    }
+
+    if (want(filt, "K11")) {
+        printf("K11 gemv_q4 (int4 gs64 dense) vs exact int4 math; GEMM int4 path vs GEMV\n");
+        struct Case { const char* name; int O, I; } cases[] = {
+            {"model.layers.0.linear_attn.in_proj_qkv.weight", 8192, D}, {"model.layers.0.linear_attn.out_proj.weight", D, 4096},
+            {"model.layers.0.mlp.shared_expert.down_proj.weight", D, 512}, {"lm_head.weight", 248320, D}};
+        auto hh = golden(P + "L00_moe_in");
+        for (auto& cs : cases) {
+            half* W = wup(C, cs.name);
+            uint8_t* q; float* s;
+            CK(cudaMalloc(&q, (size_t)cs.O * cs.I / 2)); CK(cudaMalloc(&s, (size_t)cs.O * (cs.I / 64) * 4));
+            quantize_rows_q4_k<<<cs.O, 64>>>(W, q, s, cs.I);
+            std::vector<float> xin(cs.I); for (int i = 0; i < cs.I; i++) xin[i] = hh[i % D] * ((i / D) ? -1.f : 1.f);
+            float *xd = up(xin), *y = dalloc(cs.O);
+            Mat m; m.q4 = q; m.s = s;
+            gemv(m, xd, y, cs.I, cs.O);
+            int R = std::min(cs.O, 2048);
+            std::vector<uint8_t> hq((size_t)R * cs.I / 2); std::vector<float> hs((size_t)R * (cs.I / 64));
+            CK(cudaMemcpy(hq.data(), q, hq.size(), cudaMemcpyDeviceToHost)); CK(cudaMemcpy(hs.data(), s, hs.size() * 4, cudaMemcpyDeviceToHost));
+            std::vector<float> ref(R);
+            for (int r = 0; r < R; r++) {
+                double a = 0;
+                for (int i = 0; i < cs.I; i++) {
+                    int b = hq[((size_t)r * cs.I + i) / 2], v = (i & 1) ? b >> 4 : b & 0xF;
+                    a += (double)(v >= 8 ? v - 16 : v) * hs[(size_t)r * (cs.I / 64) + i / 64] * xin[i];
+                }
+                ref[r] = (float)a;
+            }
+            auto got = down(y, cs.O); got.resize(R);
+            std::string nm = std::string(cs.name).substr(std::string(cs.name).rfind('.', strlen(cs.name) - 8) + 1);
+            check((nm + " gemv_q4 vs exact").c_str(), got, ref, 1e-5f);
+            bench((nm + " int4").c_str(), (double)cs.O * cs.I / 2 + cs.O * (cs.I / 64) * 4.0, [&] { gemv(m, xd, y, cs.I, cs.O); }, cs.O > 100000 ? 20 : 50);
+            if (cs.O < 100000) {  // prefill GEMM on int4 weights vs the GEMV, 16 tokens
+                const int S = 16;
+                std::vector<float> hx((size_t)S * cs.I); for (int t = 0; t < S; t++) for (int i = 0; i < cs.I; i++) hx[(size_t)t * cs.I + i] = xin[i] * (1.f + 0.03f * t);
+                float *X = up(hx), *Y = dalloc((size_t)S * cs.O), *Yr = dalloc((size_t)S * cs.O);
+                gemm(m, X, Y, S, cs.I, cs.O);
+                for (int t = 0; t < S; t++) gemv(m, X + (size_t)t * cs.I, Yr + (size_t)t * cs.O, cs.I, cs.O);
+                check((nm + " gemm int4 vs gemv").c_str(), down(Y, (size_t)S * cs.O), down(Yr, (size_t)S * cs.O), 5e-3f);
+                for (void* p : {(void*)X, (void*)Y, (void*)Yr}) CK(cudaFree(p));
+            }
+            for (void* p : {(void*)W, (void*)q, (void*)s, (void*)xd, (void*)y}) CK(cudaFree(p));
         }
     }
 
