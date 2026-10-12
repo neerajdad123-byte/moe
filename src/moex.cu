@@ -53,6 +53,8 @@ struct Engine {
     Mat lm_head;
     half* norm;
     bool f16 = false;
+    bool pin_async = false;  // chat/serve: lock the experts in RAM on a background thread (fast startup)
+    std::thread pinner;
     half* qtmp = nullptr;  // F16 staging for quantization, freed after load
     const half* embed;  // mmapped, stays in RAM
     int ctx;
@@ -115,6 +117,7 @@ struct Engine {
 
     explicit Engine(const char* root, int ctx_) : C(root), ctx(ctx_) {}
     ~Engine() {
+        if (pinner.joinable()) pinner.join();
         if (loader.joinable()) { { std::lock_guard<std::mutex> g(mu); stop_loader = true; } loader.join(); }
     }
 
@@ -342,7 +345,8 @@ struct Engine {
             eq[l * E + e] = C.map(ep + "merged_weight");
             es[l * E + e] = (const float*)C.map(ep + "qs");
         }
-        pin_experts_in_ram();
+        if (pin_async) pinner = std::thread([this] { pin_experts_in_ram(); });  // until done, misses may page-fault
+        else pin_experts_in_ram();
         // every byte of VRAM left (minus headroom for the driver) becomes expert slots
         size_t fr, tot; CK(cudaMemGetInfo(&fr, &tot));
         const size_t reserve = 320ull << 20;
@@ -856,6 +860,7 @@ int main(int argc, char** argv) {
 
     Engine eng(model.c_str(), ctx);
     eng.f16 = f16; eng.q4groups = q4groups; eng.samp = samp;
+    eng.pin_async = mode == "chat" || mode == "serve";
     eng.load();
 
     if (mode == "serve") {
