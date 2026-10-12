@@ -192,6 +192,7 @@ inline void gemm(const Mat& m, const float* X, float* Y, int S, int I, int O, cu
 __global__ void router_topk_k(const float* __restrict__ logits, int E, int K, int norm,
                               int* __restrict__ idx, float* __restrict__ w) {
     __shared__ float sv[32]; __shared__ int si[32];
+    logits += (size_t)blockIdx.x * E; idx += blockIdx.x * K; w += blockIdx.x * K;  // token blockIdx.x of a chunk
     int e = threadIdx.x, lane = e & 31, wid = e >> 5, nw = blockDim.x >> 5;
     float l = logits[e];
     float m = l;  // block max
@@ -220,8 +221,9 @@ __global__ void router_topk_k(const float* __restrict__ logits, int E, int K, in
     if (norm && e < K) { __syncthreads(); w[e] /= total; }
 }
 
-inline void router_topk(const float* logits, int E, int K, bool norm, int* idx, float* w, cudaStream_t st = 0) {
-    router_topk_k<<<1, E, 0, st>>>(logits, E, K, norm, idx, w);
+// T tokens: logits [T][E] -> idx, w [T][K].
+inline void router_topk(const float* logits, int E, int K, bool norm, int* idx, float* w, cudaStream_t st = 0, int T = 1) {
+    router_topk_k<<<T, E, 0, st>>>(logits, E, K, norm, idx, w);
 }
 
 // ---- K4: routed experts, int4 gs64 symmetric ----
@@ -347,6 +349,88 @@ __global__ void table_k(const uint8_t** table, TableUpd u) {
     if ((int)threadIdx.x < u.n) table[u.key[threadIdx.x]] = u.ptr[threadIdx.x];
 }
 
+// ---- Prefill MoE: (token, expert) pairs grouped by expert, so each resident expert's weights are read once
+// for all of its tokens. Pair p = t*K + rank; the host builds the work list.
+struct PairItem { const uint8_t* slot; int start, count; };  // pairs[start, start+count) all use this expert
+struct Pair { int t, p; float w; };
+
+// act[p][row] = silu(gate . x_t) * (up . x_t) for every pair of item blockIdx.y. One warp per row; the row's
+// weights stay in registers while the warp walks the item's tokens.
+template <int WARPS>
+__global__ void pairs_gate_up_k(const PairItem* __restrict__ items, const Pair* __restrict__ pairs,
+                                const float* __restrict__ X, float* __restrict__ act) {
+    const PairItem it = items[blockIdx.y];
+    const int row = blockIdx.x * WARPS + (threadIdx.x >> 5), lane = threadIdx.x & 31;
+    const uint4* g = reinterpret_cast<const uint4*>(it.slot + (size_t)row * (EH / 2));
+    const uint4* u = reinterpret_cast<const uint4*>(it.slot + (size_t)(EI + row) * (EH / 2));
+    const float* sc = reinterpret_cast<const float*>(it.slot + EXPERT_Q_BYTES);
+    uint4 qg[2], qu[2]; float sg[2], su[2];
+    for (int i = 0; i < 2; i++) {  // EH/32 = 64 uint4 per row: two per lane
+        int c = lane + 32 * i;
+        qg[i] = __ldcs(g + c); qu[i] = __ldcs(u + c);
+        sg[i] = sc[row * (EH / EGS) + (c >> 1)]; su[i] = sc[EI * (EH / EGS) + row * (EH / EGS) + (c >> 1)];
+    }
+    for (int j = 0; j < it.count; j++) {
+        const Pair pr = pairs[it.start + j];
+        const float* x = X + (size_t)pr.t * EH;
+        float ag = 0.f, au = 0.f;
+        for (int i = 0; i < 2; i++) {
+            int c = lane + 32 * i;
+            ag += dot32_i4(qg[i], x + 32 * c) * sg[i];
+            au += dot32_i4(qu[i], x + 32 * c) * su[i];
+        }
+        ag = warp_sum(ag); au = warp_sum(au);
+        if (lane == 0) act[(size_t)pr.p * EI + row] = ag / (1.f + __expf(-ag)) * au;
+    }
+}
+
+// ypair[p][d] = w_p * (down . act_p). One warp per output row; the row (256 B) is one uint4 per lane of a
+// half-warp, and the two half-warps take alternate tokens.
+template <int WARPS>
+__global__ void pairs_down_k(const PairItem* __restrict__ items, const Pair* __restrict__ pairs,
+                             const float* __restrict__ act, float* __restrict__ ypair) {
+    const PairItem it = items[blockIdx.y];
+    const int d = blockIdx.x * WARPS + (threadIdx.x >> 5), lane = threadIdx.x & 31, half_ = lane >> 4, c = lane & 15;
+    const uint4 q = __ldcs(reinterpret_cast<const uint4*>(it.slot + (size_t)2 * EI * (EH / 2) + (size_t)d * (EI / 2)) + c);
+    const float s = reinterpret_cast<const float*>(it.slot + EXPERT_Q_BYTES)[2 * EI * (EH / EGS) + d * (EI / EGS) + (c >> 1)];
+    for (int j0 = 0; j0 < it.count; j0 += 2) {
+        int j = j0 + half_;
+        float v = 0.f;
+        Pair pr = pairs[it.start + (j < it.count ? j : j0)];
+        if (j < it.count) v = s * dot32_i4(q, act + (size_t)pr.p * EI + 32 * c);
+        for (int o = 8; o; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);  // sum within each half-warp
+        if (c == 0 && j < it.count) ypair[(size_t)pr.p * EH + d] = pr.w * v;
+    }
+}
+
+// moe[t][d] = sum over ranks of ypair[t*K + r][d] (GPU pairs; others are zero) + ycpu[t][d] (CPU pairs), in rank order.
+__global__ void pairs_reduce_k(const float* __restrict__ ypair, const float* __restrict__ ycpu, float* __restrict__ moe, int K, int D) {
+    int t = blockIdx.y, d = blockIdx.x * blockDim.x + threadIdx.x;
+    if (d >= D) return;
+    float acc = 0.f;
+    for (int r = 0; r < K; r++) acc += ypair[((size_t)t * K + r) * D + d];
+    moe[(size_t)t * D + d] = acc + ycpu[(size_t)t * D + d];
+}
+
+inline void pairs_forward(const PairItem* items, int n_items, const Pair* pairs, const float* X, float* act, float* ypair,
+                          cudaStream_t st = 0) {
+    constexpr int WARPS = 8;
+    if (!n_items) return;
+    pairs_gate_up_k<WARPS><<<dim3(EI / WARPS, n_items), WARPS * 32, 0, st>>>(items, pairs, X, act);
+    pairs_down_k<WARPS><<<dim3(EH / WARPS, n_items), WARPS * 32, 0, st>>>(items, pairs, act, ypair);
+}
+
+// rows: out[t][i] = silu(gu[t][i]) * gu[t][SI + i]  (fused [gate; up] GEMM output -> compact [T][SI])
+__global__ void silu_mul_rows_k(const float* __restrict__ gu, float* __restrict__ out, int SI) {
+    int t = blockIdx.y, i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < SI) { float g = gu[(size_t)t * 2 * SI + i]; out[(size_t)t * SI + i] = g / (1.f + __expf(-g)) * gu[(size_t)t * 2 * SI + SI + i]; }
+}
+// rows: out[t][d] += sigmoid(gl[t]) * sh[t][d]
+__global__ void gated_add_rows_k(float* __restrict__ out, const float* __restrict__ sh, const float* __restrict__ gl, int D) {
+    int t = blockIdx.y, d = blockIdx.x * blockDim.x + threadIdx.x;
+    if (d < D) out[(size_t)t * D + d] += sh[(size_t)t * D + d] / (1.f + __expf(-gl[t]));
+}
+
 // Hits of this layer's routing, decided on the GPU from the device slot table (null = not resident).
 // Writes the compacted slot pointers and weights, and their count. One warp.
 __global__ void route_hits_k(const int* __restrict__ idx, const float* __restrict__ w, int K, int key_base,
@@ -398,9 +482,11 @@ constexpr int AHD = 256;
 __global__ void qk_norm_rope_k(const float* __restrict__ q, const float* __restrict__ k, const float* __restrict__ v,
                                const half* __restrict__ qn, const half* __restrict__ kn,
                                float* __restrict__ qo, float* __restrict__ Kc, float* __restrict__ Vc,
-                               int H, int KV, const int* __restrict__ pos_d, int max_t, int rot, float theta, float eps) {
+                               int H, int KV, const int* __restrict__ pos_d, int max_t, int rot, float theta, float eps, int ld) {
     __shared__ float t[AHD];
-    const int pos = *pos_d;  // device-side so a captured CUDA graph sees each token's position
+    // token blockIdx.y of a chunk is at *pos_d + y (device-side so a captured CUDA graph sees each token's position)
+    const int tok = blockIdx.y, pos = *pos_d + tok;
+    q += (size_t)tok * ld; k += (size_t)tok * ld; v += (size_t)tok * ld; qo += (size_t)tok * H * AHD;
     int hh = blockIdx.x, d = threadIdx.x;  // blocks [0,H) query heads, [H,H+KV) key heads
     bool isq = hh < H;
     float x = isq ? q[hh * 2 * AHD + d] : k[(hh - H) * AHD + d];
@@ -428,9 +514,10 @@ __global__ void qk_norm_rope_k(const float* __restrict__ q, const float* __restr
 // shortcut: whole score row in shared memory (T <= ~24k with opt-in smem); split-K when contexts grow.
 __global__ void attn_decode_k(const float* __restrict__ qo, const float* __restrict__ q_gate,
                               const float* __restrict__ Kc, const float* __restrict__ Vc,
-                              float* __restrict__ out, int H, int KV, const int* __restrict__ pos_d, int max_t) {
+                              float* __restrict__ out, int H, int KV, const int* __restrict__ pos_d, int max_t, int ld) {
     extern __shared__ float sc[];  // [max_t]
-    const int T = *pos_d + 1;
+    const int tok = blockIdx.y, T = *pos_d + tok + 1;  // causal: token tok sees positions up to its own
+    qo += (size_t)tok * H * AHD; q_gate += (size_t)tok * ld; out += (size_t)tok * H * AHD;
     __shared__ __align__(16) float qs[AHD];
     int h = blockIdx.x, kvh = h / (H / KV), tid = threadIdx.x, lane = tid & 31, wid = tid >> 5;
     qs[tid] = qo[h * AHD + tid];
@@ -462,13 +549,15 @@ __global__ void attn_decode_k(const float* __restrict__ qo, const float* __restr
     out[h * AHD + tid] = acc * inv / (1.f + __expf(-g));
 }
 
-// pos_d: device int, the position being decoded. Shared memory is sized for max_t (fixed per launch
+// pos_d: device int, the position of the first token. Shared memory is sized for max_t (fixed per launch
 // shape, so the same launch can be replayed from a graph at any position).
+// T tokens (a prefill chunk): q/k/v rows have stride ld; all K/V are appended before any token attends.
+// shortcut: one block per (head, token) re-reads K/V per token; a flash-style tile for long prompts.
 inline void attn_decode(const float* q, const float* k, const float* v, const half* qn, const half* kn,
                         float* qo, float* Kc, float* Vc, float* out, int H, int KV, const int* pos_d, int max_t,
-                        int rot, float theta, float eps, cudaStream_t st = 0) {
-    qk_norm_rope_k<<<H + KV, AHD, 0, st>>>(q, k, v, qn, kn, qo, Kc, Vc, H, KV, pos_d, max_t, rot, theta, eps);
-    attn_decode_k<<<H, AHD, max_t * sizeof(float), st>>>(qo, q, Kc, Vc, out, H, KV, pos_d, max_t);
+                        int rot, float theta, float eps, int T, int ld, cudaStream_t st = 0) {
+    qk_norm_rope_k<<<dim3(H + KV, T), AHD, 0, st>>>(q, k, v, qn, kn, qo, Kc, Vc, H, KV, pos_d, max_t, rot, theta, eps, ld);
+    attn_decode_k<<<dim3(H, T), AHD, max_t * sizeof(float), st>>>(qo, q, Kc, Vc, out, H, KV, pos_d, max_t, ld);
 }
 
 __global__ void set_int_k(int* p, int v) { *p = v; }

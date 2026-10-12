@@ -118,4 +118,46 @@ struct CpuExperts {
         };
         pool.parallel_for(H / DB, dn);
     }
+
+    // Prefill: many (token, expert) pairs grouped by expert, so each expert's weights are read once for all
+    // of its tokens. X: [T][H] rows; pair outputs ypair[pid][H] = w * expert(x_t). All threads share one
+    // parallel_for over (expert, row block) items.
+    struct Job { const uint8_t* q; const float* sc; std::vector<int> toks, pids; std::vector<float> ws; };
+    std::vector<float> pxe, pxo, pact, pae, pao;
+    void run_pairs(const std::vector<Job>& jobs, const float* X, int T, int npairs, float* ypair) {
+        if (jobs.empty()) return;
+        pxe.resize((size_t)T * H / 2); pxo.resize((size_t)T * H / 2);
+        for (int t = 0; t < T; t++) deinterleave(X + (size_t)t * H, pxe.data() + (size_t)t * H / 2, pxo.data() + (size_t)t * H / 2, H);
+        pact.resize((size_t)npairs * I); pae.resize((size_t)npairs * I / 2); pao.resize((size_t)npairs * I / 2);
+        constexpr int RB = 32, DB = 64;
+        const int nj = (int)jobs.size();
+        std::function<void(int)> gu = [&](int it) {
+            const Job& jb = jobs[it / (I / RB)];
+            int r0 = (it % (I / RB)) * RB;
+            for (int r = r0; r < r0 + RB; r++)
+                for (size_t k = 0; k < jb.toks.size(); k++) {
+                    const float *xe = pxe.data() + (size_t)jb.toks[k] * H / 2, *xo = pxo.data() + (size_t)jb.toks[k] * H / 2;
+                    float g = row_dot(jb.q + (size_t)r * (H / 2), jb.sc + r * (H / GS), xe, xo, H);
+                    float u = row_dot(jb.q + (size_t)(I + r) * (H / 2), jb.sc + I * (H / GS) + r * (H / GS), xe, xo, H);
+                    pact[(size_t)jb.pids[k] * I + r] = g / (1.f + expf(-g)) * u;
+                }
+        };
+        pool.parallel_for(nj * (I / RB), gu);
+        std::function<void(int)> di = [&](int j) {
+            for (int p : jobs[j].pids) deinterleave(pact.data() + (size_t)p * I, pae.data() + (size_t)p * I / 2, pao.data() + (size_t)p * I / 2, I);
+        };
+        pool.parallel_for(nj, di);
+        std::function<void(int)> dn = [&](int it) {
+            const Job& jb = jobs[it / (H / DB)];
+            int d0 = (it % (H / DB)) * DB;
+            for (int d = d0; d < d0 + DB; d++)
+                for (size_t k = 0; k < jb.toks.size(); k++) {
+                    int p = jb.pids[k];
+                    ypair[(size_t)p * H + d] = jb.ws[k] * row_dot(jb.q + (size_t)2 * I * (H / 2) + (size_t)d * (I / 2),
+                                                                  jb.sc + 2 * I * (H / GS) + d * (I / GS),
+                                                                  pae.data() + (size_t)p * I / 2, pao.data() + (size_t)p * I / 2, I);
+                }
+        };
+        pool.parallel_for(nj * (H / DB), dn);
+    }
 };

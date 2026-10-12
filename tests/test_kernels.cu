@@ -357,6 +357,98 @@ int main(int argc, char** argv) {
             deltanet_core(rows, rows + C8, rows + C8 + VH * DNV, rows + C8 + VH * DNV + VH, LDR, cw, Al, dtb, nw, ring, S, conv, o, C8, 4, VH, KH, EPS, T); });
     }
 
+    if (want(filt, "MEMCPY")) {
+        printf("MEMCPY: staging copy speed, mmapped experts -> pinned host buffer\n");
+        const int NB = 24;
+        uint8_t* pin; CK(cudaMallocHost(&pin, (size_t)NB * EXPERT_BYTES));
+        std::vector<const uint8_t*> q(256 * 4), sc(256 * 4);
+        for (int l = 4; l < 8; l++) for (int e = 0; e < 256; e++) {
+            std::string ep = "model.layers." + std::to_string(l) + ".mlp.experts." + std::to_string(e) + ".";
+            q[(l - 4) * 256 + e] = C.map(ep + "merged_weight"); sc[(l - 4) * 256 + e] = C.map(ep + "qs");
+        }
+        for (int pass = 0; pass < 2; pass++)
+            for (int th : {1, 2, 4, 8}) {
+                CpuPool pool(th);
+                auto t0 = std::chrono::steady_clock::now();
+                for (int b = 0; b < 1024 / NB; b++) {
+                    std::function<void(int)> f = [&](int i) {
+                        int k = b * NB + i;
+                        memcpy(pin + (size_t)i * EXPERT_BYTES, q[k], EXPERT_Q_BYTES);
+                        memcpy(pin + (size_t)i * EXPERT_BYTES + EXPERT_Q_BYTES, sc[k], EXPERT_BYTES - EXPERT_Q_BYTES);
+                    };
+                    pool.parallel_for(NB, f);
+                }
+                double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+                printf("  pass %d, %d thread(s): %.2f GB/s\n", pass, th, (1024 / NB) * NB * EXPERT_BYTES / s / 1e9);
+            }
+        // the alternatives in the engine's situation: with a spinning 8-thread pool alongside, and the driver's
+        // own pageable copy (no staging buffer of ours)
+        {
+            CpuPool spin(8), pool(4);
+            auto t0 = std::chrono::steady_clock::now();
+            for (int b = 0; b < 1024 / NB; b++) {
+                std::function<void(int)> f = [&](int i) {
+                    int k = b * NB + i;
+                    memcpy(pin + (size_t)i * EXPERT_BYTES, q[k], EXPERT_Q_BYTES);
+                    memcpy(pin + (size_t)i * EXPERT_BYTES + EXPERT_Q_BYTES, sc[k], EXPERT_BYTES - EXPERT_Q_BYTES);
+                };
+                pool.parallel_for(NB, f);
+            }
+            double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+            printf("  4 copy threads next to an idle-spinning 8-thread pool: %.2f GB/s\n", (1024 / NB) * NB * EXPERT_BYTES / s / 1e9);
+        }
+        uint8_t* dst; CK(cudaMalloc(&dst, (size_t)NB * EXPERT_BYTES));
+        for (int pass = 0; pass < 2; pass++) {
+            auto t0 = std::chrono::steady_clock::now();
+            for (int k = 0; k < 1024; k++) {
+                uint8_t* d = dst + (size_t)(k % NB) * EXPERT_BYTES;
+                CK(cudaMemcpy(d, q[k], EXPERT_Q_BYTES, cudaMemcpyHostToDevice));
+                CK(cudaMemcpy(d + EXPERT_Q_BYTES, sc[k], EXPERT_BYTES - EXPERT_Q_BYTES, cudaMemcpyHostToDevice));
+            }
+            double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+            printf("  driver pageable copy map -> VRAM, 1 thread: %.2f GB/s\n", 1024 * EXPERT_BYTES / s / 1e9);
+        }
+        CK(cudaFree(dst));
+        CK(cudaFreeHost(pin));
+    }
+
+    if (want(filt, "REG")) {
+        printf("REG: can mmapped expert pages be registered for direct DMA (no staging copy)?\n");
+        const uint8_t* lo = C.map("model.layers.1.mlp.experts.0.merged_weight");
+        const uint8_t* hi = lo;
+        for (int e = 0; e < 256; e++) {
+            std::string ep = "model.layers.1.mlp.experts." + std::to_string(e) + ".";
+            const uint8_t *q = C.map(ep + "merged_weight"), *s = C.map(ep + "qs");
+            lo = std::min({lo, q, s}); hi = std::max({hi, q + EXPERT_Q_BYTES, s + (EXPERT_BYTES - EXPERT_Q_BYTES)});
+        }
+        uintptr_t a = (uintptr_t)lo & ~(uintptr_t)4095, b = ((uintptr_t)hi + 4095) & ~(uintptr_t)4095;
+        size_t len = b - a;
+        for (size_t o = 0; o < len; o += 4096) { volatile uint8_t x = ((const uint8_t*)a)[o]; (void)x; }  // fault in
+        cudaError_t e = cudaHostRegister((void*)a, len, cudaHostRegisterReadOnly);
+        printf("  cudaHostRegister(%.0f MB, ReadOnly): %s\n", len / 1e6, cudaGetErrorString(e));
+        if (e != cudaSuccess) { cudaGetLastError(); e = cudaHostRegister((void*)a, len, cudaHostRegisterDefault); printf("  default flags: %s\n", cudaGetErrorString(e)); cudaGetLastError(); }
+        uint8_t* dst; CK(cudaMalloc(&dst, 64 * EXPERT_Q_BYTES));
+        auto timed = [&](const uint8_t* src, size_t stride) {
+            auto t0 = std::chrono::steady_clock::now();
+            for (int i = 0; i < 64; i++) CK(cudaMemcpyAsync(dst + i * EXPERT_Q_BYTES, src + i * stride, EXPERT_Q_BYTES, cudaMemcpyHostToDevice));
+            CK(cudaDeviceSynchronize());
+            return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        };
+        for (int pass = 0; pass < 3; pass++) {
+            double ms = timed(lo, EXPERT_Q_BYTES);
+            printf("  pass %d: 64 expert copies straight from the map: %.1f ms = %.1f GB/s (%s)\n", pass, ms, 64 * EXPERT_Q_BYTES / ms / 1e6,
+                   e == cudaSuccess ? "registered" : "pageable");
+        }
+        uint8_t* pin; CK(cudaMallocHost(&pin, 64 * EXPERT_Q_BYTES)); memset(pin, 1, 64 * EXPERT_Q_BYTES);
+        for (int pass = 0; pass < 2; pass++) {
+            double ms = timed(pin, EXPERT_Q_BYTES);
+            printf("  reference: same copies from cudaMallocHost memory: %.1f ms = %.1f GB/s\n", ms, 64 * EXPERT_Q_BYTES / ms / 1e6);
+        }
+        CK(cudaFreeHost(pin));
+        if (e == cudaSuccess) cudaHostUnregister((void*)a);
+        CK(cudaFree(dst));
+    }
+
     if (want(filt, "SWEEP")) {
         printf("gemv_i8 launch-config sweep on the engine's (fused) shapes; random weights\n");
         struct Sh { const char* n; int O, I; } shapes[] = {
@@ -405,7 +497,7 @@ int main(int argc, char** argv) {
         auto step = [&](int p) {
             set_int_k<<<1, 1>>>(pos_d, p);
             gemv_f16(Wq, h, q, D, H * 2 * AHD); gemv_f16(Wk, h, k, D, KV * AHD); gemv_f16(Wv, h, v, D, KV * AHD);
-            attn_decode(q, k, v, qn, kn, qo, Kc, Vc, ag, H, KV, pos_d, MAXT, ROT, 1e7f, EPS);
+            attn_decode(q, k, v, qn, kn, qo, Kc, Vc, ag, H, KV, pos_d, MAXT, ROT, 1e7f, EPS, 1, 0);
             gemv_f16(Wo, ag, o, H * AHD, D);
         };
         double worst_q = 0, worst_o = 0;
@@ -428,7 +520,7 @@ int main(int argc, char** argv) {
         bench("attn layer (proj+core) T=12", (8192.0 + 512 + 512) * D * 2 + 2048.0 * 4096 * 2, [&] { step(NPOS - 1); });
         set_int_k<<<1, 1>>>(pos_d, MAXT - 1);
         bench("attn core T=4096", 2.0 * KV * 4096 * AHD * 4, [&] {
-            attn_decode_k<<<H, AHD, MAXT * 4>>>(qo, q, Kc, Vc, ag, H, KV, pos_d, MAXT); });
+            attn_decode_k<<<H, AHD, MAXT * 4>>>(qo, q, Kc, Vc, ag, H, KV, pos_d, MAXT, 0); });
     }
 
     if (want(filt, "K8")) {

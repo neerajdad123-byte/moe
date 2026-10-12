@@ -19,6 +19,9 @@
 #include "st.h"
 #include "kernels.cuh"
 #include "cpu_expert.h"
+#include <psapi.h>
+#pragma comment(lib, "psapi.lib")
+static unsigned long page_faults() { PROCESS_MEMORY_COUNTERS c{}; GetProcessMemoryInfo(GetCurrentProcess(), &c, sizeof c); return c.PageFaultCount; }
 
 static double now() { return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
 
@@ -165,6 +168,11 @@ struct Engine {
         for (int i = 0; i < 4; i++) ths.emplace_back(work);
         for (auto& t : ths) t.join();
         static volatile uint64_t sink; sink = sum;
+        // keep them there: the minimum working set is only a hint, and prefill (which touches every expert)
+        // measured 156k soft faults per 512 tokens without locks
+        size_t locked = 0;
+        for (auto& x : r) if (VirtualLock(x.VirtualAddress, x.NumberOfBytes)) locked += x.NumberOfBytes;
+        fprintf(stderr, "[ram] %.1f GB of experts locked in the working set\n", locked / 1e9);
         fprintf(stderr, "[ram] %.1f GB of experts faulted in, %.1f s; min working set %.1f GB%s\n", total / 1e9, now() - t0,
                 got / 1e9, got >= total ? "" : " (below the expert total: some CPU misses will page-fault)");
     }
@@ -303,6 +311,14 @@ struct Engine {
         CK(cudaMalloc(&slots_d, TOPK * sizeof(void*)));
         if (ctx * 4 > 48 * 1024)
             CK(cudaFuncSetAttribute(attn_decode_k, cudaFuncAttributeMaxDynamicSharedMemorySize, ctx * 4));
+        alloc_prefill();
+        eq.resize(NL * E); es.resize(NL * E);
+        for (int l = 0; l < NL; l++) for (int e = 0; e < E; e++) {
+            std::string ep = "model.layers." + std::to_string(l) + ".mlp.experts." + std::to_string(e) + ".";
+            eq[l * E + e] = C.map(ep + "merged_weight");
+            es[l * E + e] = (const float*)C.map(ep + "qs");
+        }
+        pin_experts_in_ram();
         // every byte of VRAM left (minus headroom for the driver) becomes expert slots
         size_t fr, tot; CK(cudaMemGetInfo(&fr, &tot));
         const size_t reserve = 320ull << 20;
@@ -311,12 +327,6 @@ struct Engine {
         CK(cudaMalloc(&arena, (size_t)nslots * EXPERT_BYTES));
         slot_of.assign(NL * E, -1); owner.assign(nslots, -1); last.assign(nslots, 0);
         ready.assign(nslots, 0); inflight.assign(nslots, 0);
-        eq.resize(NL * E); es.resize(NL * E);
-        for (int l = 0; l < NL; l++) for (int e = 0; e < E; e++) {
-            std::string ep = "model.layers." + std::to_string(l) + ".mlp.experts." + std::to_string(e) + ".";
-            eq[l * E + e] = C.map(ep + "merged_weight");
-            es[l * E + e] = (const float*)C.map(ep + "qs");
-        }
         auto mapped = [](auto** hp, auto** dp, size_t bytes) {
             CK(cudaHostAlloc((void**)hp, bytes, cudaHostAllocMapped));
             CK(cudaHostGetDevicePointer((void**)dp, *hp, 0));
@@ -333,7 +343,6 @@ struct Engine {
             free_st.push_back(i);
         }
         loader = std::thread([this] { loader_main(); });
-        pin_experts_in_ram();
         capture_graphs();
         fprintf(stderr, "[load] %.1f s, dense %s, %d expert slots (%.2f GB, %.1f%% of %d experts), ctx %d\n",
                 now() - t0, f16 ? "F16" : "int8", nslots, nslots * (double)EXPERT_BYTES / 1e9, 100.0 * nslots / (NL * E), NL * E, ctx);
@@ -357,7 +366,7 @@ struct Engine {
         rmsnorm(x, l ? moe : nullptr, w.in_ln, h, D, EPS, 1, cs);  // folds in the previous layer's MoE output
         if (is_attn(l)) {
             gemv(w.attn_qkv, h, q, D, AH * 2 * AHD + 2 * AKV * AHD, cs);  // -> q, k, v
-            attn_decode(q, k, v, w.qn, w.kn, qo, w.K, w.V, ag, AH, AKV, pos_d, ctx, ROT, THETA, EPS, cs);
+            attn_decode(q, k, v, w.qn, w.kn, qo, w.K, w.V, ag, AH, AKV, pos_d, ctx, ROT, THETA, EPS, 1, 0, cs);
             gemv(w.o, ag, tmp, AH * AHD, D, cs);
         } else {
             gemv(w.dn_in, h, big, D, DC + DVH * DNV + 2 * DVH, cs);  // -> qkv, z, a, b
@@ -389,6 +398,194 @@ struct Engine {
     }
 
     // One token at position `pos`. If want_logits, logits[] is filled and the greedy id returned.
+    // ---- prefill: the prompt in chunks of CH tokens; every weight is read once per chunk ----
+    static constexpr int CH = 256;
+    float *Xc, *hc, *tmpc, *moec, *qkvc, *bigc, *convc, *oc, *qoc, *agc, *lgc, *rwc, *actp, *ypair, *shgu, *sha, *shs, *shl;
+    int* ridxc;
+    float *rows_h, *rows_d, *rwc_h, *rwc_d, *ycpu_h, *ycpu_d;  // mapped host memory (zero-copy)
+    int *ridxc_h, *ridxc_d;
+    PairItem *items_h, *items_d;
+    Pair *pairs_h, *pairs_d;
+    std::vector<float> ypair_cpu;
+    std::vector<std::vector<Pair>> per = std::vector<std::vector<Pair>>(E);
+    long long streamed_n = 0;
+    // Prefill streams non-resident experts to a VRAM staging area: worker threads copy them from the file map into
+    // a pinned host ring, and each batch goes over PCIe as one DMA, double-buffered. (Page-locking the map itself
+    // for direct DMA was measured: 12.2 GB/s, but on WDDM it comes out of the GPU's shared-memory budget, and
+    // locking/unlocking layers evicted the pages from the working set: decode CPU misses went 3 -> 79 ms/token.)
+    static constexpr int SB = 24;   // experts per staging batch; 2 * SB staging slots
+    static constexpr int STREAM_MIN = 2;  // an expert used by one token is cheaper on the CPU than over PCIe
+    uint8_t* stage_p = nullptr;   // VRAM, 2 * SB slots
+    uint8_t* hstage = nullptr;    // pinned host, 2 * SB slots
+    CpuPool cpool{4};             // staging copies, concurrent with the CPU experts on cpu.pool
+    cudaEvent_t ev_hfree[2];
+    cudaStream_t cpp;
+    cudaEvent_t ev_copied[2], ev_free[2];
+    template <class T> static void mapped_alloc(T** hp, T** dp, size_t n) {
+        CK(cudaHostAlloc((void**)hp, n * sizeof(T), cudaHostAllocMapped));
+        CK(cudaHostGetDevicePointer((void**)dp, *hp, 0));
+    }
+    void alloc_prefill() {
+        const int LQ = AH * 2 * AHD + 2 * AKV * AHD, LB = DC + DVH * DNV + 2 * DVH;
+        Xc = falloc((size_t)CH * D); hc = falloc((size_t)CH * D); tmpc = falloc((size_t)CH * D); moec = falloc((size_t)CH * D);
+        qkvc = falloc((size_t)CH * LQ); bigc = falloc((size_t)CH * LB); convc = falloc((size_t)CH * DC); oc = falloc((size_t)CH * DVH * DNV);
+        qoc = falloc((size_t)CH * AH * AHD); agc = falloc((size_t)CH * AH * AHD); lgc = falloc((size_t)CH * E); rwc = falloc((size_t)CH * TOPK);
+        actp = falloc((size_t)CH * TOPK * EI); ypair = falloc((size_t)CH * TOPK * D);
+        shgu = falloc((size_t)CH * 2 * SI); sha = falloc((size_t)CH * SI); shs = falloc((size_t)CH * D); shl = falloc(CH);
+        CK(cudaMalloc(&ridxc, CH * TOPK * 4));
+        mapped_alloc(&rows_h, &rows_d, (size_t)CH * D); mapped_alloc(&rwc_h, &rwc_d, (size_t)CH * TOPK);
+        mapped_alloc(&ycpu_h, &ycpu_d, (size_t)CH * D); mapped_alloc(&ridxc_h, &ridxc_d, (size_t)CH * TOPK);
+        mapped_alloc(&items_h, &items_d, (size_t)E); mapped_alloc(&pairs_h, &pairs_d, (size_t)CH * TOPK);
+        ypair_cpu.resize((size_t)CH * TOPK * D);
+        CK(cudaMalloc(&stage_p, (size_t)2 * SB * EXPERT_BYTES));
+        CK(cudaMallocHost(&hstage, (size_t)2 * SB * EXPERT_BYTES));
+        CK(cudaStreamCreateWithFlags(&cpp, cudaStreamNonBlocking));
+        for (int i = 0; i < 2; i++) {
+            CK(cudaEventCreateWithFlags(&ev_copied[i], cudaEventDisableTiming));
+            CK(cudaEventCreateWithFlags(&ev_free[i], cudaEventDisableTiming));
+            CK(cudaEventRecord(ev_free[i], cs));
+            CK(cudaEventCreateWithFlags(&ev_hfree[i], cudaEventDisableTiming));
+            CK(cudaEventRecord(ev_hfree[i], cpp));
+        }
+    }
+
+    // Runs prompt tokens ids[0..n) at positions pos0.. and returns the greedy next token (logits[] filled).
+    // Same math as step() except dense projections (fp16 activations on tensor cores) and summation order.
+    int prefill(const int* ids, int n, int pos0) {
+        const int LQ = AH * 2 * AHD + 2 * AKV * AHD, LB = DC + DVH * DNV + 2 * DVH;
+        int next = -1;
+        double pt0 = now(), pt[5] = {};
+        unsigned long pf0 = page_faults();
+        long long sn0 = streamed_n;
+        for (int c0 = 0; c0 < n; c0 += CH) {
+            const int T = std::min(CH, n - c0);
+            tokens += T;
+            for (int t = 0; t < T; t++)
+                for (int i = 0; i < D; i++) rows_h[(size_t)t * D + i] = __half2float(embed[(size_t)ids[c0 + t] * D + i]);
+            copy_k<<<(T * D + 255) / 256, 256, 0, cs>>>(Xc, rows_d, T * D);
+            set_int_k<<<1, 1, 0, cs>>>(pos_d, pos0 + c0);
+            for (int l = 0; l < NL; l++) {
+                LayerW& w = L[l];
+                rmsnorm(Xc, l ? moec : nullptr, w.in_ln, hc, D, EPS, T, cs);
+                if (is_attn(l)) {
+                    gemm(w.attn_qkv, hc, qkvc, T, D, LQ, cs);
+                    attn_decode(qkvc, qkvc + AH * 2 * AHD, qkvc + AH * 2 * AHD + AKV * AHD, w.qn, w.kn, qoc, w.K, w.V, agc,
+                                AH, AKV, pos_d, ctx, ROT, THETA, EPS, T, LQ, cs);
+                    gemm(w.o, agc, tmpc, T, AH * AHD, D, cs);
+                } else {
+                    gemm(w.dn_in, hc, bigc, T, D, LB, cs);
+                    deltanet_core(bigc, bigc + DC, bigc + DC + DVH * DNV, bigc + DC + DVH * DNV + DVH, LB, w.conv, w.alog, w.dtb, w.nw,
+                                  w.ring, w.S, convc, oc, DC, CONVK, DVH, DKH, EPS, T, cs);
+                    gemm(w.out, oc, tmpc, T, DVH * DNV, D, cs);
+                }
+                rmsnorm(Xc, tmpc, w.post_ln, hc, D, EPS, T, cs);
+                for (int t = 0; t < T; t++) gemv_f16(w.router, hc + (size_t)t * D, lgc + (size_t)t * E, D, E, cs);  // fp32 routing, as decode
+                router_topk(lgc, E, TOPK, false, ridxc, rwc, cs, T);
+                export_route_k<<<(T * D + 255) / 256, 256, 0, cs>>>(hc, ridxc, rwc, rows_d, ridxc_d, rwc_d, T * D, T * TOPK);
+                double w0 = now();
+                CK(cudaStreamSynchronize(cs));
+                pt[0] += now() - w0;
+                // group the chunk's (token, expert) pairs by expert: resident -> GPU, non-resident with
+                // >= STREAM_MIN tokens -> streamed to the GPU, the rest -> CPU
+                for (auto& v : per) v.clear();
+                for (int t = 0; t < T; t++)
+                    for (int r = 0; r < TOPK; r++) {
+                        int e = ridxc_h[t * TOPK + r];
+                        per[e].push_back({t, t * TOPK + r, rwc_h[t * TOPK + r]});
+                        touch(l * E + e);
+                    }
+                int nitems = 0, npairs = 0, job_of[E];
+                std::fill(job_of, job_of + E, -1);
+                std::vector<CpuExperts::Job> jobs;
+                std::vector<int> streamed;
+                auto add_item = [&](int e, const uint8_t* slot) {
+                    items_h[nitems] = {slot, npairs, (int)per[e].size()};
+                    for (auto& pr : per[e]) pairs_h[npairs++] = pr;
+                    nitems++;
+                };
+                for (int e = 0; e < E; e++) {
+                    if (per[e].empty()) continue;
+                    int key = l * E + e, sl = slot_of[key];
+                    if (sl >= 0 && ready[sl]) { add_item(e, arena + (size_t)sl * EXPERT_BYTES); hits += per[e].size(); continue; }
+                    misses += per[e].size();
+                    if ((int)per[e].size() >= STREAM_MIN) { streamed.push_back(e); continue; }
+                    job_of[e] = (int)jobs.size();
+                    jobs.push_back({eq[key], es[key], {}, {}, {}});
+                    for (auto& pr : per[e]) { jobs.back().toks.push_back(pr.t); jobs.back().pids.push_back(pr.p); jobs.back().ws.push_back(pr.w); }
+                }
+                // GPU: resident experts and the shared expert first (all async)
+                CK(cudaMemsetAsync(ypair, 0, (size_t)T * TOPK * D * 4, cs));
+                const int nres = nitems;
+                pairs_forward(items_d, nres, pairs_d, hc, actp, ypair, cs);
+                gemm(w.sh_gu, hc, shgu, T, D, 2 * SI, cs);
+                silu_mul_rows_k<<<dim3((SI + 255) / 256, T), 256, 0, cs>>>(shgu, sha, SI);
+                gemm(w.sh_d, sha, shs, T, SI, D, cs);
+                for (int t = 0; t < T; t++) gemv_f16(w.sh_gate, hc + (size_t)t * D, shl + t, D, 1, cs);
+                // streamed experts: items point at their staging slot (batch bi uses half bi&1)
+                for (int k = 0; k < (int)streamed.size(); k++)
+                    add_item(streamed[k], stage_p + ((size_t)((k / SB) & 1) * SB + k % SB) * EXPERT_BYTES);
+                // a copier thread stages + transfers + launches the streamed batches (it alone enqueues on cs
+                // until joined) while this thread computes the CPU experts
+                std::thread copier([&] {
+                    for (int b0 = 0, bi = 0; b0 < (int)streamed.size(); b0 += SB, bi++) {
+                        const int half_ = bi & 1, nb = std::min(SB, (int)streamed.size() - b0);
+                        uint8_t* base = stage_p + (size_t)half_ * SB * EXPERT_BYTES;
+                        uint8_t* hbase = hstage + (size_t)half_ * SB * EXPERT_BYTES;
+                        double q0 = now();
+                        CK(cudaEventSynchronize(ev_hfree[half_]));  // the DMA out of this host half is done
+                        double q1 = now();
+                        std::function<void(int)> cp = [&](int i) {
+                            int key = l * E + streamed[b0 + i];
+                            memcpy(hbase + (size_t)i * EXPERT_BYTES, eq[key], EXPERT_Q_BYTES);
+                            memcpy(hbase + (size_t)i * EXPERT_BYTES + EXPERT_Q_BYTES, es[key], EXPERT_BYTES - EXPERT_Q_BYTES);
+                        };
+                        cpool.parallel_for(nb, cp);
+                        pt[3] += q1 - q0; pt[4] += now() - q1;
+                        CK(cudaStreamWaitEvent(cpp, ev_free[half_]));  // the previous batch in this VRAM half is computed
+                        CK(cudaMemcpyAsync(base, hbase, (size_t)nb * EXPERT_BYTES, cudaMemcpyHostToDevice, cpp));
+                        CK(cudaEventRecord(ev_hfree[half_], cpp));
+                        CK(cudaEventRecord(ev_copied[half_], cpp));
+                        CK(cudaStreamWaitEvent(cs, ev_copied[half_]));
+                        pairs_forward(items_d + nres + b0, nb, pairs_d, hc, actp, ypair, cs);
+                        CK(cudaEventRecord(ev_free[half_], cs));
+                    }
+                });
+                streamed_n += streamed.size();
+                // CPU: non-resident experts, each read once for all of its tokens, overlapped with the above
+                double c1 = now();
+                cpu.run_pairs(jobs, rows_h, T, T * TOPK, ypair_cpu.data());
+                for (int t = 0; t < T; t++) {
+                    float* y = ycpu_h + (size_t)t * D;
+                    std::fill(y, y + D, 0.f);
+                    for (int r = 0; r < TOPK; r++) {
+                        int e = ridxc_h[t * TOPK + r];
+                        if (job_of[e] < 0) continue;
+                        const float* yp = ypair_cpu.data() + (size_t)(t * TOPK + r) * D;
+                        for (int d = 0; d < D; d++) y[d] += yp[d];
+                    }
+                }
+                cpu_s += now() - c1;
+                pt[2] += now() - c1;
+                double j0 = now();
+                copier.join();
+                pt[1] += now() - j0;  // time the main thread waited on the streaming
+                pairs_reduce_k<<<dim3((D + 255) / 256, T), 256, 0, cs>>>(ypair, ycpu_d, moec, TOPK, D);
+                gated_add_rows_k<<<dim3((D + 255) / 256, T), 256, 0, cs>>>(moec, shs, shl, D);
+            }
+            if (c0 + T == n) {  // the last prompt token: its logits pick the first generated token
+                rmsnorm(Xc + (size_t)(T - 1) * D, moec + (size_t)(T - 1) * D, norm, h, D, EPS, 1, cs);
+                gemv(lm_head, h, logits, D, V, cs);
+                argmax(logits, V, amv, ams, ids_hd, cs);
+                CK(cudaStreamSynchronize(cs));
+                next = ids_h[0];
+            }
+        }
+        fprintf(stderr, "[prefill] %d tok in %.2f s = %.1f tok/s | host: gpu-wait %.2f  streaming-wait %.2f  cpu-experts %.2f s | streamed %lld experts"
+                " | copier: wait-dma %.2f  memcpy %.2f s | page faults %lu\n",
+                n, now() - pt0, n / (now() - pt0), pt[0], pt[1], pt[2], streamed_n - sn0, pt[3], pt[4], page_faults() - pf0);
+        return next;
+    }
+
     int step(int tok, int pos, bool want_logits) {
         tokens++;
         double t = now();
@@ -464,7 +661,7 @@ int main(int argc, char** argv) {
     std::vector<int> ids, stop;
     int n = 32, ctx = 2048;
     std::string check, batch, trace_path;
-    bool prof = false, f16 = false;
+    bool prof = false, f16 = false, use_prefill = true;
     for (int i = 1; i < argc; i++) {
         std::string s = argv[i];
         auto next = [&] { if (i + 1 >= argc) { fprintf(stderr, "%s needs a value\n", s.c_str()); exit(2); } return std::string(argv[++i]); };
@@ -475,6 +672,7 @@ int main(int argc, char** argv) {
         else if (s == "--check") check = next();
         else if (s == "--profile") prof = true;
         else if (s == "--f16") f16 = true;
+        else if (s == "--no-prefill") use_prefill = false;
         else if (s == "--batch") batch = next();
         else if (s == "--trace") trace_path = next();
         else { fprintf(stderr, "unknown arg %s\n", s.c_str()); return 2; }
@@ -494,10 +692,12 @@ int main(int argc, char** argv) {
 
     if (!check.empty()) {
         int pos = 0, tok = ids[0], bad = 0; double worst = 0, worst_kl = 0;
+        const int np = (int)ids.size();
+        if (use_prefill) pos = np - 1;  // the prompt runs as one prefill; compare from its last position on
         for (;; pos++) {
             auto ref = read_f32(check + "/p" + std::string(pos < 10 ? "00" : pos < 100 ? "0" : "") + std::to_string(pos) + "_logits.bin");
             if (ref.empty()) break;
-            int id = eng.step(tok, pos, true);
+            int id = use_prefill && pos == np - 1 ? eng.prefill(ids.data(), np, 0) : eng.step(tok, pos, true);
             std::vector<float> got(V); CK(cudaMemcpy(got.data(), eng.logits, V * 4, cudaMemcpyDeviceToHost));
             double mx = 0, err = 0;
             for (int i = 0; i < V; i++) { mx = std::max(mx, (double)fabsf(ref[i])); err = std::max(err, (double)fabsf(got[i] - ref[i])); }
@@ -508,10 +708,11 @@ int main(int argc, char** argv) {
             for (int i = 0; i < V; i++) { double lp = ref[i] - mr - log(zr), lq = got[i] - mg - log(zg); kl += exp(lp) * (lp - lq); }
             worst = std::max(worst, err / mx); worst_kl = std::max(worst_kl, kl); bad += id != rid;
             fprintf(stderr, "  pos %2d tok %6d  logits rel %.3e  KL %.2e  argmax %6d ref %6d %s\n", pos, tok, err / mx, kl, id, rid, id == rid ? "" : "MISMATCH");
-            tok = pos + 1 < (int)ids.size() ? ids[pos + 1] : id;
+            tok = pos + 1 < np ? ids[pos + 1] : id;
         }
         // F16 must be numerically identical; int8 is judged by distribution drift (KL) and greedy agreement
-        bool ok = pos > 0 && bad == 0 && (f16 ? worst < 1e-4 : worst_kl < 0.02);
+        // (prefill rounds activations to fp16 on tensor cores, so only the token-by-token F16 path is held to exactness)
+        bool ok = pos > 0 && bad == 0 && (f16 && !use_prefill ? worst < 1e-4 : f16 ? worst_kl < 1e-5 : worst_kl < 0.02);
         fprintf(stderr, "[check] %s, %d positions, worst logits rel %.3e, worst KL %.2e, argmax mismatches %d -> %s\n",
                 f16 ? "F16" : "int8", pos, worst, worst_kl, bad, ok ? "PASS" : "FAIL");
         return ok ? 0 : 1;
@@ -525,7 +726,8 @@ int main(int argc, char** argv) {
         eng.trace_phase = 0;
         double t0 = now();
         int pos = 0, tok = -1;
-        for (; pos < (int)p.size(); pos++) tok = eng.step(p[pos], pos, pos + 1 == (int)p.size());
+        if (use_prefill && !eng.trace) { tok = eng.prefill(p.data(), (int)p.size(), 0); pos = (int)p.size(); }
+        else for (; pos < (int)p.size(); pos++) tok = eng.step(p[pos], pos, pos + 1 == (int)p.size());
         long long h0 = eng.hits, m0 = eng.misses, a0 = eng.admits; double c0 = eng.cpu_s, t1 = now();
         double ht0[4]; for (int i = 0; i < 4; i++) ht0[i] = eng.ht[i];
         eng.trace_phase = 1;
