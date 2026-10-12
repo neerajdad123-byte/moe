@@ -294,6 +294,11 @@ __global__ void export_route_k(const float* __restrict__ h, const int* __restric
     if (i < K) { idx_out[i] = idx[i]; w_out[i] = w[i]; }
 }
 
+// out[i] = y[i]
+__global__ void copy_k(float* __restrict__ out, const float* __restrict__ y, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) out[i] = y[i];
+}
 // out[i] += y[i]
 __global__ void add_k(float* __restrict__ out, const float* __restrict__ y, int n) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;

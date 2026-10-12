@@ -47,7 +47,7 @@ struct Engine {
     int ctx;
     // scratch
     float *x, *h, *tmp, *moe, *big, *q, *k, *v, *qo, *ag, *z, *a, *b, *conv, *o, *act, *scr, *logits, *rw, *amv;
-    int *ridx, *ams, *tok_d;
+    int *ridx, *ams;
     const uint8_t** slots_d;
     cudaStream_t cs, cp;  // compute, copy (both non-blocking: the legacy default stream would serialize them)
     // expert slot cache (LRU); a slot is usable once ready[] (its admission copy has finished)
@@ -298,7 +298,7 @@ struct Engine {
         conv = falloc(DC); o = falloc(DVH * DNV);
         act = falloc(TOPK * EI); scr = falloc(2 * SI + D + 1); logits = falloc(V); rw = falloc(TOPK);
         amv = falloc(ARGMAX_BLOCKS + 1);
-        CK(cudaMalloc(&ridx, TOPK * 4)); CK(cudaMalloc(&ams, ARGMAX_BLOCKS * 4)); CK(cudaMalloc(&tok_d, 4));
+        CK(cudaMalloc(&ridx, TOPK * 4)); CK(cudaMalloc(&ams, ARGMAX_BLOCKS * 4));
         CK(cudaMalloc(&slots_d, TOPK * sizeof(void*)));
         if (ctx * 4 > 48 * 1024)
             CK(cudaFuncSetAttribute(attn_decode_k, cudaFuncAttributeMaxDynamicSharedMemorySize, ctx * 4));
@@ -392,7 +392,7 @@ struct Engine {
         tokens++;
         double t = now();
         for (int i = 0; i < D; i++) h_h[i] = __half2float(embed[(size_t)tok * D + i]);
-        CK(cudaMemcpyAsync(x, h_h, D * 4, cudaMemcpyHostToDevice, cs));
+        copy_k<<<(D + 255) / 256, 256, 0, cs>>>(x, h_hd, D);  // zero-copy from the mapped host row
         set_int_k<<<1, 1, 0, cs>>>(pos_d, pos);
         for (int l = 0; l < NL; l++) {
             poll_admissions();
@@ -431,8 +431,7 @@ struct Engine {
         rmsnorm(x, pending, norm, h, D, EPS, 1, cs);
         if (!want_logits) return -1;
         gemv(lm_head, h, logits, D, V, cs);
-        argmax(logits, V, amv, ams, tok_d, cs);
-        CK(cudaMemcpyAsync(ids_h, tok_d, 4, cudaMemcpyDeviceToHost, cs));
+        argmax(logits, V, amv, ams, ids_hd, cs);  // the id lands in mapped host memory
         CK(cudaStreamSynchronize(cs));
         mark(2, t);
         return ids_h[0];
