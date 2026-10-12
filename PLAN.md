@@ -171,3 +171,34 @@ moex: colibri int4 gs64 container, int8 trunk.
 Verdict: decode clearly faster (expert-granular residency + CPU misses beat whole-layer placement); prefill 2.5x slower
 (next work: bigger chunks, faster GEMM, keep the PCIe copy engine saturated).
 
+## Router fix + mixed-precision decision (2026-10-12)
+
+**Bug found by comparing text with llama.cpp:** the top-8 router weights must be renormalized (norm_topk_prob).
+colibri's converter wrote false into its meta (the HF config omits the key; the Qwen3.5-MoE default is true). Our engine and
+our reference both degenerated into loops; after the fix the output matches llama.cpp's nearly word for word.
+All golden data regenerated; new 107-position teacher-forced eval set `ref/eval1`; `--check` is statistical for quantized
+weights (int8: mean KL 1.4e-3, top-1 98.6%; F16: exact, KL 7e-13).
+
+Mixed precision on the corrected model, 72 teacher-forced positions + 10-prompt warm decode:
+
+| int4 groups | mean KL | top-1 | slots | decode |
+|---|---|---|---|---|
+| none (int8) | 1.4e-3 | 98.6% | 1589 | 45.8 tok/s |
+| sh_gu | 3.4e-3 | 98.6% | 1609 | 45.5 |
+| dn_in | 3.7e-2 | 88.9% | 1771 | 50.4 |
+| sh_gu,dn_in,attn_qkv,attn_o | 5.8e-2 | 90.3% | 1853 | 53.1 |
+
+Decision: **int8 stays the default** (int4 DeltaNet input projections flip ~1 token in 9). `--q4` kept as opt-in.
+Routing changed with the fix (10-prompt hit 76% -> 71%): traces must be re-collected and the cache policy re-tuned.
+
+## Launch checklist
+1. re-collect traces on the fixed model, re-tune eviction/prefetch, re-run head-to-head (default + tuned llama.cpp)
+2. sampling (temperature, top-p, top-k, repetition penalty)
+3. multi-turn chat keeping KV/DeltaNet state
+4. OpenAI-compatible server
+5. C++ tokenizer, no Python needed
+6. other GPUs (fat binary sm_75..sm_120, VRAM/RAM auto-sizing, clear errors)
+7. `moex download` for the HF container
+8. long context: int8 KV cache, split-K attention
+9. README, release build, benchmark page
+
