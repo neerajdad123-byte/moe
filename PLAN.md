@@ -151,3 +151,23 @@ Findings: spin-wait scheduling no gain; CPU thread count 8-14 flat; CPU expert k
 + max(GPU experts+shared, CPU misses), now roughly equal. Ceiling of this design ~57 tok/s warm.
 Nsight Compute counters need Windows permission (ERR_NVGPUCTRPERM) - user setting.
 
+## Head-to-head vs llama.cpp (2026-10-12)
+
+Same model (Qwen3.6-35B-A3B), 10 never-seen prompts (`data/h2h_prompts.txt`), same chat template, greedy, 128 tokens,
+fresh process per prompt (`tools/h2h.py`). llama.cpp b11563 official CUDA build, ggml-org Q4_K_M GGUF
+(experts Q4_K int4, trunk Q8_0 int8, lm_head Q6_K), best flags from a sweep: `-ngl 99 -ncmoe 33 -fa on -t 12 -lm mmap+mlock`
+(ncmoe <= 31 spills VRAM into shared memory: 12 tok/s; default mmap without mlock: 20.3 tok/s from page faults).
+moex: colibri int4 gs64 container, int8 trunk.
+
+| | moex v2 | llama.cpp (best config) | ratio |
+|---|---|---|---|
+| decode, fresh process per prompt (mean of 10) | **47.0 tok/s** | 35.3 tok/s | **1.33x** |
+| decode, one warm process | **48.1 tok/s** | (same, static placement) | 1.36x |
+| decode range | 42.5 - 57.3 | 34.5 - 35.9 | |
+| TTFT, 24-46 token prompts (mean) | 0.86 s | **0.59 s** | 0.69x |
+| prompt processing, 512 tokens (llama-bench pp512 vs moex prefill) | 133 tok/s | **~330 tok/s** | 0.40x |
+| load time | ~24 s (experts read + locked in RAM) | ~10-20 s | |
+
+Verdict: decode clearly faster (expert-granular residency + CPU misses beat whole-layer placement); prefill 2.5x slower
+(next work: bigger chunks, faster GEMM, keep the PCIe copy engine saturated).
+
