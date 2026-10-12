@@ -1,4 +1,5 @@
-// MoEx v2 decode engine (Phase 2: everything on GPU, experts fetched into VRAM slots on miss).
+// MoEx v2 decode engine. Per MoE layer: resident experts run on the GPU, misses run on the CPU
+// at the same time, and missed experts are copied into VRAM slots in the background (admission).
 //   moex.exe --ids 760,6511,314 [--n 32] [--ctx 2048] [--stop 248044,248046] [--profile]
 //   moex.exe --check ref/golden          logits vs the PyTorch reference at every golden position
 //   --f16                                 keep dense weights F16 (exact); default is int8 per-row
@@ -8,10 +9,14 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <deque>
+#include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 #include "st.h"
 #include "kernels.cuh"
+#include "cpu_expert.h"
 
 static double now() { return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
 
@@ -41,19 +46,133 @@ struct Engine {
     float *x, *h, *tmp, *moe, *big, *q, *k, *v, *qo, *ag, *z, *a, *b, *conv, *o, *act, *scr, *logits, *rw, *amv;
     int *ridx, *ams, *tok_d;
     const uint8_t** slots_d;
-    // expert slot cache (LRU)
+    cudaStream_t cs, cp;  // compute, copy (both non-blocking: the legacy default stream would serialize them)
+    // expert slot cache (LRU); a slot is usable once ready[] (its admission copy has finished)
     uint8_t* arena = nullptr;
     int nslots = 0;
     std::vector<int> slot_of, owner;
+    std::vector<char> ready, inflight;
     std::vector<uint64_t> last;
     uint64_t clock = 0;
-    long long hits = 0, misses = 0;
-    double load_s = 0;
+    long long hits = 0, misses = 0, admits = 0;
+    double cpu_s = 0;
+    std::vector<const uint8_t*> eq;  // mmapped expert blobs [NL*E]
+    std::vector<const float*> es;    // and their scales
+    // CPU side of the MoE
+    CpuExperts cpu{getenv("MOEX_CPU_THREADS") ? atoi(getenv("MOEX_CPU_THREADS")) : 8};
+    float *h_h, *w_h, *y_h, *hw_h, *ycpu;  // pinned host / device
+    int* ids_h;
+    const uint8_t** hs_h;
+    float* hw_d;
+    // admission: loader thread copies mmap -> pinned stage -> slot on the copy stream
+    static constexpr int NSTAGE = 32;
+    struct Stage { uint8_t* buf; cudaEvent_t after_compute, done; int slot = -1, key = -1; };
+    Stage stage[NSTAGE];
+    std::vector<int> free_st;                 // main thread only
+    std::deque<int> todo, flying;             // guarded by mu
+    std::mutex mu;
+    std::thread loader;
+    bool stop_loader = false;
     // profile (synchronizing, so it perturbs the speed it measures)
     bool prof = false;
     double tp[8] = {};
 
     explicit Engine(const char* root, int ctx_) : C(root), ctx(ctx_) {}
+    ~Engine() {
+        if (loader.joinable()) { { std::lock_guard<std::mutex> g(mu); stop_loader = true; } loader.join(); }
+    }
+
+    void loader_main() {
+        while (true) {
+            int i = -1;
+            {
+                std::lock_guard<std::mutex> g(mu);
+                if (stop_loader) return;
+                if (!todo.empty()) { i = todo.front(); todo.pop_front(); }
+            }
+            if (i < 0) { std::this_thread::sleep_for(std::chrono::microseconds(50)); continue; }
+            Stage& st = stage[i];
+            memcpy(st.buf, eq[st.key], EXPERT_Q_BYTES);  // may page-fault from SSD: this thread absorbs it
+            memcpy(st.buf + EXPERT_Q_BYTES, es[st.key], EXPERT_BYTES - EXPERT_Q_BYTES);
+            CK(cudaStreamWaitEvent(cp, st.after_compute));  // nothing still reads the victim slot
+            CK(cudaMemcpyAsync(arena + (size_t)st.slot * EXPERT_BYTES, st.buf, EXPERT_BYTES, cudaMemcpyHostToDevice, cp));
+            CK(cudaEventRecord(st.done, cp));
+            std::lock_guard<std::mutex> g(mu);
+            flying.push_back(i);
+        }
+    }
+
+    // A CPU miss on a mapped page this process hasn't touched costs ~2.4 ms vs ~0.06 ms touched
+    // (measured, K14). So: read every expert into RAM up front, fault each page into the working
+    // set once, and ask Windows to keep the working set that large.
+    void pin_experts_in_ram() {
+        double t0 = now();
+        std::vector<WIN32_MEMORY_RANGE_ENTRY> r;
+        size_t total = 0;
+        for (int k = 0; k < NL * E; k++) {
+            r.push_back({(void*)eq[k], EXPERT_Q_BYTES});
+            r.push_back({(void*)es[k], EXPERT_BYTES - EXPERT_Q_BYTES});
+            total += EXPERT_BYTES;
+        }
+        // ask for the largest minimum working set Windows will grant, in 1 GB steps
+        SIZE_T got = 0;
+        for (SIZE_T mn = total + (1ull << 30); mn > (2ull << 30) && !got; mn -= 1ull << 30)
+            if (SetProcessWorkingSetSizeEx(GetCurrentProcess(), mn, mn + (2ull << 30), QUOTA_LIMITS_HARDWS_MIN_DISABLE | QUOTA_LIMITS_HARDWS_MAX_DISABLE)) got = mn;
+        // Fill the file cache with big sequential reads (4 KB page faults on a cold map read at random-I/O
+        // speed), then fault the now-cached pages into the working set; 4 threads, one layer file at a time.
+        std::atomic<int> next{0};
+        std::atomic<uint64_t> sum{0};
+        auto work = [&] {
+            std::vector<uint8_t> buf(16 << 20);
+            for (int l; (l = next.fetch_add(1)) < NL;) {
+                HANDLE f = CreateFileA(C.at("model.layers." + std::to_string(l) + ".mlp.experts.0.qs").file.c_str(), GENERIC_READ,
+                                       FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
+                DWORD got_b = 0;
+                while (f != INVALID_HANDLE_VALUE && ReadFile(f, buf.data(), (DWORD)buf.size(), &got_b, nullptr) && got_b) {}
+                if (f != INVALID_HANDLE_VALUE) CloseHandle(f);
+                uint64_t s = 0;
+                for (size_t i = (size_t)l * E * 2; i < (size_t)(l + 1) * E * 2; i++)
+                    for (size_t o = 0; o < r[i].NumberOfBytes; o += 4096) s += ((const uint8_t*)r[i].VirtualAddress)[o];
+                sum += s;
+            }
+        };
+        std::vector<std::thread> ths;
+        for (int i = 0; i < 4; i++) ths.emplace_back(work);
+        for (auto& t : ths) t.join();
+        static volatile uint64_t sink; sink = sum;
+        fprintf(stderr, "[ram] %.1f GB of experts faulted in, %.1f s; min working set %.1f GB%s\n", total / 1e9, now() - t0,
+                got / 1e9, got >= total ? "" : " (below the expert total: some CPU misses will page-fault)");
+    }
+
+    // Publish finished admissions (main thread).
+    void poll_admissions() {
+        std::lock_guard<std::mutex> g(mu);
+        for (size_t n = flying.size(); n--;) {
+            int i = flying.front(); flying.pop_front();
+            if (cudaEventQuery(stage[i].done) == cudaSuccess) {
+                Stage& st = stage[i];
+                if (owner[st.slot] == st.key) ready[st.slot] = 1;
+                inflight[st.slot] = 0;
+                free_st.push_back(i);
+            } else flying.push_back(i);
+        }
+    }
+
+    // Start copying expert `key` into the LRU victim slot; skipped when all stages are busy.
+    void admit(int key) {
+        if (free_st.empty()) return;
+        int s = -1; uint64_t best = ~0ull;
+        for (int i = 0; i < nslots; i++) if (!inflight[i] && last[i] < best) { best = last[i]; s = i; }
+        if (s < 0) return;
+        if (owner[s] >= 0) slot_of[owner[s]] = -1;
+        owner[s] = key; slot_of[key] = s; ready[s] = 0; inflight[s] = 1; last[s] = clock;
+        int i = free_st.back(); free_st.pop_back();
+        stage[i].slot = s; stage[i].key = key;
+        CK(cudaEventRecord(stage[i].after_compute, cs));
+        admits++;
+        std::lock_guard<std::mutex> g(mu);
+        todo.push_back(i);
+    }
 
     half* wup(const std::string& n, int64_t numel) {
         const StTensor& s = C.at(n);
@@ -120,6 +239,8 @@ struct Engine {
             }
         }
         if (qtmp) { CK(cudaDeviceSynchronize()); CK(cudaFree(qtmp)); qtmp = nullptr; }
+        CK(cudaStreamCreateWithFlags(&cs, cudaStreamNonBlocking));
+        CK(cudaStreamCreateWithFlags(&cp, cudaStreamNonBlocking));
         x = falloc(D); h = falloc(D); tmp = falloc(D); moe = falloc(D);
         q = falloc(AH * 2 * AHD); k = falloc(AKV * AHD); v = falloc(AKV * AHD); qo = falloc(AH * AHD); ag = falloc(AH * AHD);
         big = falloc(DC); z = falloc(DVH * DNV); a = falloc(DVH); b = falloc(DVH); conv = falloc(DC); o = falloc(DVH * DNV);
@@ -136,81 +257,97 @@ struct Engine {
         if (nslots < 2 * TOPK) { fprintf(stderr, "only %d expert slots fit; need >= %d\n", nslots, 2 * TOPK); exit(1); }
         CK(cudaMalloc(&arena, (size_t)nslots * EXPERT_BYTES));
         slot_of.assign(NL * E, -1); owner.assign(nslots, -1); last.assign(nslots, 0);
+        ready.assign(nslots, 0); inflight.assign(nslots, 0);
+        eq.resize(NL * E); es.resize(NL * E);
+        for (int l = 0; l < NL; l++) for (int e = 0; e < E; e++) {
+            std::string ep = "model.layers." + std::to_string(l) + ".mlp.experts." + std::to_string(e) + ".";
+            eq[l * E + e] = C.map(ep + "merged_weight");
+            es[l * E + e] = (const float*)C.map(ep + "qs");
+        }
+        CK(cudaMallocHost(&h_h, D * 4)); CK(cudaMallocHost(&y_h, D * 4)); CK(cudaMallocHost(&w_h, TOPK * 4));
+        CK(cudaMallocHost(&hw_h, TOPK * 4)); CK(cudaMallocHost(&ids_h, TOPK * 4)); CK(cudaMallocHost(&hs_h, TOPK * sizeof(void*)));
+        CK(cudaMalloc(&hw_d, TOPK * 4)); CK(cudaMalloc(&ycpu, D * 4));
+        for (int i = 0; i < NSTAGE; i++) {
+            CK(cudaMallocHost(&stage[i].buf, EXPERT_BYTES));
+            CK(cudaEventCreateWithFlags(&stage[i].after_compute, cudaEventDisableTiming));
+            CK(cudaEventCreateWithFlags(&stage[i].done, cudaEventDisableTiming));
+            free_st.push_back(i);
+        }
+        loader = std::thread([this] { loader_main(); });
+        pin_experts_in_ram();
         fprintf(stderr, "[load] %.1f s, dense %s, %d expert slots (%.2f GB, %.1f%% of %d experts), ctx %d\n",
                 now() - t0, f16 ? "F16" : "int8", nslots, nslots * (double)EXPERT_BYTES / 1e9, 100.0 * nslots / (NL * E), NL * E, ctx);
     }
 
-    // Make the layer's selected experts resident and return their slot pointers.
-    // LRU: this layer's experts are stamped first, so a miss never evicts a sibling.
-    void ensure(int l, const int* ids, const uint8_t** out) {
-        clock++;
-        for (int j = 0; j < TOPK; j++) { int s = slot_of[l * E + ids[j]]; if (s >= 0) last[s] = clock; }
-        for (int j = 0; j < TOPK; j++) {
-            int key = l * E + ids[j], s = slot_of[key];
-            if (s >= 0) { hits++; out[j] = arena + (size_t)s * EXPERT_BYTES; continue; }
-            misses++;
-            s = int(std::min_element(last.begin(), last.end()) - last.begin());
-            if (owner[s] >= 0) slot_of[owner[s]] = -1;
-            owner[s] = key; slot_of[key] = s; last[s] = clock;
-            std::string ep = "model.layers." + std::to_string(l) + ".mlp.experts." + std::to_string(ids[j]) + ".";
-            uint8_t* dst = arena + (size_t)s * EXPERT_BYTES;
-            double t0 = now();
-            // shortcut: synchronous pageable copy from the mmap; Phase 3 replaces misses with CPU compute + async prefetch
-            CK(cudaMemcpy(dst, C.map(ep + "merged_weight"), EXPERT_Q_BYTES, cudaMemcpyHostToDevice));
-            CK(cudaMemcpy(dst + EXPERT_Q_BYTES, C.map(ep + "qs"), EXPERT_BYTES - EXPERT_Q_BYTES, cudaMemcpyHostToDevice));
-            load_s += now() - t0;
-            out[j] = dst;
-        }
-    }
-
-    void mark(int i, double& t) { if (prof) { CK(cudaDeviceSynchronize()); double n = now(); tp[i] += n - t; t = n; } }
+    void mark(int i, double& t) { if (prof) { CK(cudaStreamSynchronize(cs)); double n = now(); tp[i] += n - t; t = n; } }
 
     // One token at position `pos`. If want_logits, logits[] is filled and the greedy id returned.
     int step(int tok, int pos, bool want_logits) {
         double t = now();
-        std::vector<float> e(D);
-        for (int i = 0; i < D; i++) e[i] = __half2float(embed[(size_t)tok * D + i]);
-        CK(cudaMemcpy(x, e.data(), D * 4, cudaMemcpyHostToDevice));
+        for (int i = 0; i < D; i++) h_h[i] = __half2float(embed[(size_t)tok * D + i]);
+        CK(cudaMemcpyAsync(x, h_h, D * 4, cudaMemcpyHostToDevice, cs));
         const float* pending = nullptr;  // previous MoE output, added to x by the next norm
         for (int l = 0; l < NL; l++) {
             LayerW& w = L[l];
-            rmsnorm(x, pending, w.in_ln, h, D, EPS);
+            rmsnorm(x, pending, w.in_ln, h, D, EPS, 1, cs);
             if (is_attn(l)) {
-                gemv(w.q, h, q, D, AH * 2 * AHD); gemv(w.k, h, k, D, AKV * AHD); gemv(w.v, h, v, D, AKV * AHD);
-                attn_decode(q, k, v, w.qn, w.kn, qo, w.K, w.V, ag, AH, AKV, pos, ctx, ROT, THETA, EPS);
-                gemv(w.o, ag, tmp, AH * AHD, D);
+                gemv(w.q, h, q, D, AH * 2 * AHD, cs); gemv(w.k, h, k, D, AKV * AHD, cs); gemv(w.v, h, v, D, AKV * AHD, cs);
+                attn_decode(q, k, v, w.qn, w.kn, qo, w.K, w.V, ag, AH, AKV, pos, ctx, ROT, THETA, EPS, cs);
+                gemv(w.o, ag, tmp, AH * AHD, D, cs);
                 mark(0, t);
             } else {
-                gemv(w.qkv, h, big, D, DC); gemv(w.z, h, z, D, DVH * DNV);
-                gemv_f16(w.a, h, a, D, DVH); gemv_f16(w.b, h, b, D, DVH);
-                deltanet_core(big, z, a, b, w.conv, w.alog, w.dtb, w.nw, w.ring, w.S, conv, o, DC, CONVK, DVH, DKH, EPS);
-                gemv(w.out, o, tmp, DVH * DNV, D);
+                gemv(w.qkv, h, big, D, DC, cs); gemv(w.z, h, z, D, DVH * DNV, cs);
+                gemv_f16(w.a, h, a, D, DVH, cs); gemv_f16(w.b, h, b, D, DVH, cs);
+                deltanet_core(big, z, a, b, w.conv, w.alog, w.dtb, w.nw, w.ring, w.S, conv, o, DC, CONVK, DVH, DKH, EPS, cs);
+                gemv(w.out, o, tmp, DVH * DNV, D, cs);
                 mark(1, t);
             }
-            rmsnorm(x, tmp, w.post_ln, h, D, EPS);
-            gemv_f16(w.router, h, scr, D, E);
-            router_topk(scr, E, TOPK, false, ridx, rw);
-            int ids[TOPK];
-            CK(cudaMemcpy(ids, ridx, sizeof ids, cudaMemcpyDeviceToHost));  // per-layer sync: the cache needs the ids
+            rmsnorm(x, tmp, w.post_ln, h, D, EPS, 1, cs);
+            gemv_f16(w.router, h, scr, D, E, cs);
+            router_topk(scr, E, TOPK, false, ridx, rw, cs);
+            CK(cudaMemcpyAsync(ids_h, ridx, TOPK * 4, cudaMemcpyDeviceToHost, cs));
+            CK(cudaMemcpyAsync(w_h, rw, TOPK * 4, cudaMemcpyDeviceToHost, cs));
+            CK(cudaMemcpyAsync(h_h, h, D * 4, cudaMemcpyDeviceToHost, cs));
+            CK(cudaStreamSynchronize(cs));  // per-layer sync: placement needs the routing
             mark(2, t);
-            const uint8_t* sp[TOPK];
-            ensure(l, ids, sp);
-            CK(cudaMemcpy(slots_d, sp, sizeof sp, cudaMemcpyHostToDevice));
+            poll_admissions();
+            clock++;
+            int nh = 0, nm = 0, mkey[TOPK];
+            const uint8_t* mq[TOPK]; const float* msc[TOPK]; float mw[TOPK];
+            for (int j = 0; j < TOPK; j++) {
+                int key = l * E + ids_h[j], sl = slot_of[key];
+                if (sl >= 0) last[sl] = clock;  // also protects in-flight siblings from eviction
+                if (sl >= 0 && ready[sl]) { hs_h[nh] = arena + (size_t)sl * EXPERT_BYTES; hw_h[nh++] = w_h[j]; hits++; }
+                else { mq[nm] = eq[key]; msc[nm] = es[key]; mw[nm] = w_h[j]; mkey[nm++] = sl < 0 ? key : -1; misses++; }
+            }
+            // GPU: resident experts + shared expert (async)
+            if (nh) {
+                CK(cudaMemcpyAsync(slots_d, hs_h, nh * sizeof(void*), cudaMemcpyHostToDevice, cs));
+                CK(cudaMemcpyAsync(hw_d, hw_h, nh * 4, cudaMemcpyHostToDevice, cs));
+                experts_forward(slots_d, hw_d, nh, h, act, moe, cs);
+            } else CK(cudaMemsetAsync(moe, 0, D * 4, cs));
+            shared_expert_add(w.sh_g, w.sh_u, w.sh_d, w.sh_gate, h, moe, scr, D, SI, cs);
+            // CPU: misses, overlapped with the GPU work above
+            if (nm) {
+                double c0 = now();
+                cpu.run(nm, mq, msc, mw, h_h, y_h);
+                cpu_s += now() - c0;
+                CK(cudaMemcpyAsync(ycpu, y_h, D * 4, cudaMemcpyHostToDevice, cs));
+                add_k<<<(D + 255) / 256, 256, 0, cs>>>(moe, ycpu, D);
+                for (int j = 0; j < nm; j++) if (mkey[j] >= 0) admit(mkey[j]);
+            }
             mark(3, t);
-            experts_forward(slots_d, rw, TOPK, h, act, moe);
-            mark(4, t);
-            shared_expert_add(w.sh_g, w.sh_u, w.sh_d, w.sh_gate, h, moe, scr, D, SI);
-            mark(5, t);
             pending = moe;
         }
         // the last MoE output is folded into x here, or by the next token's first norm
-        rmsnorm(x, pending, norm, h, D, EPS);
+        rmsnorm(x, pending, norm, h, D, EPS, 1, cs);
         if (!want_logits) return -1;
-        gemv(lm_head, h, logits, D, V);
-        argmax(logits, V, amv, ams, tok_d);
-        int id; CK(cudaMemcpy(&id, tok_d, 4, cudaMemcpyDeviceToHost));
-        mark(6, t);
-        return id;
+        gemv(lm_head, h, logits, D, V, cs);
+        argmax(logits, V, amv, ams, tok_d, cs);
+        CK(cudaMemcpyAsync(ids_h, tok_d, 4, cudaMemcpyDeviceToHost, cs));
+        CK(cudaStreamSynchronize(cs));
+        mark(4, t);
+        return ids_h[0];
     }
 };
 
@@ -289,7 +426,7 @@ int main(int argc, char** argv) {
     int pos = 0, tok = -1;
     for (; pos < (int)ids.size(); pos++) tok = eng.step(ids[pos], pos, pos + 1 == (int)ids.size());
     double t1 = now();
-    long long h0 = eng.hits, m0 = eng.misses; double l0 = eng.load_s;
+    long long h0 = eng.hits, m0 = eng.misses, a0 = eng.admits; double c0 = eng.cpu_s;
     eng.prof = prof;
     int gen = 0;
     for (; gen < n; gen++) {
@@ -302,12 +439,13 @@ int main(int argc, char** argv) {
     int dec = std::max(gen - 1, 1);  // decode steps run after the prompt
     long long dh = eng.hits - h0, dm = eng.misses - m0;
     fprintf(stderr, "[prompt] %zu tok in %.2f s (%.1f tok/s, token-by-token)\n", ids.size(), t1 - t0, ids.size() / (t1 - t0));
-    fprintf(stderr, "[decode] %d tok in %.2f s = %.2f tok/s | expert hit %.1f%% (%lld miss, %.2f s loading = %.1f ms/tok)\n",
-            dec, t2 - t1, dec / (t2 - t1), 100.0 * dh / std::max(dh + dm, 1LL), dm, eng.load_s - l0, 1e3 * (eng.load_s - l0) / dec);
+    fprintf(stderr, "[decode] %d tok in %.2f s = %.2f tok/s | expert hit %.1f%% | %.1f misses/tok on CPU = %.1f ms/tok | %lld admitted\n",
+            dec, t2 - t1, dec / (t2 - t1), 100.0 * dh / std::max(dh + dm, 1LL), (double)dm / dec,
+            1e3 * (eng.cpu_s - c0) / dec, eng.admits - a0);
     if (prof) {
-        const char* nm[] = {"attention", "deltanet", "router+sync", "expert load", "experts", "shared expert", "lm_head+argmax"};
-        double tot = 0; for (int i = 0; i < 7; i++) tot += eng.tp[i];
-        for (int i = 0; i < 7; i++) fprintf(stderr, "  %-15s %7.2f ms/tok  %5.1f%%\n", nm[i], 1e3 * eng.tp[i] / dec, 100 * eng.tp[i] / tot);
+        const char* nm[] = {"attention", "deltanet", "router+sync", "moe (gpu+cpu)", "lm_head+argmax"};
+        double tot = 0; for (int i = 0; i < 5; i++) tot += eng.tp[i];
+        for (int i = 0; i < 5; i++) fprintf(stderr, "  %-15s %7.2f ms/tok  %5.1f%%\n", nm[i], 1e3 * eng.tp[i] / dec, 100 * eng.tp[i] / tot);
     }
     return 0;
 }

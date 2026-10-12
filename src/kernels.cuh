@@ -245,6 +245,11 @@ __global__ void silu_mul_k(float* __restrict__ a, const float* __restrict__ b, i
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) { float g = a[i]; a[i] = g / (1.f + __expf(-g)) * b[i]; }
 }
+// out[i] += y[i]
+__global__ void add_k(float* __restrict__ out, const float* __restrict__ y, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) out[i] += y[i];
+}
 // out[d] += sigmoid(gate_logit[0]) * sh[d]
 __global__ void gated_add_k(float* __restrict__ out, const float* __restrict__ sh,
                             const float* __restrict__ gate_logit, int n) {

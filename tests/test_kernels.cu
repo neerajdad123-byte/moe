@@ -9,6 +9,8 @@
 #include <vector>
 #include "../src/st.h"
 #include "../src/kernels.cuh"
+#include "../src/cpu_expert.h"
+#include <chrono>
 
 static const char* MODEL = getenv("QWEN36_MODEL") ? getenv("QWEN36_MODEL") : "C:\\models\\qwen36_i4_gs64";
 static const float EPS = 1e-6f;
@@ -162,6 +164,71 @@ int main(int argc, char** argv) {
                 bench("shared expert F16", 3.0 * SI * D * 2, [&] { shared_expert_add({Wg}, {Wu}, {Wd}, Ws, h, out, scr, D, SI); });
             }
             for (void* p : {(void*)Wr, (void*)h, (void*)Wg, (void*)Wu, (void*)Wd, (void*)Ws}) CK(cudaFree(p));
+        }
+    }
+
+    if (want(filt, "K14")) {
+        printf("K14 CPU experts (AVX2) vs GPU K4, L00 routed experts\n");
+        const int K = 8;
+        std::string lp = "model.layers.0.mlp.";
+        auto h = golden(P + "L00_moe_in");
+        auto ri = golden(P + "L00_route_idx"); auto rwv = golden(P + "L00_route_w");
+        std::vector<int> ids(K); memcpy(ids.data(), ri.data(), K * 4);
+        std::vector<std::vector<uint8_t>> blobs(K);
+        std::vector<const uint8_t*> hq(K); std::vector<const float*> hs(K), dslot(K);
+        uint8_t* arena; CK(cudaMalloc(&arena, K * EXPERT_BYTES));
+        for (int k = 0; k < K; k++) {
+            std::string ep = lp + "experts." + std::to_string(ids[k]) + ".";
+            auto q = C.read(ep + "merged_weight"), s = C.read(ep + "qs");
+            blobs[k] = q; blobs[k].insert(blobs[k].end(), s.begin(), s.end());  // same layout as a VRAM slot
+            hq[k] = blobs[k].data(); hs[k] = (const float*)(blobs[k].data() + EXPERT_Q_BYTES);
+            CK(cudaMemcpy(arena + k * EXPERT_BYTES, blobs[k].data(), EXPERT_BYTES, cudaMemcpyHostToDevice));
+        }
+        std::vector<const uint8_t*> ds(K); for (int k = 0; k < K; k++) ds[k] = arena + k * EXPERT_BYTES;
+        const uint8_t** slots; CK(cudaMalloc(&slots, K * sizeof(void*))); CK(cudaMemcpy(slots, ds.data(), K * sizeof(void*), cudaMemcpyHostToDevice));
+        float *hd = up(h), *wd = up(rwv), *act = dalloc(K * EI), *out = dalloc(D);
+        experts_forward(slots, wd, K, hd, act, out);
+        auto gpu = down(out, D);
+        for (int threads : {6, 8, 12, 16}) {
+            CpuExperts ce(threads);
+            std::vector<float> cpu(D);
+            ce.run(K, hq.data(), hs.data(), rwv.data(), h.data(), cpu.data());
+            if (threads == 8) check("CPU 8 experts vs GPU", cpu, gpu, 1e-5f);
+            for (int m : {1, 2, 4, 8}) {
+                for (int i = 0; i < 3; i++) ce.run(m, hq.data(), hs.data(), rwv.data(), h.data(), cpu.data());
+                std::vector<double> t(21);
+                static std::vector<uint8_t> l3(64 << 20);  // > 24 MB L3: misses are read from DRAM, not cache
+                for (auto& ti : t) {
+                    for (size_t i = 0; i < l3.size(); i += 64) l3[i]++;
+                    auto a = std::chrono::steady_clock::now();
+                    ce.run(m, hq.data(), hs.data(), rwv.data(), h.data(), cpu.data());
+                    ti = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - a).count();
+                }
+                std::sort(t.begin(), t.end());
+                printf("  threads %2d  %d expert(s)  %7.3f ms  %5.1f GB/s  (%.3f ms/expert)\n", threads, m, t[10],
+                       m * EXPERT_BYTES / t[10] / 1e6, t[10] / m);
+            }
+        }
+        CK(cudaFree(arena));
+        // Same kernel on mmapped experts: first touch in this process vs again (page-fault cost).
+        CpuExperts ce(8);
+        std::vector<float> cpu(D);
+        for (int L : {5, 6}) {
+            std::string lpm = "model.layers." + std::to_string(L) + ".mlp.experts.";
+            for (int pass = 0; pass < 2; pass++) {
+                double tot = 0;
+                for (int e0 = 0; e0 < 64; e0 += 2) {
+                    const uint8_t* mq[2]; const float* ms[2];
+                    for (int j = 0; j < 2; j++) {
+                        mq[j] = C.map(lpm + std::to_string(e0 + j) + ".merged_weight");
+                        ms[j] = (const float*)C.map(lpm + std::to_string(e0 + j) + ".qs");
+                    }
+                    auto a = std::chrono::steady_clock::now();
+                    ce.run(2, mq, ms, rwv.data(), h.data(), cpu.data());
+                    tot += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - a).count();
+                }
+                printf("  mmap L%02d pass %d (%s): %.3f ms/expert over 64 experts\n", L, pass, pass ? "touched" : "first touch", tot / 64);
+            }
         }
     }
 

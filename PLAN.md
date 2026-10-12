@@ -56,8 +56,8 @@ Dense int8 → ~75 tok/s ceiling; dense int4 → ~110. So dense requantization i
 - [x] E5 `moex generate` CLI + per-phase profiler + tok/s
 
 ### Phase 3 — offload engine (the point of the project)
-- [ ] O1 CPU expert kernel (AVX2, int4 gs64, P-cores), checked vs reference
-- [ ] O2 Hybrid scheduler: resident experts on GPU, misses on CPU, overlapped per layer
+- [x] O1 CPU expert kernel (AVX2, int4 gs64, P-cores), checked vs reference
+- [x] O2 Hybrid scheduler: resident experts on GPU, misses on CPU, overlapped per layer
 - [ ] O3 Residency policy: LRU baseline → decayed-frequency (τ sweep)
 - [ ] O4 Prefetch on copy stream: cross-layer Markov predictor, PCIe budgeted
 - [ ] O5 Route traces for this model + port `simulate_policies.py` (old repo) to 256 experts
@@ -111,4 +111,16 @@ Dense int8 → ~75 tok/s ceiling; dense int4 → ~110. So dense requantization i
 | Expert slots | 542 (5.3%) | **1620 (15.8%)** |
 | Expert hit rate (LRU) | 45.2% | **75.5%** |
 | Decode, warm | 11.2 tok/s | **19.2 tok/s** = ~20 ms compute + 32 ms blocking misses |
+
+**O1 + O2 hybrid CPU/GPU MoE (measured):**
+
+| | |
+|---|---|
+| K14 CPU expert (AVX2, fp32) | rel 2e-7 vs GPU; 0.055-0.07 ms/expert from DRAM (8 threads, L3 flushed) |
+| Page-fault finding | first touch of a mapped expert 2.3-2.5 ms vs 0.06 ms touched -> experts read + faulted in at load, min working set raised to 19.2 GB |
+| Startup | 13 s (18.1 GB experts into RAM; was 25 s before sequential cache fill) |
+| Benchmark | `python moex.py "Write a short story about a robot who learns to paint." --chat --n 128` |
+| Decode | **30.8-33.3 tok/s**, hit 85% (LRU + background admission), 47 misses/tok on CPU = 7.5-10 ms/tok |
+| Correctness | `--check` PASS (int8 KL<=0.014; F16 KL 9e-12); F16 and int8 runs produce the identical 128-token text |
+| Known | greedy output loops on this prompt in both F16 and int8: model behavior, needs sampling (U5/K19) |
 
