@@ -49,11 +49,11 @@ Dense int8 → ~75 tok/s ceiling; dense int4 → ~110. So dense requantization i
 - [x] K9 lm_head GEMV + argmax (sampling later)
 
 ### Phase 2 — engine (all-GPU correctness)
-- [ ] E1 Loader: mmap safetensors, RAM budget, upload trunk to VRAM
-- [ ] E2 Expert arena: fixed slots in VRAM + slot table; on-demand H2D fetch on miss (simplest correct path)
-- [ ] E3 Decode step wiring all kernels; logits match reference
-- [ ] E4 Tokenizer (shortcut: Python `tokenizers` front-end at first)
-- [ ] E5 `moex generate` CLI + per-phase profiler + tok/s
+- [x] E1 Loader: mmap safetensors, RAM budget, upload trunk to VRAM
+- [x] E2 Expert arena: fixed slots in VRAM + slot table; on-demand H2D fetch on miss (simplest correct path)
+- [x] E3 Decode step wiring all kernels; logits match reference
+- [x] E4 Tokenizer (shortcut: Python `tokenizers` front-end at first)
+- [x] E5 `moex generate` CLI + per-phase profiler + tok/s
 
 ### Phase 3 — offload engine (the point of the project)
 - [ ] O1 CPU expert kernel (AVX2, int4 gs64, P-cores), checked vs reference
@@ -90,3 +90,14 @@ Dense int8 → ~75 tok/s ceiling; dense int4 → ~110. So dense requantization i
 
 **Phase 1 roll-up (all experts resident, F16 dense):** 30×0.430 + 10×0.337 + 40×0.255 (router+experts+shared+norms) + 6.25 (lm_head)
 ≈ **32.8 ms/token → ~30 tok/s** before fusion/graphs. Dense F16 is ~70% of it, which makes U1 (int8/int4 dense) the biggest lever.
+
+**Phase 2 (measured, `python moex.py "..." --chat --n 96`):**
+
+| | |
+|---|---|
+| E3 check | `moex --check ref/golden`: 12/12 greedy tokens identical, worst logits rel 3.3e-6 |
+| Load | 1.7-4.1 s from NVMe; **542 expert slots** fit (0.96 GB, 5.3% of experts) with F16 dense |
+| Decode, warm page cache | **11.2 tok/s**: ~30 ms compute + 59 ms blocking expert copies (45% hit, 175 misses/token) |
+| Decode, cold page cache | 3.4 tok/s (misses read from SSD) |
+| Prompt | token-by-token, 9 tok/s (no prefill path yet) |
+

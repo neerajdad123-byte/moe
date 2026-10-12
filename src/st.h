@@ -8,6 +8,9 @@
 #include <string>
 #include <unordered_map>
 #include <vector>
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#include <windows.h>
 
 struct StTensor {
     std::string file, dtype;
@@ -46,7 +49,23 @@ struct Container {
         return v;
     }
 
+    // Pointer into a read-only memory map of the tensor's file (the OS page cache is the RAM tier).
+    const uint8_t* map(const std::string& name) {
+        const StTensor& s = at(name);
+        auto it = maps.find(s.file);
+        if (it == maps.end()) {
+            HANDLE f = CreateFileA(s.file.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_FLAG_RANDOM_ACCESS, nullptr);
+            HANDLE m = f == INVALID_HANDLE_VALUE ? nullptr : CreateFileMappingA(f, nullptr, PAGE_READONLY, 0, 0, nullptr);
+            const void* p = m ? MapViewOfFile(m, FILE_MAP_READ, 0, 0, 0) : nullptr;
+            if (!p) { fprintf(stderr, "mmap failed: %s\n", s.file.c_str()); exit(1); }
+            it = maps.emplace(s.file, (const uint8_t*)p).first;  // mapped for the process lifetime
+        }
+        return it->second + s.off;
+    }
+
 private:
+    std::unordered_map<std::string, const uint8_t*> maps;
+
     // The header is flat JSON: {"name":{"dtype":"F16","shape":[..],"data_offsets":[a,b]},...}
     void index(const std::string& path) {
         FILE* f = fopen(path.c_str(), "rb");
