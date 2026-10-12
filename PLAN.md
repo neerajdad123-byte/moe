@@ -200,7 +200,7 @@ Routing changed with the fix (10-prompt hit 76% -> 71%): traces must be re-colle
 4. [x] OpenAI-compatible server (`moex serve`, port 8765, streaming, prefix reuse, stop strings)
 5. [x] C++ tokenizer, no Python needed (identical to HF on 54 cases / 66k tokens)
 6. [x] other GPUs: fat binary sm_75/80/86/89/90/120 + PTX (4.5 MB exe), slot cap for big GPUs, RAM check (no locking below ~23 GB), AVX2 check
-7. `moex download` for the HF container
+7. [x] `moex download` (WinHTTP, resumable, size-checked) into models\ next to moex.exe; missing model -> clear message
 8. [~] long context: int8 KV cache done (KL 2.95e-3, top-1 unchanged); split-K attention for >24k still to do
 9. README, release build, benchmark page
 

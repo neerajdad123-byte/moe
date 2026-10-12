@@ -745,6 +745,7 @@ struct Engine {
 
 #include "session.h"
 #include "serve.h"
+#include "download.h"
 
 // One line of user input as UTF-8 (the Windows console delivers non-ASCII input correctly only as UTF-16).
 static bool read_line(std::string& out) {
@@ -790,7 +791,7 @@ static bool has_avx2() {
 
 int main(int argc, char** argv) {
     if (!has_avx2()) { fprintf(stderr, "moex needs a CPU with AVX2 and FMA (Intel Haswell / AMD Zen or newer).\n"); return 1; }
-    std::string model = getenv("QWEN36_MODEL") ? getenv("QWEN36_MODEL") : "C:\\models\\qwen36_i4_gs64";
+    std::string model = default_model_dir(), only;
     std::string mode, system_prompt;
     bool think = false, samp_set = false, n_set = false;
     std::string host = "127.0.0.1";
@@ -808,6 +809,7 @@ int main(int argc, char** argv) {
         if (s == "--ids") ids = parse_ids(next());
         else if (s == "--n") { n = std::stoi(next()); n_set = true; }
         else if (s == "--model") model = next();
+        else if (s == "--only") only = next();
         else if (s == "--system") system_prompt = next();
         else if (s == "--think") think = true;
         else if (s == "--host") host = next();
@@ -836,7 +838,8 @@ int main(int argc, char** argv) {
         ids = parse_ids(m.substr(a, b - a));
     }
     if (mode.empty() && ids.empty() && batch.empty()) {
-        fprintf(stderr, "usage: moex chat [--system TEXT] [--think] [--temp T ...]\n"
+        fprintf(stderr, "usage: moex download                                 fetch the model (~22 GB, resumable)\n"
+                        "       moex chat [--system TEXT] [--think] [--temp T ...]\n"
                         "       moex serve [--port 8765] [--host 127.0.0.1]     OpenAI-compatible API\n"
                         "       moex --ids 1,2,3 [--n N] | --batch ids.txt | --check ref/golden\n"
                         "       options: --model DIR (default %s) --ctx N\n", model.c_str());
@@ -845,6 +848,11 @@ int main(int argc, char** argv) {
     if (mode == "chat" && !samp_set) { samp.temp = 0.7f; samp.top_p = 0.8f; samp.top_k = 20; }  // Qwen non-thinking defaults
     if (mode == "chat" && think && !samp_set) { samp.temp = 1.0f; samp.top_p = 0.95f; samp.top_k = 20; }  // thinking defaults
     if ((mode == "chat" || mode == "serve") && ctx == 2048) ctx = 8192;
+    if (mode == "download") return download_model(model, only);
+    if (!std::filesystem::exists(std::filesystem::path(model) / "config.json")) {
+        fprintf(stderr, "No model at %s.\nRun `moex download` first (or pass --model DIR).\n", model.c_str());
+        return 1;
+    }
 
     Engine eng(model.c_str(), ctx);
     eng.f16 = f16; eng.q4groups = q4groups; eng.samp = samp;
