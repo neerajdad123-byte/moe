@@ -66,7 +66,7 @@ struct Engine {
     float *h_h, *w_h, *y_h, *ycpu;  // pinned host / device
     int* ids_h;
     float* hw_d;
-    int* nh_d;
+    int *nh_d, *pos_d;
     cudaEvent_t ev_route;
     // Device copy of the slot table (key -> slot pointer, null = not resident), so the GPU picks its
     // hits without a host round trip. Updated in stream order on cs by table_k with values passed as
@@ -316,6 +316,7 @@ struct Engine {
         CK(cudaMalloc(&hw_d, TOPK * 4)); CK(cudaMalloc(&ycpu, D * 4)); CK(cudaMalloc(&nh_d, 4));
         CK(cudaMalloc(&table_d, NL * E * sizeof(void*))); CK(cudaMemset(table_d, 0, NL * E * sizeof(void*)));
         CK(cudaEventCreateWithFlags(&ev_route, cudaEventDisableTiming));
+        CK(cudaMalloc(&pos_d, 4));
         for (int i = 0; i < NSTAGE; i++) {
             CK(cudaMallocHost(&stage[i].buf, EXPERT_BYTES));
             CK(cudaEventCreateWithFlags(&stage[i].after_compute, cudaEventDisableTiming));
@@ -324,6 +325,7 @@ struct Engine {
         }
         loader = std::thread([this] { loader_main(); });
         pin_experts_in_ram();
+        capture_graphs();
         fprintf(stderr, "[load] %.1f s, dense %s, %d expert slots (%.2f GB, %.1f%% of %d experts), ctx %d\n",
                 now() - t0, f16 ? "F16" : "int8", nslots, nslots * (double)EXPERT_BYTES / 1e9, 100.0 * nslots / (NL * E), NL * E, ctx);
     }
@@ -338,42 +340,60 @@ struct Engine {
 
     void mark(int i, double& t) { if (prof) { CK(cudaStreamSynchronize(cs)); double n = now(); tp[i] += n - t; t = n; } }
 
+    // All of layer l's GPU work: mixer, post norm, router (+ routing to the host, ev_route), then the
+    // resident experts and the shared expert. Host-independent, so it is captured once as a CUDA graph:
+    // ~18 launches at ~7 us each on WDDM become one graph launch.
+    void enqueue_layer(int l) {
+        LayerW& w = L[l];
+        rmsnorm(x, l ? moe : nullptr, w.in_ln, h, D, EPS, 1, cs);  // folds in the previous layer's MoE output
+        if (is_attn(l)) {
+            gemv(w.attn_qkv, h, q, D, AH * 2 * AHD + 2 * AKV * AHD, cs);  // -> q, k, v
+            attn_decode(q, k, v, w.qn, w.kn, qo, w.K, w.V, ag, AH, AKV, pos_d, ctx, ROT, THETA, EPS, cs);
+            gemv(w.o, ag, tmp, AH * AHD, D, cs);
+        } else {
+            gemv(w.dn_in, h, big, D, DC + DVH * DNV + 2 * DVH, cs);  // -> qkv, z, a, b
+            deltanet_core(big, z, a, b, w.conv, w.alog, w.dtb, w.nw, w.ring, w.S, conv, o, DC, CONVK, DVH, DKH, EPS, cs);
+            gemv(w.out, o, tmp, DVH * DNV, D, cs);
+        }
+        rmsnorm(x, tmp, w.post_ln, h, D, EPS, 1, cs);
+        gemv_f16(w.router, h, scr, D, E, cs);
+        router_topk(scr, E, TOPK, false, ridx, rw, cs);
+        CK(cudaMemcpyAsync(ids_h, ridx, TOPK * 4, cudaMemcpyDeviceToHost, cs));
+        CK(cudaMemcpyAsync(w_h, rw, TOPK * 4, cudaMemcpyDeviceToHost, cs));
+        CK(cudaMemcpyAsync(h_h, h, D * 4, cudaMemcpyDeviceToHost, cs));
+        CK(cudaEventRecordWithFlags(ev_route, cs, cudaEventRecordExternal));  // host-visible even from a graph
+        // hits from the device slot table, then resident experts + shared expert, no host in the loop
+        route_hits_k<<<1, 32, 0, cs>>>(ridx, rw, TOPK, l * E, table_d, slots_d, hw_d, nh_d);
+        experts_forward(slots_d, hw_d, TOPK, h, act, moe, cs, nh_d);
+        shared_expert_add(w.sh_gu, w.sh_d, w.sh_gate, h, moe, scr, D, SI, cs);
+    }
+
+    std::vector<cudaGraphExec_t> graphs;
+    void capture_graphs() {
+        graphs.resize(NL);
+        for (int l = 0; l < NL; l++) {
+            cudaGraph_t g;
+            CK(cudaStreamBeginCapture(cs, cudaStreamCaptureModeThreadLocal));
+            enqueue_layer(l);
+            CK(cudaStreamEndCapture(cs, &g));
+            CK(cudaGraphInstantiate(&graphs[l], g, 0));
+            CK(cudaGraphDestroy(g));
+        }
+    }
+
     // One token at position `pos`. If want_logits, logits[] is filled and the greedy id returned.
     int step(int tok, int pos, bool want_logits) {
         tokens++;
         double t = now();
         for (int i = 0; i < D; i++) h_h[i] = __half2float(embed[(size_t)tok * D + i]);
         CK(cudaMemcpyAsync(x, h_h, D * 4, cudaMemcpyHostToDevice, cs));
-        const float* pending = nullptr;  // previous MoE output, added to x by the next norm
+        set_int_k<<<1, 1, 0, cs>>>(pos_d, pos);
         for (int l = 0; l < NL; l++) {
-            LayerW& w = L[l];
-            rmsnorm(x, pending, w.in_ln, h, D, EPS, 1, cs);
-            if (is_attn(l)) {
-                gemv(w.attn_qkv, h, q, D, AH * 2 * AHD + 2 * AKV * AHD, cs);  // -> q, k, v
-                attn_decode(q, k, v, w.qn, w.kn, qo, w.K, w.V, ag, AH, AKV, pos, ctx, ROT, THETA, EPS, cs);
-                gemv(w.o, ag, tmp, AH * AHD, D, cs);
-                mark(0, t);
-            } else {
-                gemv(w.dn_in, h, big, D, DC + DVH * DNV + 2 * DVH, cs);  // -> qkv, z, a, b
-                deltanet_core(big, z, a, b, w.conv, w.alog, w.dtb, w.nw, w.ring, w.S, conv, o, DC, CONVK, DVH, DKH, EPS, cs);
-                gemv(w.out, o, tmp, DVH * DNV, D, cs);
-                mark(1, t);
-            }
-            rmsnorm(x, tmp, w.post_ln, h, D, EPS, 1, cs);
             poll_admissions();
             flush_table();  // the GPU's view of residency for this layer == the host's ready[] below
-            gemv_f16(w.router, h, scr, D, E, cs);
-            router_topk(scr, E, TOPK, false, ridx, rw, cs);
-            CK(cudaMemcpyAsync(ids_h, ridx, TOPK * 4, cudaMemcpyDeviceToHost, cs));
-            CK(cudaMemcpyAsync(w_h, rw, TOPK * 4, cudaMemcpyDeviceToHost, cs));
-            CK(cudaMemcpyAsync(h_h, h, D * 4, cudaMemcpyDeviceToHost, cs));
-            CK(cudaEventRecord(ev_route, cs));
-            // GPU: hits from the device table, then resident experts + shared expert, no host in the loop
-            route_hits_k<<<1, 32, 0, cs>>>(ridx, rw, TOPK, l * E, table_d, slots_d, hw_d, nh_d);
-            experts_forward(slots_d, hw_d, TOPK, h, act, moe, cs, nh_d);
-            shared_expert_add(w.sh_gu, w.sh_d, w.sh_gate, h, moe, scr, D, SI, cs);
+            if (prof || graphs.empty()) enqueue_layer(l); else CK(cudaGraphLaunch(graphs[l], cs));
             CK(cudaEventSynchronize(ev_route));  // host needs the routing only for the misses
-            mark(2, t);
+            mark(0, t);
             if (trace) {
                 int16_t rec[12] = {(int16_t)trace_prompt, (int16_t)pos, (int16_t)l, (int16_t)trace_phase};
                 for (int j = 0; j < TOPK; j++) rec[4 + j] = (int16_t)ids_h[j];
@@ -389,7 +409,7 @@ struct Engine {
                 if (sl >= 0 && ready[sl]) hits++;
                 else { mq[nm] = eq[key]; msc[nm] = es[key]; mw[nm] = w_h[j]; mkey[nm++] = sl < 0 ? key : -1; misses++; }
             }
-            // CPU: misses, overlapped with the GPU work above
+            // CPU: misses, overlapped with the GPU's experts + shared expert
             if (nm) {
                 double c0 = now();
                 cpu.run(nm, mq, msc, mw, h_h, y_h);
@@ -399,9 +419,9 @@ struct Engine {
                 for (int j = 0; j < nm; j++) if (mkey[j] >= 0) admit(mkey[j]);
                 start_admissions();
             }
-            mark(3, t);
-            pending = moe;
+            mark(1, t);
         }
+        const float* pending = moe;
         // the last MoE output is folded into x here, or by the next token's first norm
         rmsnorm(x, pending, norm, h, D, EPS, 1, cs);
         if (!want_logits) return -1;
@@ -409,7 +429,7 @@ struct Engine {
         argmax(logits, V, amv, ams, tok_d, cs);
         CK(cudaMemcpyAsync(ids_h, tok_d, 4, cudaMemcpyDeviceToHost, cs));
         CK(cudaStreamSynchronize(cs));
-        mark(4, t);
+        mark(2, t);
         return ids_h[0];
     }
 };
@@ -543,9 +563,9 @@ int main(int argc, char** argv) {
     Stats st = generate(ids, out, true);
     report("decode", st);
     if (prof) {
-        const char* nm[] = {"attention", "deltanet", "router+sync", "moe (gpu+cpu)", "lm_head+argmax"};
-        double tot = 0; for (int i = 0; i < 5; i++) tot += eng.tp[i];
-        for (int i = 0; i < 5; i++) fprintf(stderr, "  %-15s %7.2f ms/tok  %5.1f%%\n", nm[i], 1e3 * eng.tp[i] / std::max(st.dec, 1), 100 * eng.tp[i] / tot);
+        const char* nm[] = {"layers (gpu)", "misses (cpu)", "lm_head+argmax"};
+        double tot = 0; for (int i = 0; i < 3; i++) tot += eng.tp[i];
+        for (int i = 0; i < 3; i++) fprintf(stderr, "  %-15s %7.2f ms/tok  %5.1f%%\n", nm[i], 1e3 * eng.tp[i] / std::max(st.dec, 1), 100 * eng.tp[i] / tot);
     }
     if (eng.trace) fclose(eng.trace);
     return 0;

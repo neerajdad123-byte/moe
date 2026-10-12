@@ -306,8 +306,9 @@ constexpr int AHD = 256;
 __global__ void qk_norm_rope_k(const float* __restrict__ q, const float* __restrict__ k, const float* __restrict__ v,
                                const half* __restrict__ qn, const half* __restrict__ kn,
                                float* __restrict__ qo, float* __restrict__ Kc, float* __restrict__ Vc,
-                               int H, int KV, int pos, int max_t, int rot, float theta, float eps) {
+                               int H, int KV, const int* __restrict__ pos_d, int max_t, int rot, float theta, float eps) {
     __shared__ float t[AHD];
+    const int pos = *pos_d;  // device-side so a captured CUDA graph sees each token's position
     int hh = blockIdx.x, d = threadIdx.x;  // blocks [0,H) query heads, [H,H+KV) key heads
     bool isq = hh < H;
     float x = isq ? q[hh * 2 * AHD + d] : k[(hh - H) * AHD + d];
@@ -335,8 +336,9 @@ __global__ void qk_norm_rope_k(const float* __restrict__ q, const float* __restr
 // shortcut: whole score row in shared memory (T <= ~24k with opt-in smem); split-K when contexts grow.
 __global__ void attn_decode_k(const float* __restrict__ qo, const float* __restrict__ q_gate,
                               const float* __restrict__ Kc, const float* __restrict__ Vc,
-                              float* __restrict__ out, int H, int KV, int T, int max_t) {
-    extern __shared__ float sc[];  // [T]
+                              float* __restrict__ out, int H, int KV, const int* __restrict__ pos_d, int max_t) {
+    extern __shared__ float sc[];  // [max_t]
+    const int T = *pos_d + 1;
     __shared__ __align__(16) float qs[AHD];
     int h = blockIdx.x, kvh = h / (H / KV), tid = threadIdx.x, lane = tid & 31, wid = tid >> 5;
     qs[tid] = qo[h * AHD + tid];
@@ -368,13 +370,16 @@ __global__ void attn_decode_k(const float* __restrict__ qo, const float* __restr
     out[h * AHD + tid] = acc * inv / (1.f + __expf(-g));
 }
 
+// pos_d: device int, the position being decoded. Shared memory is sized for max_t (fixed per launch
+// shape, so the same launch can be replayed from a graph at any position).
 inline void attn_decode(const float* q, const float* k, const float* v, const half* qn, const half* kn,
-                        float* qo, float* Kc, float* Vc, float* out, int H, int KV, int pos, int max_t,
+                        float* qo, float* Kc, float* Vc, float* out, int H, int KV, const int* pos_d, int max_t,
                         int rot, float theta, float eps, cudaStream_t st = 0) {
-    qk_norm_rope_k<<<H + KV, AHD, 0, st>>>(q, k, v, qn, kn, qo, Kc, Vc, H, KV, pos, max_t, rot, theta, eps);
-    int T = pos + 1;
-    attn_decode_k<<<H, AHD, T * sizeof(float), st>>>(qo, q, Kc, Vc, out, H, KV, T, max_t);
+    qk_norm_rope_k<<<H + KV, AHD, 0, st>>>(q, k, v, qn, kn, qo, Kc, Vc, H, KV, pos_d, max_t, rot, theta, eps);
+    attn_decode_k<<<H, AHD, max_t * sizeof(float), st>>>(qo, q, Kc, Vc, out, H, KV, pos_d, max_t);
 }
+
+__global__ void set_int_k(int* p, int v) { *p = v; }
 
 // ---- K8: Gated DeltaNet decode ----
 // Conv: causal depthwise conv (kernel CK) over C channels with a carried ring [C][CK-1], then SiLU.

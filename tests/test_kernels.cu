@@ -330,9 +330,12 @@ int main(int argc, char** argv) {
         float *h = dalloc(D), *q = dalloc(H * 2 * AHD), *k = dalloc(KV * AHD), *v = dalloc(KV * AHD),
               *qo = dalloc(H * AHD), *ag = dalloc(H * AHD), *o = dalloc(D);
         float *Kc = dalloc((size_t)KV * MAXT * AHD), *Vc = dalloc((size_t)KV * MAXT * AHD);
+        int* pos_d; CK(cudaMalloc(&pos_d, 4));
+        CK(cudaFuncSetAttribute(attn_decode_k, cudaFuncAttributeMaxDynamicSharedMemorySize, MAXT * 4));
         auto step = [&](int p) {
+            set_int_k<<<1, 1>>>(pos_d, p);
             gemv_f16(Wq, h, q, D, H * 2 * AHD); gemv_f16(Wk, h, k, D, KV * AHD); gemv_f16(Wv, h, v, D, KV * AHD);
-            attn_decode(q, k, v, qn, kn, qo, Kc, Vc, ag, H, KV, p, MAXT, ROT, 1e7f, EPS);
+            attn_decode(q, k, v, qn, kn, qo, Kc, Vc, ag, H, KV, pos_d, MAXT, ROT, 1e7f, EPS);
             gemv_f16(Wo, ag, o, H * AHD, D);
         };
         double worst_q = 0, worst_o = 0;
@@ -353,9 +356,9 @@ int main(int argc, char** argv) {
                worst_q < 1e-5 && worst_o < 1e-5 ? "PASS" : "FAIL");
         if (!(worst_q < 1e-5 && worst_o < 1e-5)) g_fail++;
         bench("attn layer (proj+core) T=12", (8192.0 + 512 + 512) * D * 2 + 2048.0 * 4096 * 2, [&] { step(NPOS - 1); });
-        CK(cudaFuncSetAttribute(attn_decode_k, cudaFuncAttributeMaxDynamicSharedMemorySize, MAXT * 4));
+        set_int_k<<<1, 1>>>(pos_d, MAXT - 1);
         bench("attn core T=4096", 2.0 * KV * 4096 * AHD * 4, [&] {
-            attn_decode_k<<<H, AHD, MAXT * 4>>>(qo, q, Kc, Vc, ag, H, KV, MAXT, MAXT); });
+            attn_decode_k<<<H, AHD, MAXT * 4>>>(qo, q, Kc, Vc, ag, H, KV, pos_d, MAXT); });
     }
 
     if (want(filt, "K8")) {
