@@ -286,6 +286,14 @@ __global__ void silu_mul_k(float* __restrict__ a, const float* __restrict__ b, i
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) { float g = a[i]; a[i] = g / (1.f + __expf(-g)) * b[i]; }
 }
+// Routing for the host, written straight into mapped host memory: MoE input h, top-K ids and weights.
+__global__ void export_route_k(const float* __restrict__ h, const int* __restrict__ idx, const float* __restrict__ w,
+                               float* h_out, int* idx_out, float* w_out, int D, int K) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < D) h_out[i] = h[i];
+    if (i < K) { idx_out[i] = idx[i]; w_out[i] = w[i]; }
+}
+
 // out[i] += y[i]
 __global__ void add_k(float* __restrict__ out, const float* __restrict__ y, int n) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;

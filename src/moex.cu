@@ -63,7 +63,12 @@ struct Engine {
     std::vector<const float*> es;    // and their scales
     // CPU side of the MoE
     CpuExperts cpu{getenv("MOEX_CPU_THREADS") ? atoi(getenv("MOEX_CPU_THREADS")) : 8};
-    float *h_h, *w_h, *y_h, *ycpu;  // pinned host / device
+    // Host buffers mapped into the GPU's address space (zero-copy): kernels write the routing straight to the
+    // host and read the CPU experts' result straight from it, so a layer needs no memcpy operations
+    // (each small async copy costs a separate DMA op, ~10-20 us on WDDM; ~10% of the decode timeline).
+    float *h_h, *w_h, *y_h;           // host views
+    float *h_hd, *w_hd, *y_hd;        // device views of the same memory
+    int* ids_hd;
     int* ids_h;
     float* hw_d;
     int *nh_d, *pos_d;
@@ -311,9 +316,12 @@ struct Engine {
             eq[l * E + e] = C.map(ep + "merged_weight");
             es[l * E + e] = (const float*)C.map(ep + "qs");
         }
-        CK(cudaMallocHost(&h_h, D * 4)); CK(cudaMallocHost(&y_h, D * 4)); CK(cudaMallocHost(&w_h, TOPK * 4));
-        CK(cudaMallocHost(&ids_h, TOPK * 4));
-        CK(cudaMalloc(&hw_d, TOPK * 4)); CK(cudaMalloc(&ycpu, D * 4)); CK(cudaMalloc(&nh_d, 4));
+        auto mapped = [](auto** hp, auto** dp, size_t bytes) {
+            CK(cudaHostAlloc((void**)hp, bytes, cudaHostAllocMapped));
+            CK(cudaHostGetDevicePointer((void**)dp, *hp, 0));
+        };
+        mapped(&h_h, &h_hd, D * 4); mapped(&y_h, &y_hd, D * 4); mapped(&w_h, &w_hd, TOPK * 4); mapped(&ids_h, &ids_hd, TOPK * 4);
+        CK(cudaMalloc(&hw_d, TOPK * 4)); CK(cudaMalloc(&nh_d, 4));
         CK(cudaMalloc(&table_d, NL * E * sizeof(void*))); CK(cudaMemset(table_d, 0, NL * E * sizeof(void*)));
         CK(cudaEventCreateWithFlags(&ev_route, cudaEventDisableTiming));
         CK(cudaMalloc(&pos_d, 4));
@@ -358,9 +366,7 @@ struct Engine {
         rmsnorm(x, tmp, w.post_ln, h, D, EPS, 1, cs);
         gemv_f16(w.router, h, scr, D, E, cs);
         router_topk(scr, E, TOPK, false, ridx, rw, cs);
-        CK(cudaMemcpyAsync(ids_h, ridx, TOPK * 4, cudaMemcpyDeviceToHost, cs));
-        CK(cudaMemcpyAsync(w_h, rw, TOPK * 4, cudaMemcpyDeviceToHost, cs));
-        CK(cudaMemcpyAsync(h_h, h, D * 4, cudaMemcpyDeviceToHost, cs));
+        export_route_k<<<(D + 255) / 256, 256, 0, cs>>>(h, ridx, rw, h_hd, ids_hd, w_hd, D, TOPK);
         CK(cudaEventRecordWithFlags(ev_route, cs, cudaEventRecordExternal));  // host-visible even from a graph
         // hits from the device slot table, then resident experts + shared expert, no host in the loop
         route_hits_k<<<1, 32, 0, cs>>>(ridx, rw, TOPK, l * E, table_d, slots_d, hw_d, nh_d);
@@ -414,8 +420,7 @@ struct Engine {
                 double c0 = now();
                 cpu.run(nm, mq, msc, mw, h_h, y_h);
                 cpu_s += now() - c0;
-                CK(cudaMemcpyAsync(ycpu, y_h, D * 4, cudaMemcpyHostToDevice, cs));
-                add_k<<<(D + 255) / 256, 256, 0, cs>>>(moe, ycpu, D);
+                add_k<<<(D + 255) / 256, 256, 0, cs>>>(moe, y_hd, D);  // reads the host buffer over PCIe
                 for (int j = 0; j < nm; j++) if (mkey[j] >= 0) admit(mkey[j]);
                 start_admissions();
             }
