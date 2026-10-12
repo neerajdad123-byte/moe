@@ -120,6 +120,51 @@ int main(int argc, char** argv) {
         bench("lm_head 248320x2048", (double)V * D * 2, [&] { gemv_f16(lm, h, logits, D, V); }, 20);
     }
 
+    if (want(filt, "K3") || want(filt, "K4") || want(filt, "K5")) {
+        printf("K3 router + K4 experts + K5 shared expert\n");
+        const int E = 256, K = 8, SI = 512;
+        float *logits = dalloc(E), *w = dalloc(K), *act = dalloc(K * EI), *out = dalloc(D), *scr = dalloc(2 * SI + D + 1);
+        int* idx; CK(cudaMalloc(&idx, K * 4));
+        uint8_t* arena; CK(cudaMalloc(&arena, K * EXPERT_BYTES));
+        const uint8_t** slots; CK(cudaMalloc(&slots, K * sizeof(void*)));
+        for (int L : {0, 3, 39}) {
+            char pf[32]; snprintf(pf, sizeof pf, "%sL%02d_", P.c_str(), L);
+            std::string lp = "model.layers." + std::to_string(L) + ".mlp.";
+            half* Wr = wup(C, lp + "gate.weight");
+            float* h = up(golden(pf + std::string("moe_in")));
+            gemv_f16(Wr, h, logits, D, E);
+            check((std::string(pf) + "router logits").c_str(), down(logits, E), golden(pf + std::string("router_logits")), 1e-5f);
+            router_topk(logits, E, K, false, idx, w);
+            std::vector<int> gi(K); CK(cudaMemcpy(gi.data(), idx, K * 4, cudaMemcpyDeviceToHost));
+            auto ri = golden(pf + std::string("route_idx"));  // int32 bits read as float
+            bool same = !memcmp(gi.data(), ri.data(), K * 4);
+            printf("  %-34s %s\n", (std::string(pf) + "top-8 ids").c_str(), same ? "PASS" : "FAIL"); if (!same) g_fail++;
+            check((std::string(pf) + "top-8 weights").c_str(), down(w, K), golden(pf + std::string("route_w")), 1e-5f);
+            // load the selected experts into the arena (test stand-in for the slot cache)
+            std::vector<const uint8_t*> hs(K);
+            for (int k = 0; k < K; k++) {
+                std::string ep = lp + "experts." + std::to_string(gi[k]) + ".";
+                auto q = C.read(ep + "merged_weight"), s = C.read(ep + "qs");
+                uint8_t* dst = arena + k * EXPERT_BYTES;
+                CK(cudaMemcpy(dst, q.data(), q.size(), cudaMemcpyHostToDevice));
+                CK(cudaMemcpy(dst + EXPERT_Q_BYTES, s.data(), s.size(), cudaMemcpyHostToDevice));
+                hs[k] = dst;
+            }
+            CK(cudaMemcpy(slots, hs.data(), K * sizeof(void*), cudaMemcpyHostToDevice));
+            half *Wg = wup(C, lp + "shared_expert.gate_proj.weight"), *Wu = wup(C, lp + "shared_expert.up_proj.weight"),
+                 *Wd = wup(C, lp + "shared_expert.down_proj.weight"), *Ws = wup(C, lp + "shared_expert_gate.weight");
+            experts_forward(slots, w, K, h, act, out);
+            shared_expert_add(Wg, Wu, Wd, Ws, h, out, scr, D, SI);
+            check((std::string(pf) + "routed+shared -> moe_out").c_str(), down(out, D), golden(pf + std::string("moe_out")), 1e-5f);
+            if (L == 0) {
+                bench("router gemv 256x2048 + topk", 256.0 * D * 2, [&] { gemv_f16(Wr, h, logits, D, E); router_topk(logits, E, K, false, idx, w); });
+                bench("experts x8 int4 gs64", (double)K * EXPERT_BYTES, [&] { experts_forward(slots, w, K, h, act, out); });
+                bench("shared expert F16", 3.0 * SI * D * 2, [&] { shared_expert_add(Wg, Wu, Wd, Ws, h, out, scr, D, SI); });
+            }
+            for (void* p : {(void*)Wr, (void*)h, (void*)Wg, (void*)Wu, (void*)Wd, (void*)Ws}) CK(cudaFree(p));
+        }
+    }
+
     printf(g_fail ? "\n%d FAILED\n" : "\nALL PASS\n", g_fail);
     return g_fail != 0;
 }
