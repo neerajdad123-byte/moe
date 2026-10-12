@@ -72,28 +72,42 @@ inline void gemv_f16(const half* W, const float* x, float* y, int I, int O, cuda
 }
 
 // ---- K10: int8 dense GEMV, y[r] = s[r] * (Q[r,:] . x), per-row symmetric scale ----
-// One warp per row, 16-byte loads (16 int8) per lane. Requires I % 512 == 0.
-template <int WARPS>
+// R rows per warp (their loads are issued together for memory-level parallelism), 16-byte loads
+// (16 int8) per lane. Requires I % 512 == 0.
+template <int WARPS, int R>
 __global__ void gemv_i8_k(const int8_t* __restrict__ Q, const float* __restrict__ s, const float* __restrict__ x,
                           float* __restrict__ y, int I, int O) {
-    int row = blockIdx.x * WARPS + (threadIdx.x >> 5), lane = threadIdx.x & 31;
-    if (row >= O) return;
-    const uint4* wr = reinterpret_cast<const uint4*>(Q + (size_t)row * I);
+    int row0 = (blockIdx.x * WARPS + (threadIdx.x >> 5)) * R, lane = threadIdx.x & 31;
+    if (row0 >= O) return;
     const float4* xv = reinterpret_cast<const float4*>(x);
-    float acc = 0.f;
-#pragma unroll 4
+    float acc[R] = {};
+#pragma unroll 2
     for (int c = lane; c < I / 16; c += 32) {
-        uint4 u = __ldcs(wr + c);
-        const uint32_t w[4] = {u.x, u.y, u.z, u.w};
+        uint4 u[R];
+#pragma unroll
+        for (int r = 0; r < R; r++) u[r] = row0 + r < O ? __ldcs(reinterpret_cast<const uint4*>(Q + (size_t)(row0 + r) * I) + c) : make_uint4(0, 0, 0, 0);
 #pragma unroll
         for (int j = 0; j < 4; j++) {
             float4 xx = __ldg(xv + 4 * c + j);
-            acc += (float)(int8_t)(w[j]) * xx.x + (float)(int8_t)(w[j] >> 8) * xx.y +
-                   (float)(int8_t)(w[j] >> 16) * xx.z + (float)(int8_t)(w[j] >> 24) * xx.w;
+#pragma unroll
+            for (int r = 0; r < R; r++) {
+                uint32_t w = (&u[r].x)[j];
+                acc[r] += (float)(int8_t)(w) * xx.x + (float)(int8_t)(w >> 8) * xx.y +
+                          (float)(int8_t)(w >> 16) * xx.z + (float)(int8_t)(w >> 24) * xx.w;
+            }
         }
     }
-    acc = warp_sum(acc);
-    if (lane == 0) y[row] = acc * s[row];
+#pragma unroll
+    for (int r = 0; r < R; r++) {
+        float v = warp_sum(acc[r]);
+        if (lane == 0 && row0 + r < O) y[row0 + r] = v * s[row0 + r];
+    }
+}
+
+template <int WARPS, int R>
+inline void gemv_i8(const int8_t* q, const float* s, const float* x, float* y, int I, int O, cudaStream_t st = 0) {
+    int rows_per_block = WARPS * R;
+    gemv_i8_k<WARPS, R><<<(O + rows_per_block - 1) / rows_per_block, WARPS * 32, 0, st>>>(q, s, x, y, I, O);
 }
 
 // F16 [O,I] -> int8 [O,I] + f32 scale per row (absmax / 127). One block per row.
@@ -121,7 +135,7 @@ struct Mat {
 
 inline void gemv(const Mat& m, const float* x, float* y, int I, int O, cudaStream_t st = 0) {
     constexpr int WARPS = 8;
-    if (m.q) gemv_i8_k<WARPS><<<(O + WARPS - 1) / WARPS, WARPS * 32, 0, st>>>(m.q, m.s, x, y, I, O);
+    if (m.q) gemv_i8<WARPS, 1>(m.q, m.s, x, y, I, O, st);
     else gemv_f16(m.f16, x, y, I, O, st);
 }
 
@@ -186,8 +200,9 @@ __device__ __forceinline__ float dot32_i4(uint4 u, const float* __restrict__ x) 
 
 // act[k][I] = silu(gate_k . x) * (up_k . x). One warp per (expert, row); rows are 1024 B = 64 uint4.
 template <int WARPS>
-__global__ void expert_gate_up_k(const uint8_t* const* __restrict__ slots, const float* __restrict__ x,
-                                 float* __restrict__ act) {
+__global__ void expert_gate_up_k(const uint8_t* const* __restrict__ slots, const int* __restrict__ nh,
+                                 const float* __restrict__ x, float* __restrict__ act) {
+    if (nh && (int)(blockIdx.x * WARPS / EI) >= *nh) return;  // whole block is one expert: past the hit count
     __shared__ __align__(16) float xs[EH];
     for (int i = threadIdx.x; i < EH; i += blockDim.x) xs[i] = x[i];
     __syncthreads();
@@ -214,7 +229,8 @@ __global__ void expert_gate_up_k(const uint8_t* const* __restrict__ slots, const
 // so a warp covers two experts per iteration.
 template <int WARPS>
 __global__ void expert_down_k(const uint8_t* const* __restrict__ slots, const float* __restrict__ w, int K,
-                              const float* __restrict__ act, float* __restrict__ out) {
+                              const int* __restrict__ nh, const float* __restrict__ act, float* __restrict__ out) {
+    if (nh) K = *nh;
     extern __shared__ __align__(16) float as[];  // [K][EI]
     for (int i = threadIdx.x; i < K * EI; i += blockDim.x) as[i] = act[i];
     __syncthreads();
@@ -231,12 +247,37 @@ __global__ void expert_down_k(const uint8_t* const* __restrict__ slots, const fl
     if (lane == 0) out[d] = acc;
 }
 
-// slots: device array of K slot pointers; w: device top-K weights; act: scratch [K*EI].
+// slots: device array of up to K slot pointers; w: device weights; act: scratch [K*EI].
+// nh: optional device count of valid entries (<= K), so the GPU can decide hits without the host;
+// with nh == 0 the output is all zeros.
 inline void experts_forward(const uint8_t* const* slots, const float* w, int K, const float* x,
-                            float* act, float* out, cudaStream_t st = 0) {
+                            float* act, float* out, cudaStream_t st = 0, const int* nh = nullptr) {
     constexpr int WARPS = 8;
-    expert_gate_up_k<WARPS><<<K * EI / WARPS, WARPS * 32, 0, st>>>(slots, x, act);
-    expert_down_k<WARPS><<<EH / WARPS, WARPS * 32, K * EI * sizeof(float), st>>>(slots, w, K, act, out);
+    expert_gate_up_k<WARPS><<<K * EI / WARPS, WARPS * 32, 0, st>>>(slots, nh, x, act);
+    expert_down_k<WARPS><<<EH / WARPS, WARPS * 32, K * EI * sizeof(float), st>>>(slots, w, K, nh, act, out);
+}
+
+// Batched slot-table writes, passed by value so each lands with the value it had when enqueued.
+struct TableUpd {
+    static constexpr int N = 32;
+    int n = 0;
+    int key[N];
+    const uint8_t* ptr[N];
+};
+__global__ void table_k(const uint8_t** table, TableUpd u) {
+    if ((int)threadIdx.x < u.n) table[u.key[threadIdx.x]] = u.ptr[threadIdx.x];
+}
+
+// Hits of this layer's routing, decided on the GPU from the device slot table (null = not resident).
+// Writes the compacted slot pointers and weights, and their count. One warp.
+__global__ void route_hits_k(const int* __restrict__ idx, const float* __restrict__ w, int K, int key_base,
+                             const uint8_t* const* __restrict__ table, const uint8_t** __restrict__ slots,
+                             float* __restrict__ hw, int* __restrict__ nh) {
+    int j = threadIdx.x;
+    const uint8_t* p = j < K ? table[key_base + idx[j]] : nullptr;
+    unsigned m = __ballot_sync(0xffffffffu, p != nullptr);
+    if (p) { int o = __popc(m & ((1u << j) - 1)); slots[o] = p; hw[o] = w[j]; }
+    if (j == 0) *nh = __popc(m);
 }
 
 // ---- K5 helpers: shared expert ----
@@ -419,13 +460,12 @@ inline void argmax(const float* x, int n, float* sv, int* si, int* out, cudaStre
     argmax_k<<<1, 256, 0, st>>>(sv, si, ARGMAX_BLOCKS, sv + ARGMAX_BLOCKS, out);
 }
 
-// Shared expert added into `out`. gate/up [SI,H], down [H,SI], sgate F16 [1,H].
+// Shared expert added into `out`. gate+up fused [2*SI,H], down [H,SI], sgate F16 [1,H].
 // scratch: >= 2*SI + H + 1 floats.
-inline void shared_expert_add(const Mat& Wg, const Mat& Wu, const Mat& Wd, const half* Wsg,
+inline void shared_expert_add(const Mat& Wgu, const Mat& Wd, const half* Wsg,
                               const float* x, float* out, float* scratch, int H, int SI, cudaStream_t st = 0) {
     float *g = scratch, *u = g + SI, *sh = u + SI, *sl = sh + H;
-    gemv(Wg, x, g, H, SI, st);
-    gemv(Wu, x, u, H, SI, st);
+    gemv(Wgu, x, g, H, 2 * SI, st);  // fused [gate; up] -> g, u
     gemv_f16(Wsg, x, sl, H, 1, st);
     silu_mul_k<<<(SI + 255) / 256, 256, 0, st>>>(g, u, SI);
     gemv(Wd, g, sh, SI, H, st);

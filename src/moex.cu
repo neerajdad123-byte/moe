@@ -30,8 +30,9 @@ constexpr float EPS = 1e-6f, THETA = 1e7f;
 static bool is_attn(int l) { return l % 4 == 3; }
 
 struct LayerW {
-    half *in_ln, *post_ln, *router, *sh_gate, *qn, *kn, *a, *b, *conv, *nw, *alog, *dtb;  // small: F16 always
-    Mat sh_g, sh_u, sh_d, q, k, v, o, qkv, z, out;                                        // big: int8 unless --f16
+    half *in_ln, *post_ln, *router, *sh_gate, *qn, *kn, *conv, *nw, *alog, *dtb;  // small: F16 always
+    // big: int8 unless --f16. Projections that share an input are one fused matrix (one launch, less tail):
+    Mat sh_gu, sh_d, attn_qkv, o, dn_in, out;  // sh_gu=[gate;up], attn_qkv=[q;k;v], dn_in=[qkv;z;a;b]
     float *K, *V, *ring, *S;                                          // state
 };
 
@@ -62,10 +63,24 @@ struct Engine {
     std::vector<const float*> es;    // and their scales
     // CPU side of the MoE
     CpuExperts cpu{getenv("MOEX_CPU_THREADS") ? atoi(getenv("MOEX_CPU_THREADS")) : 8};
-    float *h_h, *w_h, *y_h, *hw_h, *ycpu;  // pinned host / device
+    float *h_h, *w_h, *y_h, *ycpu;  // pinned host / device
     int* ids_h;
-    const uint8_t** hs_h;
     float* hw_d;
+    int* nh_d;
+    cudaEvent_t ev_route;
+    // Device copy of the slot table (key -> slot pointer, null = not resident), so the GPU picks its
+    // hits without a host round trip. Updated in stream order on cs by table_k with values passed as
+    // kernel arguments (a pinned-memory copy would read the host value at execution time, not enqueue time).
+    const uint8_t** table_d;
+    TableUpd upd;
+    std::vector<int> new_jobs;
+    void table_set(int key, const uint8_t* p) {
+        if (upd.n == TableUpd::N) flush_table();
+        upd.key[upd.n] = key; upd.ptr[upd.n++] = p;
+    }
+    void flush_table() {
+        if (upd.n) { table_k<<<1, TableUpd::N, 0, cs>>>(table_d, upd); upd.n = 0; }
+    }
     // admission: loader thread copies mmap -> pinned stage -> slot on the copy stream
     static constexpr int NSTAGE = 32;
     struct Stage { uint8_t* buf; cudaEvent_t after_compute, done; int slot = -1, key = -1; };
@@ -155,27 +170,48 @@ struct Engine {
             int i = flying.front(); flying.pop_front();
             if (cudaEventQuery(stage[i].done) == cudaSuccess) {
                 Stage& st = stage[i];
-                if (owner[st.slot] == st.key) ready[st.slot] = 1;
+                if (owner[st.slot] == st.key) { ready[st.slot] = 1; table_set(st.key, arena + (size_t)st.slot * EXPERT_BYTES); }
                 inflight[st.slot] = 0;
                 free_st.push_back(i);
             } else flying.push_back(i);
         }
     }
 
-    // Start copying expert `key` into the LRU victim slot; skipped when all stages are busy.
+    // Eviction score: decayed use count with a 10-token half-life (log domain). Measured on 80-prompt
+    // traces (tools/sim.py): 82.0% hit vs 80.8% LRU; longer half-lives lose (tau 200: 69%).
+    static constexpr double TAU = 10.0;
+    std::vector<double> G = std::vector<double>(NL * E, -INFINITY);
+    long long tokens = 0;
+    void touch(int key) {
+        double v = tokens / TAU, g = G[key];
+        G[key] = g == -INFINITY ? v : std::max(g, v) + log1p(exp(-fabs(g - v)));
+    }
+
+    // Start copying expert `key` into the lowest-scoring slot not used this layer step; skipped when all stages are busy.
     void admit(int key) {
         if (free_st.empty()) return;
-        int s = -1; uint64_t best = ~0ull;
-        for (int i = 0; i < nslots; i++) if (!inflight[i] && last[i] < best) { best = last[i]; s = i; }
+        int s = -1; double best = INFINITY;
+        for (int i = 0; i < nslots; i++) {
+            double sc = owner[i] < 0 ? -INFINITY : G[owner[i]];
+            if (!inflight[i] && last[i] != clock && sc < best) { best = sc; s = i; }
+        }
         if (s < 0) return;
-        if (owner[s] >= 0) slot_of[owner[s]] = -1;
+        if (owner[s] >= 0) { slot_of[owner[s]] = -1; if (ready[s]) table_set(owner[s], nullptr); }
         owner[s] = key; slot_of[key] = s; ready[s] = 0; inflight[s] = 1; last[s] = clock;
         int i = free_st.back(); free_st.pop_back();
         stage[i].slot = s; stage[i].key = key;
-        CK(cudaEventRecord(stage[i].after_compute, cs));
         admits++;
+        new_jobs.push_back(i);
+    }
+    // After a layer's admit() calls: evictions reach the device table, then the copies may start
+    // (each waits for everything enqueued on cs so far, which includes the last reads of its victim).
+    void start_admissions() {
+        if (new_jobs.empty()) return;
+        flush_table();
+        for (int i : new_jobs) CK(cudaEventRecord(stage[i].after_compute, cs));
         std::lock_guard<std::mutex> g(mu);
-        todo.push_back(i);
+        for (int i : new_jobs) todo.push_back(i);
+        new_jobs.clear();
     }
 
     half* wup(const std::string& n, int64_t numel) {
@@ -185,16 +221,27 @@ struct Engine {
         CK(cudaMemcpy(d, C.map(n), s.bytes, cudaMemcpyHostToDevice));
         return d;
     }
-    Mat wmat(const std::string& n, int64_t O, int64_t I) {
-        if (f16) return {wup(n, O * I)};
-        const StTensor& st = C.at(n);
-        if ((int64_t)st.bytes != O * I * 2) { fprintf(stderr, "shape mismatch %s\n", n.c_str()); exit(1); }
-        CK(cudaMemcpy(qtmp, C.map(n), st.bytes, cudaMemcpyHostToDevice));
-        int8_t* q; float* sc;
-        CK(cudaMalloc(&q, O * I)); CK(cudaMalloc(&sc, O * 4));
-        quantize_rows_i8_k<<<(int)O, 256>>>(qtmp, q, sc, (int)I);
-        CK(cudaGetLastError());
-        return {nullptr, q, sc};
+    // Row-concatenation of matrices with the same input width I, as F16 or int8 + per-row scales.
+    Mat wmat(std::initializer_list<std::pair<std::string, int64_t>> parts, int64_t I) {
+        int64_t O = 0;
+        for (auto& [n, rows] : parts) {
+            if ((int64_t)C.at(n).bytes != rows * I * 2) { fprintf(stderr, "shape mismatch %s\n", n.c_str()); exit(1); }
+            O += rows;
+        }
+        half* f = nullptr; int8_t* q = nullptr; float* sc = nullptr;
+        if (f16) CK(cudaMalloc(&f, O * I * 2));
+        else { CK(cudaMalloc(&q, O * I)); CK(cudaMalloc(&sc, O * 4)); }
+        int64_t off = 0;
+        for (auto& [n, rows] : parts) {
+            if (f16) CK(cudaMemcpy(f + off * I, C.map(n), rows * I * 2, cudaMemcpyHostToDevice));
+            else {  // the synchronous copy also orders qtmp's reuse after the previous quantize
+                CK(cudaMemcpy(qtmp, C.map(n), rows * I * 2, cudaMemcpyHostToDevice));
+                quantize_rows_i8_k<<<(int)rows, 256>>>(qtmp, q + off * I, sc + off, (int)I);
+                CK(cudaGetLastError());
+            }
+            off += rows;
+        }
+        return {f, q, sc};
     }
     static float* falloc(size_t n, bool zero = false) {
         float* d; CK(cudaMalloc(&d, n * 4)); if (zero) CK(cudaMemset(d, 0, n * 4)); return d;
@@ -204,7 +251,7 @@ struct Engine {
         double t0 = now();
         embed = (const half*)C.map("model.embed_tokens.weight");
         if (!f16) CK(cudaMalloc(&qtmp, (size_t)V * D * 2));  // largest matrix
-        lm_head = wmat("lm_head.weight", V, D);
+        lm_head = wmat({{"lm_head.weight", V}}, D);
         norm = wup("model.norm.weight", D);
         L.resize(NL);
         for (int i = 0; i < NL; i++) {
@@ -213,27 +260,22 @@ struct Engine {
             w.in_ln = wup(p + "input_layernorm.weight", D);
             w.post_ln = wup(p + "post_attention_layernorm.weight", D);
             w.router = wup(m + "gate.weight", (int64_t)E * D);
-            w.sh_g = wmat(m + "shared_expert.gate_proj.weight", SI, D);
-            w.sh_u = wmat(m + "shared_expert.up_proj.weight", SI, D);
-            w.sh_d = wmat(m + "shared_expert.down_proj.weight", D, SI);
+            w.sh_gu = wmat({{m + "shared_expert.gate_proj.weight", SI}, {m + "shared_expert.up_proj.weight", SI}}, D);
+            w.sh_d = wmat({{m + "shared_expert.down_proj.weight", D}}, SI);
             w.sh_gate = wup(m + "shared_expert_gate.weight", D);
             if (is_attn(i)) {
                 std::string a = p + "self_attn.";
-                w.q = wmat(a + "q_proj.weight", AH * 2 * AHD, D);
-                w.k = wmat(a + "k_proj.weight", AKV * AHD, D);
-                w.v = wmat(a + "v_proj.weight", AKV * AHD, D);
-                w.o = wmat(a + "o_proj.weight", D, AH * AHD);
+                w.attn_qkv = wmat({{a + "q_proj.weight", AH * 2 * AHD}, {a + "k_proj.weight", AKV * AHD}, {a + "v_proj.weight", AKV * AHD}}, D);
+                w.o = wmat({{a + "o_proj.weight", D}}, AH * AHD);
                 w.qn = wup(a + "q_norm.weight", AHD);
                 w.kn = wup(a + "k_norm.weight", AHD);
                 w.K = falloc((size_t)AKV * ctx * AHD);
                 w.V = falloc((size_t)AKV * ctx * AHD);
             } else {
                 std::string a = p + "linear_attn.";
-                w.qkv = wmat(a + "in_proj_qkv.weight", DC, D);
-                w.z = wmat(a + "in_proj_z.weight", DVH * DNV, D);
-                w.a = wup(a + "in_proj_a.weight", (int64_t)DVH * D);
-                w.b = wup(a + "in_proj_b.weight", (int64_t)DVH * D);
-                w.out = wmat(a + "out_proj.weight", D, DVH * DNV);
+                w.dn_in = wmat({{a + "in_proj_qkv.weight", DC}, {a + "in_proj_z.weight", DVH * DNV},
+                                {a + "in_proj_a.weight", DVH}, {a + "in_proj_b.weight", DVH}}, D);
+                w.out = wmat({{a + "out_proj.weight", D}}, DVH * DNV);
                 w.conv = wup(a + "conv1d.weight", (int64_t)DC * CONVK);
                 w.nw = wup(a + "norm.weight", DNV);
                 w.alog = wup(a + "A_log", DVH);
@@ -246,8 +288,9 @@ struct Engine {
         CK(cudaStreamCreateWithFlags(&cs, cudaStreamNonBlocking));
         CK(cudaStreamCreateWithFlags(&cp, cudaStreamNonBlocking));
         x = falloc(D); h = falloc(D); tmp = falloc(D); moe = falloc(D);
-        q = falloc(AH * 2 * AHD); k = falloc(AKV * AHD); v = falloc(AKV * AHD); qo = falloc(AH * AHD); ag = falloc(AH * AHD);
-        big = falloc(DC); z = falloc(DVH * DNV); a = falloc(DVH); b = falloc(DVH); conv = falloc(DC); o = falloc(DVH * DNV);
+        q = falloc(AH * 2 * AHD + 2 * AKV * AHD); k = q + AH * 2 * AHD; v = k + AKV * AHD; qo = falloc(AH * AHD); ag = falloc(AH * AHD);
+        big = falloc(DC + DVH * DNV + 2 * DVH); z = big + DC; a = z + DVH * DNV; b = a + DVH;
+        conv = falloc(DC); o = falloc(DVH * DNV);
         act = falloc(TOPK * EI); scr = falloc(2 * SI + D + 1); logits = falloc(V); rw = falloc(TOPK);
         amv = falloc(ARGMAX_BLOCKS + 1);
         CK(cudaMalloc(&ridx, TOPK * 4)); CK(cudaMalloc(&ams, ARGMAX_BLOCKS * 4)); CK(cudaMalloc(&tok_d, 4));
@@ -269,8 +312,10 @@ struct Engine {
             es[l * E + e] = (const float*)C.map(ep + "qs");
         }
         CK(cudaMallocHost(&h_h, D * 4)); CK(cudaMallocHost(&y_h, D * 4)); CK(cudaMallocHost(&w_h, TOPK * 4));
-        CK(cudaMallocHost(&hw_h, TOPK * 4)); CK(cudaMallocHost(&ids_h, TOPK * 4)); CK(cudaMallocHost(&hs_h, TOPK * sizeof(void*)));
-        CK(cudaMalloc(&hw_d, TOPK * 4)); CK(cudaMalloc(&ycpu, D * 4));
+        CK(cudaMallocHost(&ids_h, TOPK * 4));
+        CK(cudaMalloc(&hw_d, TOPK * 4)); CK(cudaMalloc(&ycpu, D * 4)); CK(cudaMalloc(&nh_d, 4));
+        CK(cudaMalloc(&table_d, NL * E * sizeof(void*))); CK(cudaMemset(table_d, 0, NL * E * sizeof(void*)));
+        CK(cudaEventCreateWithFlags(&ev_route, cudaEventDisableTiming));
         for (int i = 0; i < NSTAGE; i++) {
             CK(cudaMallocHost(&stage[i].buf, EXPERT_BYTES));
             CK(cudaEventCreateWithFlags(&stage[i].after_compute, cudaEventDisableTiming));
@@ -295,6 +340,7 @@ struct Engine {
 
     // One token at position `pos`. If want_logits, logits[] is filled and the greedy id returned.
     int step(int tok, int pos, bool want_logits) {
+        tokens++;
         double t = now();
         for (int i = 0; i < D; i++) h_h[i] = __half2float(embed[(size_t)tok * D + i]);
         CK(cudaMemcpyAsync(x, h_h, D * 4, cudaMemcpyHostToDevice, cs));
@@ -303,47 +349,46 @@ struct Engine {
             LayerW& w = L[l];
             rmsnorm(x, pending, w.in_ln, h, D, EPS, 1, cs);
             if (is_attn(l)) {
-                gemv(w.q, h, q, D, AH * 2 * AHD, cs); gemv(w.k, h, k, D, AKV * AHD, cs); gemv(w.v, h, v, D, AKV * AHD, cs);
+                gemv(w.attn_qkv, h, q, D, AH * 2 * AHD + 2 * AKV * AHD, cs);  // -> q, k, v
                 attn_decode(q, k, v, w.qn, w.kn, qo, w.K, w.V, ag, AH, AKV, pos, ctx, ROT, THETA, EPS, cs);
                 gemv(w.o, ag, tmp, AH * AHD, D, cs);
                 mark(0, t);
             } else {
-                gemv(w.qkv, h, big, D, DC, cs); gemv(w.z, h, z, D, DVH * DNV, cs);
-                gemv_f16(w.a, h, a, D, DVH, cs); gemv_f16(w.b, h, b, D, DVH, cs);
+                gemv(w.dn_in, h, big, D, DC + DVH * DNV + 2 * DVH, cs);  // -> qkv, z, a, b
                 deltanet_core(big, z, a, b, w.conv, w.alog, w.dtb, w.nw, w.ring, w.S, conv, o, DC, CONVK, DVH, DKH, EPS, cs);
                 gemv(w.out, o, tmp, DVH * DNV, D, cs);
                 mark(1, t);
             }
             rmsnorm(x, tmp, w.post_ln, h, D, EPS, 1, cs);
+            poll_admissions();
+            flush_table();  // the GPU's view of residency for this layer == the host's ready[] below
             gemv_f16(w.router, h, scr, D, E, cs);
             router_topk(scr, E, TOPK, false, ridx, rw, cs);
             CK(cudaMemcpyAsync(ids_h, ridx, TOPK * 4, cudaMemcpyDeviceToHost, cs));
             CK(cudaMemcpyAsync(w_h, rw, TOPK * 4, cudaMemcpyDeviceToHost, cs));
             CK(cudaMemcpyAsync(h_h, h, D * 4, cudaMemcpyDeviceToHost, cs));
-            CK(cudaStreamSynchronize(cs));  // per-layer sync: placement needs the routing
+            CK(cudaEventRecord(ev_route, cs));
+            // GPU: hits from the device table, then resident experts + shared expert, no host in the loop
+            route_hits_k<<<1, 32, 0, cs>>>(ridx, rw, TOPK, l * E, table_d, slots_d, hw_d, nh_d);
+            experts_forward(slots_d, hw_d, TOPK, h, act, moe, cs, nh_d);
+            shared_expert_add(w.sh_gu, w.sh_d, w.sh_gate, h, moe, scr, D, SI, cs);
+            CK(cudaEventSynchronize(ev_route));  // host needs the routing only for the misses
             mark(2, t);
             if (trace) {
                 int16_t rec[12] = {(int16_t)trace_prompt, (int16_t)pos, (int16_t)l, (int16_t)trace_phase};
                 for (int j = 0; j < TOPK; j++) rec[4 + j] = (int16_t)ids_h[j];
                 fwrite(rec, sizeof rec, 1, trace);
             }
-            poll_admissions();
             clock++;
-            int nh = 0, nm = 0, mkey[TOPK];
+            int nm = 0, mkey[TOPK];
             const uint8_t* mq[TOPK]; const float* msc[TOPK]; float mw[TOPK];
             for (int j = 0; j < TOPK; j++) {
                 int key = l * E + ids_h[j], sl = slot_of[key];
-                if (sl >= 0) last[sl] = clock;  // also protects in-flight siblings from eviction
-                if (sl >= 0 && ready[sl]) { hs_h[nh] = arena + (size_t)sl * EXPERT_BYTES; hw_h[nh++] = w_h[j]; hits++; }
+                touch(key);
+                if (sl >= 0) last[sl] = clock;  // protects this step's experts (incl. in-flight) from eviction
+                if (sl >= 0 && ready[sl]) hits++;
                 else { mq[nm] = eq[key]; msc[nm] = es[key]; mw[nm] = w_h[j]; mkey[nm++] = sl < 0 ? key : -1; misses++; }
             }
-            // GPU: resident experts + shared expert (async)
-            if (nh) {
-                CK(cudaMemcpyAsync(slots_d, hs_h, nh * sizeof(void*), cudaMemcpyHostToDevice, cs));
-                CK(cudaMemcpyAsync(hw_d, hw_h, nh * 4, cudaMemcpyHostToDevice, cs));
-                experts_forward(slots_d, hw_d, nh, h, act, moe, cs);
-            } else CK(cudaMemsetAsync(moe, 0, D * 4, cs));
-            shared_expert_add(w.sh_g, w.sh_u, w.sh_d, w.sh_gate, h, moe, scr, D, SI, cs);
             // CPU: misses, overlapped with the GPU work above
             if (nm) {
                 double c0 = now();
@@ -352,6 +397,7 @@ struct Engine {
                 CK(cudaMemcpyAsync(ycpu, y_h, D * 4, cudaMemcpyHostToDevice, cs));
                 add_k<<<(D + 255) / 256, 256, 0, cs>>>(moe, ycpu, D);
                 for (int j = 0; j < nm; j++) if (mkey[j] >= 0) admit(mkey[j]);
+                start_admissions();
             }
             mark(3, t);
             pending = moe;

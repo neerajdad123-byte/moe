@@ -155,15 +155,18 @@ int main(int argc, char** argv) {
             CK(cudaMemcpy(slots, hs.data(), K * sizeof(void*), cudaMemcpyHostToDevice));
             half *Wg = wup(C, lp + "shared_expert.gate_proj.weight"), *Wu = wup(C, lp + "shared_expert.up_proj.weight"),
                  *Wd = wup(C, lp + "shared_expert.down_proj.weight"), *Ws = wup(C, lp + "shared_expert_gate.weight");
+            half* Wgu; CK(cudaMalloc(&Wgu, (size_t)2 * SI * D * 2));  // fused [gate; up], as the engine stores it
+            CK(cudaMemcpy(Wgu, Wg, (size_t)SI * D * 2, cudaMemcpyDeviceToDevice));
+            CK(cudaMemcpy(Wgu + (size_t)SI * D, Wu, (size_t)SI * D * 2, cudaMemcpyDeviceToDevice));
             experts_forward(slots, w, K, h, act, out);
-            shared_expert_add({Wg}, {Wu}, {Wd}, Ws, h, out, scr, D, SI);
+            shared_expert_add({Wgu}, {Wd}, Ws, h, out, scr, D, SI);
             check((std::string(pf) + "routed+shared -> moe_out").c_str(), down(out, D), golden(pf + std::string("moe_out")), 1e-5f);
             if (L == 0) {
                 bench("router gemv 256x2048 + topk", 256.0 * D * 2, [&] { gemv_f16(Wr, h, logits, D, E); router_topk(logits, E, K, false, idx, w); });
                 bench("experts x8 int4 gs64", (double)K * EXPERT_BYTES, [&] { experts_forward(slots, w, K, h, act, out); });
-                bench("shared expert F16", 3.0 * SI * D * 2, [&] { shared_expert_add({Wg}, {Wu}, {Wd}, Ws, h, out, scr, D, SI); });
+                bench("shared expert F16", 3.0 * SI * D * 2, [&] { shared_expert_add({Wgu}, {Wd}, Ws, h, out, scr, D, SI); });
             }
-            for (void* p : {(void*)Wr, (void*)h, (void*)Wg, (void*)Wu, (void*)Wd, (void*)Ws}) CK(cudaFree(p));
+            for (void* p : {(void*)Wr, (void*)h, (void*)Wg, (void*)Wu, (void*)Wgu, (void*)Wd, (void*)Ws}) CK(cudaFree(p));
         }
     }
 
@@ -281,6 +284,35 @@ int main(int argc, char** argv) {
             printf("  %-34s int8-vs-F16 rel %.3e (quantization drift)\n", nm.c_str(), e / mx);
             bench((nm + " int8").c_str(), (double)cs.O * cs.I + cs.O * 4.0, [&] { gemv({nullptr, q, s}, xd, y, cs.I, cs.O); }, cs.O > 100000 ? 20 : 50);
             for (void* p : {(void*)W, (void*)q, (void*)s, (void*)xd, (void*)y, (void*)yf}) CK(cudaFree(p));
+        }
+    }
+
+    if (want(filt, "SWEEP")) {
+        printf("gemv_i8 launch-config sweep on the engine's (fused) shapes; random weights\n");
+        struct Sh { const char* n; int O, I; } shapes[] = {
+            {"dn qkv+z+a+b 12352x2048", 12352, 2048}, {"attn q+k+v 9216x2048", 9216, 2048}, {"out/o 2048x4096", 2048, 4096},
+            {"shared gate+up 1024x2048", 1024, 2048}, {"shared down 2048x512", 2048, 512}, {"lm_head 248320x2048", 248320, 2048}};
+        for (auto& sh : shapes) {
+            size_t n = (size_t)sh.O * sh.I;
+            std::vector<int8_t> hq(n); for (size_t i = 0; i < n; i++) hq[i] = (int8_t)((i * 2654435761u >> 13) % 255 - 127);
+            std::vector<float> hs(sh.O, 0.01f), hx(sh.I); for (int i = 0; i < sh.I; i++) hx[i] = sinf(0.1f * i);
+            int8_t* q = up(hq); float *s = up(hs), *x = up(hx), *y = dalloc(sh.O), *y0 = dalloc(sh.O);
+            gemv_i8<8, 1>(q, s, x, y0, sh.I, sh.O);
+            auto ref = down(y0, sh.O);
+            double bytes = (double)n + sh.O * 4.0;
+            printf(" %s\n", sh.n);
+            auto one = [&](const char* nm, auto fn) {
+                fn(); auto got = down(y, sh.O);
+                double e = 0, mx = 0; for (int i = 0; i < sh.O; i++) { e = std::max(e, (double)fabsf(got[i] - ref[i])); mx = std::max(mx, (double)fabsf(ref[i])); }
+                if (e / mx > 1e-5) { printf("  %s WRONG rel %.2e\n", nm, e / mx); g_fail++; }
+                bench(nm, bytes, fn, sh.O > 100000 ? 20 : 50);
+            };
+            one("  W8 R1", [&] { gemv_i8<8, 1>(q, s, x, y, sh.I, sh.O); });
+            one("  W8 R2", [&] { gemv_i8<8, 2>(q, s, x, y, sh.I, sh.O); });
+            one("  W8 R4", [&] { gemv_i8<8, 4>(q, s, x, y, sh.I, sh.O); });
+            one("  W4 R2", [&] { gemv_i8<4, 2>(q, s, x, y, sh.I, sh.O); });
+            one("  W4 R1", [&] { gemv_i8<4, 1>(q, s, x, y, sh.I, sh.O); });
+            for (void* p : {(void*)q, (void*)s, (void*)x, (void*)y, (void*)y0}) CK(cudaFree(p));
         }
     }
 
