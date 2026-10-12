@@ -136,3 +136,18 @@ Dense int8 → ~75 tok/s ceiling; dense int4 → ~110. So dense requantization i
 | nsys timeline (`tools/gaps.py`) | GPU 83% busy; dense GEMV 10.4 ms/token vs 10.2 ms roofline (1.92 GB at 188 GB/s) |
 | int4 gs64 dense trunk (tried, **rejected**) | KL 0.02-0.16 typ., 1.2 at pos 0, greedy flip even with int8 lm_head (int8: KL ~1e-3). Kernel also only 22 GB/s before tuning |
 
+**Host/GPU pipeline pass (measured, 80-prompt batch = realistic number):**
+
+| Change | 3x story warm | 80-prompt batch |
+|---|---|---|
+| start of phase (LRU, separate projections) | 37.6 | 35.6 |
+| + fusion, tau=10 eviction, GPU-side hit routing | 41.1 | 34.7 -> (GPU routing not yet in batch run) |
+| + zero-copy routing/CPU result (no memcpy ops per layer) | 51.4 | 47.0 |
+| + zero-copy embedding/token id | 54.1 | - |
+| + expert kernels: padded smem (bank conflicts), persistent grid | 55.0 | **51.4** (81.4% hit) |
+
+Findings: spin-wait scheduling no gain; CPU thread count 8-14 flat; CPU expert kernel compute-bound per core
+(6-7 GB/s single thread, ~31 GB/s at 8-12). Per layer the critical path is GPU pre-routing work (dense GEMV at roofline)
++ max(GPU experts+shared, CPU misses), now roughly equal. Ceiling of this design ~57 tok/s warm.
+Nsight Compute counters need Windows permission (ERR_NVGPUCTRPERM) - user setting.
+
