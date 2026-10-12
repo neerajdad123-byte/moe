@@ -877,7 +877,8 @@ int main(int argc, char** argv) {
         std::vector<ChatMsg> msgs;
         if (!system_prompt.empty()) msgs.push_back({"system", system_prompt});
         const int max_new = n_set ? n : 2048;
-        fprintf(stderr, "\nmoex chat - Qwen3.6-35B-A3B. /reset starts over, /exit quits.\n");
+        fprintf(stderr, "\nmoex chat - Qwen3.6-35B-A3B. /reset starts over, /exit quits.\n"
+                        "(experts are still loading into RAM for ~20 s: the first reply can be slower)\n");
         std::string line;
         while (true) {
             fprintf(stdout, "\n> "); fflush(stdout);

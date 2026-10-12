@@ -202,5 +202,5 @@ Routing changed with the fix (10-prompt hit 76% -> 71%): traces must be re-colle
 6. [x] other GPUs: fat binary sm_75/80/86/89/90/120 + PTX (4.5 MB exe), slot cap for big GPUs, RAM check (no locking below ~23 GB), AVX2 check
 7. [x] `moex download` (WinHTTP, resumable, size-checked) into models\ next to moex.exe; missing model -> clear message
 8. [~] long context: int8 KV cache done (KL 2.95e-3, top-1 unchanged); split-K attention for >24k still to do
-9. README, release build, benchmark page
+9. [x] README (results, quick start, API, how it works, accuracy, limits), package.bat -> dist/moex-windows-x64.zip (1.2 MB; needs only the NVIDIA driver)
 
