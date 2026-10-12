@@ -167,6 +167,21 @@ int main(int argc, char** argv) {
         }
     }
 
+    if (want(filt, "POOL")) {
+        printf("CpuPool stress: 100k jobs, each item must run exactly once\n");
+        CpuPool pool(12);
+        std::vector<std::atomic<int>> hit(64);
+        long long bad = 0;
+        for (int job = 0; job < 100000; job++) {
+            int items = 1 + job % 64;
+            for (int i = 0; i < items; i++) hit[i] = 0;
+            std::function<void(int)> f = [&](int i) { hit[i].fetch_add(1); };
+            pool.parallel_for(items, f);
+            for (int i = 0; i < items; i++) bad += hit[i] != 1;
+        }
+        printf("  bad items %lld %s\n", bad, bad ? "FAIL" : "PASS"); if (bad) g_fail++;
+    }
+
     if (want(filt, "K14")) {
         printf("K14 CPU experts (AVX2) vs GPU K4, L00 routed experts\n");
         const int K = 8;

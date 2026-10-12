@@ -3,6 +3,8 @@
 //   moex.exe --ids 760,6511,314 [--n 32] [--ctx 2048] [--stop 248044,248046] [--profile]
 //   moex.exe --check ref/golden          logits vs the PyTorch reference at every golden position
 //   --f16                                 keep dense weights F16 (exact); default is int8 per-row
+//   moex.exe --batch ids.txt [--trace routes.bin]   one prompt (comma ids) per line; expert cache stays warm
+//     trace record: int16[12] = prompt, pos, layer, phase (0 prompt / 1 decode), 8 routed expert ids
 // Generated token ids go to stdout one per line; stats go to stderr. Tokenizing is moex.py's job.
 #include <cuda_runtime.h>
 #include <algorithm>
@@ -73,6 +75,8 @@ struct Engine {
     std::mutex mu;
     std::thread loader;
     bool stop_loader = false;
+    FILE* trace = nullptr;
+    int trace_prompt = 0, trace_phase = 0;
     // profile (synchronizing, so it perturbs the speed it measures)
     bool prof = false;
     double tp[8] = {};
@@ -279,6 +283,14 @@ struct Engine {
                 now() - t0, f16 ? "F16" : "int8", nslots, nslots * (double)EXPERT_BYTES / 1e9, 100.0 * nslots / (NL * E), NL * E, ctx);
     }
 
+    // New conversation: recurrent state back to zero (KV rows are overwritten position by position).
+    void reset() {
+        for (int l = 0; l < NL; l++) if (!is_attn(l)) {
+            CK(cudaMemsetAsync(L[l].ring, 0, (size_t)DC * (CONVK - 1) * 4, cs));
+            CK(cudaMemsetAsync(L[l].S, 0, (size_t)DVH * DNK * DNV * 4, cs));
+        }
+    }
+
     void mark(int i, double& t) { if (prof) { CK(cudaStreamSynchronize(cs)); double n = now(); tp[i] += n - t; t = n; } }
 
     // One token at position `pos`. If want_logits, logits[] is filled and the greedy id returned.
@@ -310,6 +322,11 @@ struct Engine {
             CK(cudaMemcpyAsync(h_h, h, D * 4, cudaMemcpyDeviceToHost, cs));
             CK(cudaStreamSynchronize(cs));  // per-layer sync: placement needs the routing
             mark(2, t);
+            if (trace) {
+                int16_t rec[12] = {(int16_t)trace_prompt, (int16_t)pos, (int16_t)l, (int16_t)trace_phase};
+                for (int j = 0; j < TOPK; j++) rec[4 + j] = (int16_t)ids_h[j];
+                fwrite(rec, sizeof rec, 1, trace);
+            }
             poll_admissions();
             clock++;
             int nh = 0, nm = 0, mkey[TOPK];
@@ -369,7 +386,7 @@ int main(int argc, char** argv) {
     const char* model = getenv("QWEN36_MODEL") ? getenv("QWEN36_MODEL") : "C:\\models\\qwen36_i4_gs64";
     std::vector<int> ids, stop;
     int n = 32, ctx = 2048;
-    std::string check;
+    std::string check, batch, trace_path;
     bool prof = false, f16 = false;
     for (int i = 1; i < argc; i++) {
         std::string s = argv[i];
@@ -381,6 +398,8 @@ int main(int argc, char** argv) {
         else if (s == "--check") check = next();
         else if (s == "--profile") prof = true;
         else if (s == "--f16") f16 = true;
+        else if (s == "--batch") batch = next();
+        else if (s == "--trace") trace_path = next();
         else { fprintf(stderr, "unknown arg %s\n", s.c_str()); return 2; }
     }
     if (!check.empty()) {  // ids come from the golden run's meta.json
@@ -390,7 +409,7 @@ int main(int argc, char** argv) {
         size_t a = m.find('[', m.find("\"ids\"")) + 1, b = m.find(']', a);
         ids = parse_ids(m.substr(a, b - a));
     }
-    if (ids.empty()) { fprintf(stderr, "usage: moex --ids 1,2,3 [--n N] | --check ref/golden\n"); return 2; }
+    if (ids.empty() && batch.empty()) { fprintf(stderr, "usage: moex --ids 1,2,3 [--n N] | --batch ids.txt | --check ref/golden\n"); return 2; }
 
     Engine eng(model, ctx);
     eng.f16 = f16;
@@ -421,31 +440,67 @@ int main(int argc, char** argv) {
         return ok ? 0 : 1;
     }
 
-    if ((int)ids.size() + n > ctx) { fprintf(stderr, "prompt + n exceeds --ctx %d\n", ctx); return 2; }
-    double t0 = now();
-    int pos = 0, tok = -1;
-    for (; pos < (int)ids.size(); pos++) tok = eng.step(ids[pos], pos, pos + 1 == (int)ids.size());
-    double t1 = now();
-    long long h0 = eng.hits, m0 = eng.misses, a0 = eng.admits; double c0 = eng.cpu_s;
-    eng.prof = prof;
-    int gen = 0;
-    for (; gen < n; gen++) {
-        printf("%d\n", tok); fflush(stdout);
-        if (std::find(stop.begin(), stop.end(), tok) != stop.end()) { gen++; break; }
-        if (gen + 1 == n) { gen++; break; }
-        tok = eng.step(tok, pos++, true);
+    struct Stats { int dec = 0; double sec = 0; long long hits = 0, misses = 0, admits = 0; double cpu = 0; };
+    // Prompt token-by-token, then up to n greedy tokens. Returns decode-phase stats.
+    auto generate = [&](const std::vector<int>& p, std::vector<int>& out, bool stream) {
+        Stats st;
+        if ((int)p.size() + n > ctx) { fprintf(stderr, "prompt + n exceeds --ctx %d\n", ctx); exit(2); }
+        eng.trace_phase = 0;
+        int pos = 0, tok = -1;
+        for (; pos < (int)p.size(); pos++) tok = eng.step(p[pos], pos, pos + 1 == (int)p.size());
+        long long h0 = eng.hits, m0 = eng.misses, a0 = eng.admits; double c0 = eng.cpu_s, t1 = now();
+        eng.trace_phase = 1;
+        for (int gen = 0; gen < n; gen++) {
+            out.push_back(tok);
+            if (stream) { printf("%d\n", tok); fflush(stdout); }
+            if (std::find(stop.begin(), stop.end(), tok) != stop.end() || gen + 1 == n) break;
+            tok = eng.step(tok, pos++, true);
+            st.dec++;
+        }
+        st.sec = now() - t1; st.hits = eng.hits - h0; st.misses = eng.misses - m0; st.admits = eng.admits - a0; st.cpu = eng.cpu_s - c0;
+        return st;
+    };
+    auto report = [&](const char* tag, const Stats& st) {
+        int dec = std::max(st.dec, 1);
+        fprintf(stderr, "[%s] %d tok in %.2f s = %.2f tok/s | expert hit %.1f%% | %.1f misses/tok on CPU = %.1f ms/tok | %lld admitted\n",
+                tag, st.dec, st.sec, st.dec / std::max(st.sec, 1e-9), 100.0 * st.hits / std::max(st.hits + st.misses, 1LL),
+                (double)st.misses / dec, 1e3 * st.cpu / dec, st.admits);
+    };
+    if (!trace_path.empty() && !(eng.trace = fopen(trace_path.c_str(), "wb"))) { fprintf(stderr, "cannot write %s\n", trace_path.c_str()); return 1; }
+
+    if (!batch.empty()) {
+        FILE* f = fopen(batch.c_str(), "rb");
+        if (!f) { fprintf(stderr, "no %s\n", batch.c_str()); return 1; }
+        std::vector<std::vector<int>> prompts;
+        char line[1 << 16];
+        while (fgets(line, sizeof line, f)) { auto v = parse_ids(line); if (!v.empty()) prompts.push_back(v); }
+        fclose(f);
+        Stats tot;
+        for (size_t i = 0; i < prompts.size(); i++) {
+            eng.reset();
+            eng.trace_prompt = (int)i;
+            std::vector<int> out;
+            Stats st = generate(prompts[i], out, false);
+            for (size_t j = 0; j < out.size(); j++) printf(j ? ",%d" : "%d", out[j]);
+            printf("\n"); fflush(stdout);
+            char tag[32]; snprintf(tag, sizeof tag, "prompt %zu", i);
+            report(tag, st);
+            tot.dec += st.dec; tot.sec += st.sec; tot.hits += st.hits; tot.misses += st.misses; tot.admits += st.admits; tot.cpu += st.cpu;
+        }
+        report("batch total", tot);
+        if (eng.trace) fclose(eng.trace);
+        return 0;
     }
-    double t2 = now();
-    int dec = std::max(gen - 1, 1);  // decode steps run after the prompt
-    long long dh = eng.hits - h0, dm = eng.misses - m0;
-    fprintf(stderr, "[prompt] %zu tok in %.2f s (%.1f tok/s, token-by-token)\n", ids.size(), t1 - t0, ids.size() / (t1 - t0));
-    fprintf(stderr, "[decode] %d tok in %.2f s = %.2f tok/s | expert hit %.1f%% | %.1f misses/tok on CPU = %.1f ms/tok | %lld admitted\n",
-            dec, t2 - t1, dec / (t2 - t1), 100.0 * dh / std::max(dh + dm, 1LL), (double)dm / dec,
-            1e3 * (eng.cpu_s - c0) / dec, eng.admits - a0);
+
+    eng.prof = prof;
+    std::vector<int> out;
+    Stats st = generate(ids, out, true);
+    report("decode", st);
     if (prof) {
         const char* nm[] = {"attention", "deltanet", "router+sync", "moe (gpu+cpu)", "lm_head+argmax"};
         double tot = 0; for (int i = 0; i < 5; i++) tot += eng.tp[i];
-        for (int i = 0; i < 5; i++) fprintf(stderr, "  %-15s %7.2f ms/tok  %5.1f%%\n", nm[i], 1e3 * eng.tp[i] / dec, 100 * eng.tp[i] / tot);
+        for (int i = 0; i < 5; i++) fprintf(stderr, "  %-15s %7.2f ms/tok  %5.1f%%\n", nm[i], 1e3 * eng.tp[i] / std::max(st.dec, 1), 100 * eng.tp[i] / tot);
     }
+    if (eng.trace) fclose(eng.trace);
     return 0;
 }

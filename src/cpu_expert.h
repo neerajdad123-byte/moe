@@ -9,10 +9,12 @@
 
 // Persistent worker pool. Workers spin between jobs: a decode token dispatches ~80 jobs and
 // waking threads through the OS costs tens of microseconds each on Windows.
+// Every worker joins every job and reports when it has left it, so the next job's counters are only
+// reset once no thread can still be grabbing items of the previous one.
 struct CpuPool {
     std::vector<std::thread> th;
     std::atomic<uint64_t> gen{0};
-    std::atomic<int> next{0}, done{0};
+    std::atomic<int> next{0}, finished{0};
     std::atomic<bool> quit{false};
     const std::function<void(int)>* fn = nullptr;
     int n = 0;
@@ -23,7 +25,7 @@ struct CpuPool {
     ~CpuPool() { quit = true; gen++; for (auto& t : th) t.join(); }
 
     void run_items() {
-        for (int i; (i = next.fetch_add(1)) < n;) { (*fn)(i); done.fetch_add(1); }
+        for (int i; (i = next.fetch_add(1)) < n;) (*fn)(i);
     }
     void worker() {
         uint64_t seen = 0;
@@ -32,17 +34,18 @@ struct CpuPool {
             while (gen.load(std::memory_order_acquire) == seen) {
                 if (++spins < 20000) _mm_pause(); else std::this_thread::yield();
             }
+            seen++;  // main never starts job g+1 before every worker finished job g
             if (quit) return;
-            seen = gen.load();
             run_items();
+            finished.fetch_add(1, std::memory_order_release);
         }
     }
     // Calls f(i) for i in [0, items), spread over the pool; returns when all are done.
     void parallel_for(int items, const std::function<void(int)>& f) {
-        fn = &f; n = items; done = 0; next = 0;
+        fn = &f; n = items; next = 0; finished = 0;
         gen.fetch_add(1, std::memory_order_release);
         run_items();
-        while (done.load(std::memory_order_acquire) < items) _mm_pause();
+        while (finished.load(std::memory_order_acquire) < (int)th.size()) _mm_pause();
     }
 };
 
