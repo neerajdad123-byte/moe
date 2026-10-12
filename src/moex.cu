@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <iostream>
 #include <cstdio>
 #include <deque>
 #include <random>
@@ -732,6 +733,26 @@ struct Engine {
     }
 };
 
+#include "session.h"
+
+// One line of user input as UTF-8 (the Windows console delivers non-ASCII input correctly only as UTF-16).
+static bool read_line(std::string& out) {
+    HANDLE in = GetStdHandle(STD_INPUT_HANDLE);
+    DWORD mode;
+    if (!GetConsoleMode(in, &mode)) { if (!std::getline(std::cin, out)) return false; if (!out.empty() && out.back() == '\r') out.pop_back(); return true; }
+    std::wstring w; wchar_t buf[512]; DWORD got;
+    while (true) {
+        if (!ReadConsoleW(in, buf, 512, &got, nullptr) || got == 0) return false;
+        w.append(buf, got);
+        if (!w.empty() && w.back() == L'\n') break;
+    }
+    while (!w.empty() && (w.back() == L'\n' || w.back() == L'\r')) w.pop_back();
+    int n = WideCharToMultiByte(CP_UTF8, 0, w.c_str(), (int)w.size(), nullptr, 0, nullptr, nullptr);
+    out.assign(n, '\0');
+    WideCharToMultiByte(CP_UTF8, 0, w.c_str(), (int)w.size(), out.data(), n, nullptr, nullptr);
+    return true;
+}
+
 static std::vector<int> parse_ids(const std::string& s) {
     std::vector<int> v;
     for (size_t p = 0; p < s.size();) { size_t q = s.find(',', p); if (q == std::string::npos) q = s.size(); if (q > p) v.push_back(std::stoi(s.substr(p, q - p))); p = q + 1; }
@@ -747,7 +768,10 @@ static std::vector<float> read_f32(const std::string& p) {
 }
 
 int main(int argc, char** argv) {
-    const char* model = getenv("QWEN36_MODEL") ? getenv("QWEN36_MODEL") : "C:\\models\\qwen36_i4_gs64";
+    std::string model = getenv("QWEN36_MODEL") ? getenv("QWEN36_MODEL") : "C:\\models\\qwen36_i4_gs64";
+    std::string mode, system_prompt;
+    bool think = false, samp_set = false, n_set = false;
+    if (argc > 1 && argv[1][0] != '-') { mode = argv[1]; argv++; argc--; }  // moex chat | moex serve
     std::vector<int> ids, stop;
     int n = 32, ctx = 2048;
     std::string check, batch, trace_path;
@@ -758,7 +782,10 @@ int main(int argc, char** argv) {
         std::string s = argv[i];
         auto next = [&] { if (i + 1 >= argc) { fprintf(stderr, "%s needs a value\n", s.c_str()); exit(2); } return std::string(argv[++i]); };
         if (s == "--ids") ids = parse_ids(next());
-        else if (s == "--n") n = std::stoi(next());
+        else if (s == "--n") { n = std::stoi(next()); n_set = true; }
+        else if (s == "--model") model = next();
+        else if (s == "--system") system_prompt = next();
+        else if (s == "--think") think = true;
         else if (s == "--ctx") ctx = std::stoi(next());
         else if (s == "--stop") stop = parse_ids(next());
         else if (s == "--check") check = next();
@@ -766,7 +793,7 @@ int main(int argc, char** argv) {
         else if (s == "--f16") f16 = true;
         else if (s == "--no-prefill") use_prefill = false;
         else if (s == "--q4") q4groups = next();
-        else if (s == "--temp") samp.temp = std::stof(next());
+        else if (s == "--temp") { samp.temp = std::stof(next()); samp_set = true; }
         else if (s == "--top-k") samp.top_k = std::stoi(next());
         else if (s == "--top-p") samp.top_p = std::stof(next());
         else if (s == "--repeat-penalty") samp.rep = std::stof(next());
@@ -782,11 +809,55 @@ int main(int argc, char** argv) {
         size_t a = m.find('[', m.find("\"ids\"")) + 1, b = m.find(']', a);
         ids = parse_ids(m.substr(a, b - a));
     }
-    if (ids.empty() && batch.empty()) { fprintf(stderr, "usage: moex --ids 1,2,3 [--n N] | --batch ids.txt | --check ref/golden\n"); return 2; }
+    if (mode.empty() && ids.empty() && batch.empty()) {
+        fprintf(stderr, "usage: moex chat [--system TEXT] [--think] [--temp T ...]\n"
+                        "       moex --ids 1,2,3 [--n N] | --batch ids.txt | --check ref/golden\n"
+                        "       options: --model DIR (default %s) --ctx N\n", model.c_str());
+        return 2;
+    }
+    if (mode == "chat" && !samp_set) { samp.temp = 0.7f; samp.top_p = 0.8f; samp.top_k = 20; }  // Qwen non-thinking defaults
+    if (mode == "chat" && think && !samp_set) { samp.temp = 1.0f; samp.top_p = 0.95f; samp.top_k = 20; }  // thinking defaults
+    if (mode == "chat" && ctx == 2048) ctx = 8192;
 
-    Engine eng(model, ctx);
+    Engine eng(model.c_str(), ctx);
     eng.f16 = f16; eng.q4groups = q4groups; eng.samp = samp;
     eng.load();
+
+    if (mode == "chat") {
+        SetConsoleOutputCP(CP_UTF8);
+        Tokenizer tk(model + "/tokenizer.json");
+        Session ss(eng, tk);
+        ss.think = think;
+        std::vector<ChatMsg> msgs;
+        if (!system_prompt.empty()) msgs.push_back({"system", system_prompt});
+        const int max_new = n_set ? n : 2048;
+        fprintf(stderr, "\nmoex chat - Qwen3.6-35B-A3B. /reset starts over, /exit quits.\n");
+        std::string line;
+        while (true) {
+            fprintf(stdout, "\n> "); fflush(stdout);
+            if (!read_line(line) || line == "/exit") break;
+            if (line.empty()) continue;
+            if (line == "/reset") { msgs.resize(system_prompt.empty() ? 0 : 1); ss.ctx.clear(); fprintf(stderr, "(new conversation)\n"); continue; }
+            msgs.push_back({"user", line});
+            auto prompt = ss.render(msgs);
+            Utf8Stream us; std::string reply;
+            double t0 = now(), t1 = 0; int ntok = 0;
+            auto out = ss.generate(prompt, max_new, [&](int t) {
+                if (!ntok++) t1 = now();
+                std::string txt = us.push(tk.piece(t));
+                fputs(txt.c_str(), stdout); fflush(stdout);
+                reply += txt;
+                return true;
+            });
+            reply += us.held;
+            ss.replies[reply] = out;
+            msgs.push_back({"assistant", reply});
+            double t2 = now();
+            fprintf(stderr, "\n[%d tokens, %.1f tok/s, first token %.2f s, context %zu]\n", ntok,
+                    ntok > 1 ? (ntok - 1) / (t2 - t1) : 0.0, t1 - t0, ss.ctx.size());
+        }
+        return 0;
+    }
 
     if (!check.empty()) {
         int pos = 0, tok = ids[0], bad = 0, scored = 0; double worst = 0, worst_kl = 0, sum_kl = 0;
