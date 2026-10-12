@@ -124,3 +124,15 @@ Dense int8 → ~75 tok/s ceiling; dense int4 → ~110. So dense requantization i
 | Correctness | `--check` PASS (int8 KL<=0.014; F16 KL 9e-12); F16 and int8 runs produce the identical 128-token text |
 | Known | greedy output loops on this prompt in both F16 and int8: model behavior, needs sampling (U5/K19) |
 
+**Step 3 + kernel pass (measured):**
+
+| Change | Result |
+|---|---|
+| Batch benchmark (80 prompts, one warm process) | baseline 35.6 tok/s, 80.5% hit |
+| `tools/sim.py` (replays real traces, PCIe budget, online learning) | LRU 80.8% (engine 80.5%, so the sim is faithful); decayed-freq tau=10 tokens **82.0%** (best); tau>=200 loses badly; Markov next-layer prefetch: no gain (35% useful, evicts better experts); Belady ceiling 90.7% |
+| Fused projections + tau=10 eviction | dn in-proj 80% / attn qkv 75% of bandwidth (were 72% / 62%) |
+| GPU-side hit routing (device slot table) | warm 37.6 -> **41.1 tok/s**, output token-identical |
+| CUDA graph per layer | no change (launch overhead was not the limit); kept: frees the host thread |
+| nsys timeline (`tools/gaps.py`) | GPU 83% busy; dense GEMV 10.4 ms/token vs 10.2 ms roofline (1.92 GB at 188 GB/s) |
+| int4 gs64 dense trunk (tried, **rejected**) | KL 0.02-0.16 typ., 1.2 at pos 0, greedy flip even with int8 lm_head (int8: KL ~1e-3). Kernel also only 22 GB/s before tuning |
+
