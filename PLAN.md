@@ -196,9 +196,9 @@ Routing changed with the fix (10-prompt hit 76% -> 71%): traces must be re-colle
    sim on corrected traces: tau=10 still best (73.2% vs LRU 72.3%), Markov prefetch no gain, Belady 85.6%.
    10 prompts: moex 41.1 cold / 42.6 warm tok/s vs llama.cpp default 20.3 (2.0x) and tuned 35.3 (1.16-1.21x)
 2. [x] sampling (temperature, top-p, top-k, repetition penalty, seed); greedy stays the engine default
-3. multi-turn chat keeping KV/DeltaNet state
-4. OpenAI-compatible server
-5. C++ tokenizer, no Python needed
+3. [x] multi-turn chat keeping KV/DeltaNet state (`moex chat`)
+4. [x] OpenAI-compatible server (`moex serve`, port 8765, streaming, prefix reuse, stop strings)
+5. [x] C++ tokenizer, no Python needed (identical to HF on 54 cases / 66k tokens)
 6. other GPUs (fat binary sm_75..sm_120, VRAM/RAM auto-sizing, clear errors)
 7. `moex download` for the HF container
 8. long context: int8 KV cache, split-K attention

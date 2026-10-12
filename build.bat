@@ -7,3 +7,4 @@ call "C:\Program Files\Microsoft Visual Studio\18\Community\VC\Auxiliary\Build\v
 set NV=nvcc -std=c++20 -O3 -arch=sm_89 -lineinfo -Xcompiler "/EHsc /utf-8 /D_CRT_SECURE_NO_WARNINGS /arch:AVX2"
 %NV% tests\test_kernels.cu -o build\test_kernels.exe || exit /b 1
 %NV% src\moex.cu -o build\moex.exe || exit /b 1
+cl /nologo /std:c++20 /O2 /EHsc /utf-8 /I "%CUDA_PATH%\include" tests\test_tokenizer.cpp /Fe:build\test_tokenizer.exe /Fo:build\ > build\cl_tok.log || exit /b 1

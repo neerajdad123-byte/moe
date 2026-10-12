@@ -734,6 +734,7 @@ struct Engine {
 };
 
 #include "session.h"
+#include "serve.h"
 
 // One line of user input as UTF-8 (the Windows console delivers non-ASCII input correctly only as UTF-16).
 static bool read_line(std::string& out) {
@@ -771,6 +772,8 @@ int main(int argc, char** argv) {
     std::string model = getenv("QWEN36_MODEL") ? getenv("QWEN36_MODEL") : "C:\\models\\qwen36_i4_gs64";
     std::string mode, system_prompt;
     bool think = false, samp_set = false, n_set = false;
+    std::string host = "127.0.0.1";
+    int port = 8765;
     if (argc > 1 && argv[1][0] != '-') { mode = argv[1]; argv++; argc--; }  // moex chat | moex serve
     std::vector<int> ids, stop;
     int n = 32, ctx = 2048;
@@ -786,6 +789,8 @@ int main(int argc, char** argv) {
         else if (s == "--model") model = next();
         else if (s == "--system") system_prompt = next();
         else if (s == "--think") think = true;
+        else if (s == "--host") host = next();
+        else if (s == "--port") port = std::stoi(next());
         else if (s == "--ctx") ctx = std::stoi(next());
         else if (s == "--stop") stop = parse_ids(next());
         else if (s == "--check") check = next();
@@ -811,18 +816,25 @@ int main(int argc, char** argv) {
     }
     if (mode.empty() && ids.empty() && batch.empty()) {
         fprintf(stderr, "usage: moex chat [--system TEXT] [--think] [--temp T ...]\n"
+                        "       moex serve [--port 8765] [--host 127.0.0.1]     OpenAI-compatible API\n"
                         "       moex --ids 1,2,3 [--n N] | --batch ids.txt | --check ref/golden\n"
                         "       options: --model DIR (default %s) --ctx N\n", model.c_str());
         return 2;
     }
     if (mode == "chat" && !samp_set) { samp.temp = 0.7f; samp.top_p = 0.8f; samp.top_k = 20; }  // Qwen non-thinking defaults
     if (mode == "chat" && think && !samp_set) { samp.temp = 1.0f; samp.top_p = 0.95f; samp.top_k = 20; }  // thinking defaults
-    if (mode == "chat" && ctx == 2048) ctx = 8192;
+    if ((mode == "chat" || mode == "serve") && ctx == 2048) ctx = 8192;
 
     Engine eng(model.c_str(), ctx);
     eng.f16 = f16; eng.q4groups = q4groups; eng.samp = samp;
     eng.load();
 
+    if (mode == "serve") {
+        Tokenizer tk(model + "/tokenizer.json");
+        Session ss(eng, tk);
+        serve(ss, tk, host, port, "qwen3.6-35b-a3b");
+        return 0;
+    }
     if (mode == "chat") {
         SetConsoleOutputCP(CP_UTF8);
         Tokenizer tk(model + "/tokenizer.json");
