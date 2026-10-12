@@ -1,6 +1,7 @@
 // Decode kernels. Activations fp32, weights as stored (F16 dense, int4 gs64 experts).
 #pragma once
 #include <cuda_fp16.h>
+#include <mma.h>
 #include <cstdint>
 
 #define CK(x) do { cudaError_t e_ = (x); if (e_ != cudaSuccess) { \
@@ -137,6 +138,53 @@ inline void gemv(const Mat& m, const float* x, float* y, int I, int O, cudaStrea
     constexpr int WARPS = 8;
     if (m.q) gemv_i8<WARPS, 1>(m.q, m.s, x, y, I, O, st);
     else gemv_f16(m.f16, x, y, I, O, st);
+}
+
+// ---- K12: prefill GEMM, Y[S][O] = X[S][I] . W[O][I]^T (* row scale), on tensor cores ----
+// Weights are int8 (exact in fp16: they are integers; the row scale is applied after the fp32 accumulation)
+// or F16. Activations are rounded to fp16. Block tile 64 rows x 64 tokens x 32 K, 4 warps of 32x32.
+// Requires I % 32 == 0.
+template <typename WT>
+__global__ void gemm_wmma_k(const WT* __restrict__ W, const float* __restrict__ s, const float* __restrict__ X,
+                            float* __restrict__ Y, int S, int I, int O) {
+    using namespace nvcuda;
+    constexpr int BM = 64, BN = 64, BK = 32, LD = BK + 8;  // +8 halves: no bank conflicts on fragment loads
+    __shared__ __align__(32) half As[BM * LD], Bs[BN * LD];
+    __shared__ __align__(32) float Cs[4][32 * 32];
+    const int o0 = blockIdx.x * BM, s0 = blockIdx.y * BN, warp = threadIdx.x >> 5, wm = (warp >> 1) * 32, wn = (warp & 1) * 32;
+    wmma::fragment<wmma::accumulator, 16, 16, 16, float> c[2][2];
+    for (int i = 0; i < 2; i++) for (int j = 0; j < 2; j++) wmma::fill_fragment(c[i][j], 0.f);
+    for (int k0 = 0; k0 < I; k0 += BK) {
+        for (int e = threadIdx.x; e < BM * BK; e += blockDim.x) {
+            int r = e / BK, k = e % BK, o = o0 + r, t = s0 + r;
+            As[r * LD + k] = o < O ? __float2half((float)W[(size_t)o * I + k0 + k]) : __float2half(0.f);
+            Bs[r * LD + k] = t < S ? __float2half(X[(size_t)t * I + k0 + k]) : __float2half(0.f);
+        }
+        __syncthreads();
+        for (int kk = 0; kk < BK; kk += 16) {
+            wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> a[2];
+            wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::col_major> b[2];
+            for (int i = 0; i < 2; i++) wmma::load_matrix_sync(a[i], As + (wm + 16 * i) * LD + kk, LD);
+            for (int j = 0; j < 2; j++) wmma::load_matrix_sync(b[j], Bs + (wn + 16 * j) * LD + kk, LD);
+            for (int i = 0; i < 2; i++) for (int j = 0; j < 2; j++) wmma::mma_sync(c[i][j], a[i], b[j], c[i][j]);
+        }
+        __syncthreads();
+    }
+    float* cs = Cs[warp];
+    for (int i = 0; i < 2; i++) for (int j = 0; j < 2; j++)
+        wmma::store_matrix_sync(cs + (16 * i) * 32 + 16 * j, c[i][j], 32, wmma::mem_row_major);
+    __syncwarp();
+    for (int e = threadIdx.x & 31; e < 32 * 32; e += 32) {
+        int r = e / 32, n = e % 32, o = o0 + wm + r, t = s0 + wn + n;
+        if (o < O && t < S) Y[(size_t)t * O + o] = cs[e] * (s ? s[o] : 1.f);
+    }
+}
+
+// Y[S][O] = X[S][I] . W^T for a dense matrix in either form.
+inline void gemm(const Mat& m, const float* X, float* Y, int S, int I, int O, cudaStream_t st = 0) {
+    dim3 grid((O + 63) / 64, (S + 63) / 64);
+    if (m.q) gemm_wmma_k<int8_t><<<grid, 128, 0, st>>>(m.q, m.s, X, Y, S, I, O);
+    else gemm_wmma_k<half><<<grid, 128, 0, st>>>(m.f16, nullptr, X, Y, S, I, O);
 }
 
 // ---- K3: router: softmax over E logits, top-K (ties -> lower index), raw probs (norm_topk_prob=false) ----
@@ -427,60 +475,71 @@ __global__ void set_int_k(int* p, int v) { *p = v; }
 
 // ---- K8: Gated DeltaNet decode ----
 // Conv: causal depthwise conv (kernel CK) over C channels with a carried ring [C][CK-1], then SiLU.
-__global__ void dn_conv_k(const float* __restrict__ qkv, const half* __restrict__ w, float* __restrict__ ring,
-                          float* __restrict__ out, int C, int CKn) {
+// T tokens in order (T = 1 for decode, a chunk for prefill). qkv rows have stride ld; out is [T][C].
+__global__ void dn_conv_k(const float* __restrict__ qkv, int ld, const half* __restrict__ w, float* __restrict__ ring,
+                          float* __restrict__ out, int C, int CKn, int T) {
     int c = blockIdx.x * blockDim.x + threadIdx.x;
     if (c >= C) return;
     float* rg = ring + (size_t)c * (CKn - 1);
     const half* wc = w + (size_t)c * CKn;
-    float x = qkv[c], acc = __half2float(wc[CKn - 1]) * x;
-    for (int i = 0; i < CKn - 1; i++) acc += __half2float(wc[i]) * rg[i];
-    for (int i = 0; i < CKn - 2; i++) rg[i] = rg[i + 1];
-    rg[CKn - 2] = x;
-    out[c] = acc / (1.f + __expf(-acc));
+    for (int t = 0; t < T; t++) {
+        float x = qkv[(size_t)t * ld + c], acc = __half2float(wc[CKn - 1]) * x;
+        for (int i = 0; i < CKn - 1; i++) acc += __half2float(wc[i]) * rg[i];
+        for (int i = 0; i < CKn - 2; i++) rg[i] = rg[i + 1];
+        rg[CKn - 2] = x;
+        out[(size_t)t * C + c] = acc / (1.f + __expf(-acc));
+    }
 }
 
-// Recurrence + gated RMSNorm. One block per value head, thread = value column (DV threads),
-// the state column S[:, v] lives in registers: S is read once and written once per token.
+// Recurrence + gated RMSNorm over T tokens. One block per value head, thread = value column (DV threads);
+// the state column S[:, v] lives in registers for the whole chunk: S is read once and written once per call.
+// conv is [T][C]; z, a, b rows have stride ld; o is [T][VH*DNV].
 constexpr int DNK = 128, DNV = 128;
-__global__ void dn_recur_k(const float* __restrict__ conv, const float* __restrict__ z,
-                           const float* __restrict__ a, const float* __restrict__ b,
+__global__ void dn_recur_k(const float* __restrict__ conv, int C, const float* __restrict__ z,
+                           const float* __restrict__ a, const float* __restrict__ b, int ld,
                            const half* __restrict__ A_log, const half* __restrict__ dt_bias,
                            const half* __restrict__ nw, float* __restrict__ S, float* __restrict__ o,
-                           int VH, int KH, float eps) {
+                           int VH, int KH, float eps, int T) {
     __shared__ float qs[DNK], ks[DNK];
-    int h = blockIdx.x, v = threadIdx.x, kh = h / (VH / KH);
-    const float* qin = conv + kh * DNK;
-    const float* kin = conv + KH * DNK + kh * DNK;
-    float vin = conv[2 * KH * DNK + h * DNV + v];
-    float qv = qin[v], kv_ = kin[v];  // DNK == DNV == blockDim
-    float qn = sqrtf(block_sum(qv * qv) + 1e-6f), kn = sqrtf(block_sum(kv_ * kv_) + 1e-6f);
-    qs[v] = qv / qn * rsqrtf((float)DNK);
-    ks[v] = kv_ / kn;
-    float beta = 1.f / (1.f + __expf(-b[h]));
-    float ax = a[h] + __half2float(dt_bias[h]);
-    float sp = ax > 20.f ? ax : log1pf(expf(ax));
-    float eg = expf(-expf(__half2float(A_log[h])) * sp);
-    __syncthreads();
+    const int h = blockIdx.x, v = threadIdx.x, kh = h / (VH / KH);
+    const float alog = expf(__half2float(A_log[h])), dtb = __half2float(dt_bias[h]), nwv = __half2float(nw[v]);
     float* Sh = S + (size_t)h * DNK * DNV;
     float col[DNK];
-    float kvs = 0.f;
 #pragma unroll
-    for (int i = 0; i < DNK; i++) { col[i] = Sh[i * DNV + v] * eg; kvs += ks[i] * col[i]; }
-    float delta = (vin - kvs) * beta, out = 0.f;
+    for (int i = 0; i < DNK; i++) col[i] = Sh[i * DNV + v];
+    for (int t = 0; t < T; t++) {
+        const float* cv = conv + (size_t)t * C;
+        float qv = cv[kh * DNK + v], kv_ = cv[KH * DNK + kh * DNK + v];  // DNK == DNV == blockDim
+        float vin = cv[2 * KH * DNK + h * DNV + v];
+        float qn = sqrtf(block_sum(qv * qv) + 1e-6f), kn = sqrtf(block_sum(kv_ * kv_) + 1e-6f);  // also orders qs/ks reuse
+        qs[v] = qv / qn * rsqrtf((float)DNK);
+        ks[v] = kv_ / kn;
+        float beta = 1.f / (1.f + __expf(-b[(size_t)t * ld + h]));
+        float ax = a[(size_t)t * ld + h] + dtb;
+        float sp = ax > 20.f ? ax : log1pf(expf(ax));
+        float eg = expf(-alog * sp);
+        __syncthreads();
+        float kvs = 0.f;
 #pragma unroll
-    for (int i = 0; i < DNK; i++) { col[i] += ks[i] * delta; out += qs[i] * col[i]; Sh[i * DNV + v] = col[i]; }
-    float r = rsqrtf(block_sum(out * out) / DNV + eps);
-    float zz = z[h * DNV + v];
-    o[h * DNV + v] = out * r * __half2float(nw[v]) * (zz / (1.f + __expf(-zz)));
+        for (int i = 0; i < DNK; i++) { col[i] *= eg; kvs += ks[i] * col[i]; }
+        float delta = (vin - kvs) * beta, out = 0.f;
+#pragma unroll
+        for (int i = 0; i < DNK; i++) { col[i] += ks[i] * delta; out += qs[i] * col[i]; }
+        float r = rsqrtf(block_sum(out * out) / DNV + eps);
+        float zz = z[(size_t)t * ld + h * DNV + v];
+        o[(size_t)t * VH * DNV + h * DNV + v] = out * r * nwv * (zz / (1.f + __expf(-zz)));
+    }
+#pragma unroll
+    for (int i = 0; i < DNK; i++) Sh[i * DNV + v] = col[i];
 }
 
-inline void deltanet_core(const float* qkv, const float* z, const float* a, const float* b,
+// T tokens through conv + recurrence. qkv, z, a, b: rows of stride ld (one fused projection row per token).
+inline void deltanet_core(const float* qkv, const float* z, const float* a, const float* b, int ld,
                           const half* conv_w, const half* A_log, const half* dt_bias, const half* nw,
                           float* ring, float* S, float* conv_scratch, float* o,
-                          int C, int CKn, int VH, int KH, float eps, cudaStream_t st = 0) {
-    dn_conv_k<<<(C + 255) / 256, 256, 0, st>>>(qkv, conv_w, ring, conv_scratch, C, CKn);
-    dn_recur_k<<<VH, DNV, 0, st>>>(conv_scratch, z, a, b, A_log, dt_bias, nw, S, o, VH, KH, eps);
+                          int C, int CKn, int VH, int KH, float eps, int T = 1, cudaStream_t st = 0) {
+    dn_conv_k<<<(C + 255) / 256, 256, 0, st>>>(qkv, ld, conv_w, ring, conv_scratch, C, CKn, T);
+    dn_recur_k<<<VH, DNV, 0, st>>>(conv_scratch, C, z, a, b, ld, A_log, dt_bias, nw, S, o, VH, KH, eps, T);
 }
 
 // ---- K9: argmax over n floats (ties -> lower index), two passes ----

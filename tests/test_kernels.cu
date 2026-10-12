@@ -31,7 +31,9 @@ template <class T> static T* up(const std::vector<T>& v) {
     CK(cudaMemcpy(d, v.data(), v.size() * sizeof(T), cudaMemcpyHostToDevice));
     return d;
 }
-static float* dalloc(size_t n) { float* d; CK(cudaMalloc(&d, n * 4)); return d; }
+static float* dalloc(size_t n, bool zero = false) {
+    float* d; CK(cudaMalloc(&d, n * 4)); if (zero) CK(cudaMemset(d, 0, n * 4)); return d;
+}
 static std::vector<float> down(const float* d, size_t n) {
     std::vector<float> v(n); CK(cudaMemcpy(v.data(), d, n * 4, cudaMemcpyDeviceToHost)); return v;
 }
@@ -71,6 +73,7 @@ static float bench(const char* what, double bytes, const std::function<void()>& 
 }
 
 static bool want(const char* f, const char* name) { return !f || strstr(name, f); }
+static std::string pn_(int p, const char* rest) { char b[64]; snprintf(b, sizeof b, "p%03d_%s", p, rest); return b; }
 
 int main(int argc, char** argv) {
     const char* filt = argc > 1 ? argv[1] : nullptr;
@@ -290,6 +293,70 @@ int main(int argc, char** argv) {
         }
     }
 
+    if (want(filt, "K12")) {
+        printf("K12 prefill GEMM (WMMA fp16, int8 weights) vs per-token GEMV\n");
+        struct Case { const char* name; int O, I; } cases[] = {
+            {"model.layers.0.linear_attn.in_proj_qkv.weight", 8192, D}, {"model.layers.0.linear_attn.out_proj.weight", D, 4096}};
+        for (auto& cs : cases) {
+            half* W = wup(C, cs.name);
+            int8_t* q; float* s; CK(cudaMalloc(&q, (size_t)cs.O * cs.I)); CK(cudaMalloc(&s, cs.O * 4));
+            quantize_rows_i8_k<<<cs.O, 256>>>(W, q, s, cs.I);
+            Mat m; m.q = q; m.s = s;
+            const int SMAX = 256;
+            std::vector<float> hx((size_t)SMAX * cs.I);
+            for (int t = 0; t < SMAX; t++) {  // real activations (12 golden positions), varied per token
+                auto g = golden(pn_(t % 12, "L00_moe_in"));
+                for (int i = 0; i < cs.I; i++) hx[(size_t)t * cs.I + i] = g[i % D] * (1.f + 0.01f * (t / 12)) * ((i / D) ? -1.f : 1.f);
+            }
+            float *X = up(hx), *Y = dalloc((size_t)SMAX * cs.O), *Yr = dalloc((size_t)SMAX * cs.O);
+            for (int S : {64, 128, 256}) {
+                gemm(m, X, Y, S, cs.I, cs.O);
+                for (int t = 0; t < S; t++) gemv(m, X + (size_t)t * cs.I, Yr + (size_t)t * cs.O, cs.I, cs.O);
+                auto g = down(Y, (size_t)S * cs.O), r = down(Yr, (size_t)S * cs.O);
+                std::string nm = std::string(cs.name).substr(std::string(cs.name).rfind('.', strlen(cs.name) - 8) + 1);
+                char lbl[96]; snprintf(lbl, sizeof lbl, "%s S=%d vs GEMV", nm.c_str(), S);
+                check(lbl, g, r, 5e-3f);  // fp16 activations: ~1e-3 relative, below the int8 weight error
+                snprintf(lbl, sizeof lbl, "  S=%d gemm (%.3f ms/token)", S, 0.0);
+                float ms = bench(lbl, (double)cs.O * cs.I, [&] { gemm(m, X, Y, S, cs.I, cs.O); }, 20);
+                printf("      -> %.4f ms per token (GEMV per token: weights re-read S times)\n", ms / S);
+            }
+            for (void* p : {(void*)W, (void*)q, (void*)s, (void*)X, (void*)Y, (void*)Yr}) CK(cudaFree(p));
+        }
+    }
+
+    if (want(filt, "K8T")) {
+        printf("K8T DeltaNet over a chunk (L00, all 12 golden positions in one call)\n");
+        const int C8 = 8192, VH = 32, KH = 16, T = 12, LDR = C8 + VH * DNV + 2 * VH;
+        std::string lp = "model.layers.0.", la = lp + "linear_attn.";
+        half *ln = wup(C, lp + "input_layernorm.weight"), *Wqkv = wup(C, la + "in_proj_qkv.weight"),
+             *Wz = wup(C, la + "in_proj_z.weight"), *Wa = wup(C, la + "in_proj_a.weight"), *Wb = wup(C, la + "in_proj_b.weight"),
+             *Wo = wup(C, la + "out_proj.weight"), *cw = wup(C, la + "conv1d.weight"), *Al = wup(C, la + "A_log"),
+             *dtb = wup(C, la + "dt_bias"), *nw = wup(C, la + "norm.weight");
+        float *h = dalloc(D), *rows = dalloc((size_t)T * LDR), *conv = dalloc((size_t)T * C8), *o = dalloc((size_t)T * VH * DNV), *out = dalloc(D);
+        float *ring = dalloc(C8 * 3, true), *S = dalloc((size_t)VH * DNK * DNV, true);
+        for (int p = 0; p < T; p++) {  // fused projection row per token: [qkv | z | a | b]
+            float* x = up(golden(pn_(p, "L00_x_in")));
+            rmsnorm(x, nullptr, ln, h, D, EPS);
+            float* r = rows + (size_t)p * LDR;
+            gemv_f16(Wqkv, h, r, D, C8); gemv_f16(Wz, h, r + C8, D, VH * DNV);
+            gemv_f16(Wa, h, r + C8 + VH * DNV, D, VH); gemv_f16(Wb, h, r + C8 + VH * DNV + VH, D, VH);
+            CK(cudaFree(x));
+        }
+        deltanet_core(rows, rows + C8, rows + C8 + VH * DNV, rows + C8 + VH * DNV + VH, LDR, cw, Al, dtb, nw, ring, S, conv, o,
+                      C8, 4, VH, KH, EPS, T);
+        double worst = 0;
+        for (int p = 0; p < T; p++) {
+            gemv_f16(Wo, o + (size_t)p * VH * DNV, out, VH * DNV, D);
+            auto g = down(out, D), r = golden(pn_(p, "L00_dn_out"));
+            double mx = 0, e = 0; for (int i = 0; i < D; i++) { mx = std::max(mx, (double)fabsf(r[i])); e = std::max(e, (double)fabsf(g[i] - r[i])); }
+            worst = std::max(worst, e / mx);
+        }
+        printf("  worst rel dn_out over 12 positions (one chunk) %.3e %s\n", worst, worst < 1e-4 ? "PASS" : "FAIL");
+        if (worst >= 1e-4) g_fail++;
+        bench("deltanet core, T=12 chunk", 2.0 * VH * DNK * DNV * 4, [&] {
+            deltanet_core(rows, rows + C8, rows + C8 + VH * DNV, rows + C8 + VH * DNV + VH, LDR, cw, Al, dtb, nw, ring, S, conv, o, C8, 4, VH, KH, EPS, T); });
+    }
+
     if (want(filt, "SWEEP")) {
         printf("gemv_i8 launch-config sweep on the engine's (fused) shapes; random weights\n");
         struct Sh { const char* n; int O, I; } shapes[] = {
@@ -379,7 +446,7 @@ int main(int argc, char** argv) {
         auto step = [&] {
             gemv_f16(Wqkv, h, qkv, D, C8); gemv_f16(Wz, h, z, D, VH * DNV);
             gemv_f16(Wa, h, a, D, VH); gemv_f16(Wb, h, b, D, VH);
-            deltanet_core(qkv, z, a, b, cw, Al, dtb, nw, ring, S, conv, o, C8, 4, VH, KH, EPS);
+            deltanet_core(qkv, z, a, b, 0, cw, Al, dtb, nw, ring, S, conv, o, C8, 4, VH, KH, EPS);
             gemv_f16(Wo, o, out, VH * DNV, D);
         };
         double wc = 0, wo = 0, wout = 0;
@@ -402,7 +469,7 @@ int main(int argc, char** argv) {
         if (!ok) g_fail++;
         bench("deltanet layer (proj+core)", (8192.0 + 4096 + 64) * D * 2 + 2048.0 * 4096 * 2 + 2.0 * VH * DNK * DNV * 4, step);
         bench("deltanet core (conv+recur)", 2.0 * VH * DNK * DNV * 4, [&] {
-            deltanet_core(qkv, z, a, b, cw, Al, dtb, nw, ring, S, conv, o, C8, 4, VH, KH, EPS); });
+            deltanet_core(qkv, z, a, b, 0, cw, Al, dtb, nw, ring, S, conv, o, C8, 4, VH, KH, EPS); });
     }
 
     if (want(filt, "K9")) {

@@ -1,0 +1,10 @@
+Write a Python function that merges overlapping intervals and explain its time complexity briefly.
+Describe how a volcano forms and what happens during an eruption.
+A shop sells pencils at 3 for 1 dollar and pens at 2 dollars each. How much do 12 pencils and 5 pens cost? Explain.
+Write a short fable about a fox and a crow that teaches a lesson about flattery.
+Explain the difference between TCP and UDP with one example use case for each.
+Translate into German: Could you tell me where the nearest train station is?
+Write a SQL query that returns the top three customers by total order amount, then explain it.
+What are the health benefits of regular walking? Give a short list.
+Explain how public key cryptography lets two strangers communicate securely.
+Write a cover letter opening paragraph for a junior data analyst position.

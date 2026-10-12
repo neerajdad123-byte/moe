@@ -361,7 +361,7 @@ struct Engine {
             gemv(w.o, ag, tmp, AH * AHD, D, cs);
         } else {
             gemv(w.dn_in, h, big, D, DC + DVH * DNV + 2 * DVH, cs);  // -> qkv, z, a, b
-            deltanet_core(big, z, a, b, w.conv, w.alog, w.dtb, w.nw, w.ring, w.S, conv, o, DC, CONVK, DVH, DKH, EPS, cs);
+            deltanet_core(big, z, a, b, DC + DVH * DNV + 2 * DVH, w.conv, w.alog, w.dtb, w.nw, w.ring, w.S, conv, o, DC, CONVK, DVH, DKH, EPS, 1, cs);
             gemv(w.out, o, tmp, DVH * DNV, D, cs);
         }
         rmsnorm(x, tmp, w.post_ln, h, D, EPS, 1, cs);
@@ -517,12 +517,13 @@ int main(int argc, char** argv) {
         return ok ? 0 : 1;
     }
 
-    struct Stats { int dec = 0; double sec = 0; long long hits = 0, misses = 0, admits = 0; double cpu = 0, ht[4] = {}; };
+    struct Stats { int dec = 0; double sec = 0; long long hits = 0, misses = 0, admits = 0; double cpu = 0, ht[4] = {}, ttft = 0; };
     // Prompt token-by-token, then up to n greedy tokens. Returns decode-phase stats.
     auto generate = [&](const std::vector<int>& p, std::vector<int>& out, bool stream) {
         Stats st;
         if ((int)p.size() + n > ctx) { fprintf(stderr, "prompt + n exceeds --ctx %d\n", ctx); exit(2); }
         eng.trace_phase = 0;
+        double t0 = now();
         int pos = 0, tok = -1;
         for (; pos < (int)p.size(); pos++) tok = eng.step(p[pos], pos, pos + 1 == (int)p.size());
         long long h0 = eng.hits, m0 = eng.misses, a0 = eng.admits; double c0 = eng.cpu_s, t1 = now();
@@ -535,6 +536,7 @@ int main(int argc, char** argv) {
             tok = eng.step(tok, pos++, true);
             st.dec++;
         }
+        st.ttft = t1 - t0;
         st.sec = now() - t1; st.hits = eng.hits - h0; st.misses = eng.misses - m0; st.admits = eng.admits - a0; st.cpu = eng.cpu_s - c0;
         for (int i = 0; i < 4; i++) st.ht[i] = eng.ht[i] - ht0[i];
         return st;
@@ -544,8 +546,8 @@ int main(int argc, char** argv) {
         fprintf(stderr, "[%s] %d tok in %.2f s = %.2f tok/s | expert hit %.1f%% | %.1f misses/tok on CPU = %.1f ms/tok | %lld admitted\n",
                 tag, st.dec, st.sec, st.dec / std::max(st.sec, 1e-9), 100.0 * st.hits / std::max(st.hits + st.misses, 1LL),
                 (double)st.misses / dec, 1e3 * st.cpu / dec, st.admits);
-        fprintf(stderr, "    host ms/tok: launch %.2f  wait-routing %.2f  cpu-misses %.2f  admissions %.2f\n",
-                1e3 * st.ht[0] / dec, 1e3 * st.ht[1] / dec, 1e3 * st.ht[2] / dec, 1e3 * st.ht[3] / dec);
+        fprintf(stderr, "    host ms/tok: launch %.2f  wait-routing %.2f  cpu-misses %.2f  admissions %.2f | TTFT %.2f s\n",
+                1e3 * st.ht[0] / dec, 1e3 * st.ht[1] / dec, 1e3 * st.ht[2] / dec, 1e3 * st.ht[3] / dec, st.ttft);
     };
     if (!trace_path.empty() && !(eng.trace = fopen(trace_path.c_str(), "wb"))) { fprintf(stderr, "cannot write %s\n", trace_path.c_str()); return 1; }
 
