@@ -107,9 +107,9 @@ def run(name, evict, admit_filter=False, tau=None, prefetch=0):
 
 t0 = time.time()
 run("LRU (engine today)", "lru")
-for tau in (3, 5, 10, 30, 80, 200, 1000, 5000):
+for tau in (3, 5, 10, 20, 40, 80):
     run(f"decayed-freq tau={tau}", "freq", tau=tau)
-for tau in (200, 1000, 5000):
+for tau in ():
     run(f"decayed-freq tau={tau} + admit filter", "freq", admit_filter=True, tau=tau)
 run("Belady oracle (ceiling)", "belady")
 for m in (2, 4):

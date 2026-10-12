@@ -687,6 +687,24 @@ inline void deltanet_core(const float* qkv, const float* z, const float* a, cons
     dn_recur_k<<<VH, DNV, 0, st>>>(conv_scratch, C, z, a, b, ld, A_log, dt_bias, nw, S, o, VH, KH, eps, T);
 }
 
+// ---- K19: sampling helpers ----
+// Repetition penalty (llama.cpp semantics) on the logits of recent distinct tokens, passed by value.
+struct TokList { static constexpr int N = 64; int n = 0; int id[N]; };
+__global__ void repeat_penalty_k(float* __restrict__ logits, TokList h, float pen) {
+    int i = threadIdx.x;
+    if (i < h.n) { float l = logits[h.id[i]]; logits[h.id[i]] = l > 0.f ? l / pen : l * pen; }
+}
+// Candidates for sampling: every logit within `cut` of the maximum (*maxv), compacted (unordered).
+struct Cand { int id; float v; };
+__global__ void candidates_k(const float* __restrict__ logits, int n, const float* __restrict__ maxv, float cut,
+                             Cand* __restrict__ out, int* __restrict__ count, int cap) {
+    const float thr = *maxv - cut;
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x) {
+        float v = logits[i];
+        if (v >= thr) { int k = atomicAdd(count, 1); if (k < cap) out[k] = {i, v}; }
+    }
+}
+
 // ---- K9: argmax over n floats (ties -> lower index), two passes ----
 // xi: candidate indices for x (second pass), or null for x's own positions.
 __global__ void argmax_k(const float* __restrict__ x, const int* __restrict__ xi, int n, float* __restrict__ pv, int* __restrict__ pi) {

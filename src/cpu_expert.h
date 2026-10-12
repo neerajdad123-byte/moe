@@ -22,7 +22,7 @@ struct CpuPool {
 
     // spin = false: idle workers sleep instead of spinning (for a pool used only now and then, so its idle
     // threads don't take cores from the hot pool; costs up to ~200 us of wake-up latency)
-    bool spin;
+    std::atomic<bool> spin;  // may be switched while running (a pool that is hot only now and then)
     explicit CpuPool(int threads, bool spin_ = true) : spin(spin_) {
         for (int i = 0; i < threads - 1; i++) th.emplace_back([this] { worker(); });  // caller is the last worker
     }

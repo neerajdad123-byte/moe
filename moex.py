@@ -16,6 +16,8 @@ ap.add_argument("--n", type=int, default=64)
 ap.add_argument("--chat", action="store_true", help="wrap in the chat template, thinking off")
 ap.add_argument("--profile", action="store_true")
 ap.add_argument("--f16", action="store_true", help="exact F16 dense weights")
+ap.add_argument("--temp", type=float, help="sampling temperature (default with --chat: 0.7; 0 = greedy)")
+ap.add_argument("--seed", type=int)
 ap.add_argument("--batch", help="file with one prompt per line")
 ap.add_argument("--trace", help="write routed-expert trace (with --batch)")
 a = ap.parse_args()
@@ -24,7 +26,10 @@ if not a.prompt and not a.batch:
 
 tk = Tokenizer.from_file(os.path.join(MODEL, "tokenizer.json"))
 wrap = lambda p: (f"<|im_start|>user\n{p}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n" if a.chat else p)
+temp = a.temp if a.temp is not None else (0.7 if a.chat and not a.batch else 0.0)  # Qwen non-thinking: 0.7/0.8/20; batch stays greedy
 flags = ["--n", str(a.n), "--stop", STOP] + (["--profile"] if a.profile else []) + (["--f16"] if a.f16 else [])
+if temp > 0: flags += ["--temp", str(temp), "--top-p", "0.8", "--top-k", "20"]
+if a.seed is not None: flags += ["--seed", str(a.seed)]
 
 if a.batch:
     prompts = [l.strip() for l in open(a.batch, encoding="utf-8") if l.strip()]

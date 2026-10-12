@@ -192,8 +192,10 @@ Decision: **int8 stays the default** (int4 DeltaNet input projections flip ~1 to
 Routing changed with the fix (10-prompt hit 76% -> 71%): traces must be re-collected and the cache policy re-tuned.
 
 ## Launch checklist
-1. re-collect traces on the fixed model, re-tune eviction/prefetch, re-run head-to-head (default + tuned llama.cpp)
-2. sampling (temperature, top-p, top-k, repetition penalty)
+1. [x] re-collect traces on the fixed model, re-tune eviction/prefetch, re-run head-to-head (default + tuned llama.cpp)
+   sim on corrected traces: tau=10 still best (73.2% vs LRU 72.3%), Markov prefetch no gain, Belady 85.6%.
+   10 prompts: moex 41.1 cold / 42.6 warm tok/s vs llama.cpp default 20.3 (2.0x) and tuned 35.3 (1.16-1.21x)
+2. [x] sampling (temperature, top-p, top-k, repetition penalty, seed); greedy stays the engine default
 3. multi-turn chat keeping KV/DeltaNet state
 4. OpenAI-compatible server
 5. C++ tokenizer, no Python needed

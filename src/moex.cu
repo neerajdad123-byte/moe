@@ -3,6 +3,7 @@
 //   moex.exe --ids 760,6511,314 [--n 32] [--ctx 2048] [--stop 248044,248046] [--profile]
 //   moex.exe --check ref/golden          logits vs the PyTorch reference at every golden position
 //   --f16                                 keep dense weights F16 (exact); default is int8 per-row
+//   --temp T --top-k K --top-p P --repeat-penalty R --seed S   sampling (default: greedy)
 //   moex.exe --batch ids.txt [--trace routes.bin]   one prompt (comma ids) per line; expert cache stays warm
 //     trace record: int16[12] = prompt, pos, layer, phase (0 prompt / 1 decode), 8 routed expert ids
 // Generated token ids go to stdout one per line; stats go to stderr. Tokenizing is moex.py's job.
@@ -12,6 +13,7 @@
 #include <cmath>
 #include <cstdio>
 #include <deque>
+#include <random>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -364,6 +366,7 @@ struct Engine {
 
     // New conversation: recurrent state back to zero (KV rows are overwritten position by position).
     void reset() {
+        recent.clear();
         for (int l = 0; l < NL; l++) if (!is_attn(l)) {
             CK(cudaMemsetAsync(L[l].ring, 0, (size_t)DC * (CONVK - 1) * 4, cs));
             CK(cudaMemsetAsync(L[l].S, 0, (size_t)DVH * DNK * DNV * 4, cs));
@@ -494,12 +497,14 @@ struct Engine {
         const int LQ = AH * 2 * AHD + 2 * AKV * AHD, LB = DC + DVH * DNV + 2 * DVH;
         int next = -1;
         claim_prefill_slots();
+        cpool.spin = true;  // the copy pool is hot for the length of the prefill
         double pt0 = now(), pt[5] = {};
         unsigned long pf0 = page_faults();
         long long sn0 = streamed_n;
         for (int c0 = 0; c0 < n; c0 += CH) {
             const int T = std::min(CH, n - c0);
             tokens += T;
+            for (int t = 0; t < T; t++) note(ids[c0 + t]);
             for (int t = 0; t < T; t++)
                 for (int i = 0; i < D; i++) rows_h[(size_t)t * D + i] = __half2float(embed[(size_t)ids[c0 + t] * D + i]);
             copy_k<<<(T * D + 255) / 256, 256, 0, cs>>>(Xc, rows_d, T * D);
@@ -615,20 +620,65 @@ struct Engine {
             if (c0 + T == n) {  // the last prompt token: its logits pick the first generated token
                 rmsnorm(Xc + (size_t)(T - 1) * D, moec + (size_t)(T - 1) * D, norm, h, D, EPS, 1, cs);
                 gemv(lm_head, h, logits, D, V, cs);
-                argmax(logits, V, amv, ams, ids_hd, cs);
-                CK(cudaStreamSynchronize(cs));
-                next = ids_h[0];
+                next = pick_token();
             }
         }
         release_prefill_slots();
+        cpool.spin = false;
         fprintf(stderr, "[prefill] %d tok in %.2f s = %.1f tok/s | host: gpu-wait %.2f  streaming-wait %.2f  cpu-experts %.2f s | streamed %lld experts"
                 " | copier: wait-dma %.2f  memcpy %.2f s | page faults %lu\n",
                 n, now() - pt0, n / (now() - pt0), pt[0], pt[1], pt[2], streamed_n - sn0, pt[3], pt[4], page_faults() - pf0);
         return next;
     }
 
+    // ---- token choice: greedy (GPU argmax) or sampled (temperature / top-k / top-p), repetition penalty ----
+    struct Sampling { float temp = 0.f, top_p = 1.f, rep = 1.f; int top_k = 0; uint64_t seed = 0; };
+    Sampling samp;
+    std::mt19937_64 rng;
+    std::deque<int> recent;  // last TokList::N tokens of the context, for the repetition penalty
+    static constexpr int CAND_CAP = 8192;
+    Cand *cand_d = nullptr, *cand_h = nullptr;
+    int *cnt_d = nullptr, *cnt_h = nullptr;
+    void note(int tok) { recent.push_back(tok); if ((int)recent.size() > TokList::N) recent.pop_front(); }
+    // logits[] is being computed on cs; returns the next token.
+    int pick_token() {
+        if (samp.rep != 1.f && !recent.empty()) {
+            TokList tl;
+            for (int t : recent) if (std::find(tl.id, tl.id + tl.n, t) == tl.id + tl.n) tl.id[tl.n++] = t;
+            repeat_penalty_k<<<1, TokList::N, 0, cs>>>(logits, tl, samp.rep);
+        }
+        argmax(logits, V, amv, ams, ids_hd, cs);  // the greedy id lands in mapped host memory; the max in amv[BLOCKS]
+        if (samp.temp <= 0.f) { CK(cudaStreamSynchronize(cs)); return ids_h[0]; }
+        if (!cand_d) {
+            CK(cudaMalloc(&cand_d, CAND_CAP * sizeof(Cand))); CK(cudaMallocHost(&cand_h, CAND_CAP * sizeof(Cand)));
+            CK(cudaMalloc(&cnt_d, 4)); CK(cudaMallocHost(&cnt_h, 4));
+            rng.seed(samp.seed ? samp.seed : (uint64_t)std::chrono::steady_clock::now().time_since_epoch().count());
+        }
+        // tokens more than 20 * temp below the top have probability < e^-20 of it: dropping them changes nothing
+        CK(cudaMemsetAsync(cnt_d, 0, 4, cs));
+        candidates_k<<<ARGMAX_BLOCKS, 256, 0, cs>>>(logits, V, amv + ARGMAX_BLOCKS, 20.f * samp.temp, cand_d, cnt_d, CAND_CAP);
+        CK(cudaMemcpyAsync(cnt_h, cnt_d, 4, cudaMemcpyDeviceToHost, cs));
+        CK(cudaMemcpyAsync(cand_h, cand_d, CAND_CAP * sizeof(Cand), cudaMemcpyDeviceToHost, cs));
+        CK(cudaStreamSynchronize(cs));
+        std::vector<Cand> c(cand_h, cand_h + std::min(*cnt_h, CAND_CAP));
+        if (*cnt_h > CAND_CAP) {  // a very flat distribution: take the whole vocabulary (rare)
+            std::vector<float> lg(V); CK(cudaMemcpy(lg.data(), logits, V * 4, cudaMemcpyDeviceToHost));
+            c.clear(); for (int i = 0; i < V; i++) c.push_back({i, lg[i]});
+        }
+        std::sort(c.begin(), c.end(), [](const Cand& a, const Cand& b) { return a.v > b.v || (a.v == b.v && a.id < b.id); });
+        if (samp.top_k > 0 && (int)c.size() > samp.top_k) c.resize(samp.top_k);
+        std::vector<double> p(c.size());
+        double z = 0; for (size_t i = 0; i < c.size(); i++) z += p[i] = exp((c[i].v - c[0].v) / samp.temp);
+        size_t keep = c.size(); double cum = 0;
+        for (size_t i = 0; i < c.size(); i++) { cum += p[i] / z; if (cum >= samp.top_p) { keep = i + 1; break; } }
+        double r = std::uniform_real_distribution<double>(0.0, cum >= samp.top_p ? cum : 1.0)(rng) * z, acc = 0;
+        for (size_t i = 0; i < keep; i++) { acc += p[i]; if (acc >= r) return c[i].id; }
+        return c[keep - 1].id;
+    }
+
     int step(int tok, int pos, bool want_logits) {
         tokens++;
+        note(tok);
         double t = now();
         for (int i = 0; i < D; i++) h_h[i] = __half2float(embed[(size_t)tok * D + i]);
         copy_k<<<(D + 255) / 256, 256, 0, cs>>>(x, h_hd, D);  // zero-copy from the mapped host row
@@ -676,10 +726,9 @@ struct Engine {
         rmsnorm(x, pending, norm, h, D, EPS, 1, cs);
         if (!want_logits) return -1;
         gemv(lm_head, h, logits, D, V, cs);
-        argmax(logits, V, amv, ams, ids_hd, cs);  // the id lands in mapped host memory
-        CK(cudaStreamSynchronize(cs));
+        int next = pick_token();
         mark(2, t);
-        return ids_h[0];
+        return next;
     }
 };
 
@@ -704,6 +753,7 @@ int main(int argc, char** argv) {
     std::string check, batch, trace_path;
     bool prof = false, f16 = false, use_prefill = true;
     std::string q4groups;
+    Engine::Sampling samp;  // default greedy
     for (int i = 1; i < argc; i++) {
         std::string s = argv[i];
         auto next = [&] { if (i + 1 >= argc) { fprintf(stderr, "%s needs a value\n", s.c_str()); exit(2); } return std::string(argv[++i]); };
@@ -716,6 +766,11 @@ int main(int argc, char** argv) {
         else if (s == "--f16") f16 = true;
         else if (s == "--no-prefill") use_prefill = false;
         else if (s == "--q4") q4groups = next();
+        else if (s == "--temp") samp.temp = std::stof(next());
+        else if (s == "--top-k") samp.top_k = std::stoi(next());
+        else if (s == "--top-p") samp.top_p = std::stof(next());
+        else if (s == "--repeat-penalty") samp.rep = std::stof(next());
+        else if (s == "--seed") samp.seed = std::stoull(next());
         else if (s == "--batch") batch = next();
         else if (s == "--trace") trace_path = next();
         else { fprintf(stderr, "unknown arg %s\n", s.c_str()); return 2; }
@@ -730,7 +785,7 @@ int main(int argc, char** argv) {
     if (ids.empty() && batch.empty()) { fprintf(stderr, "usage: moex --ids 1,2,3 [--n N] | --batch ids.txt | --check ref/golden\n"); return 2; }
 
     Engine eng(model, ctx);
-    eng.f16 = f16; eng.q4groups = q4groups;
+    eng.f16 = f16; eng.q4groups = q4groups; eng.samp = samp;
     eng.load();
 
     if (!check.empty()) {
