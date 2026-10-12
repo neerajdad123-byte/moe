@@ -1,6 +1,7 @@
 // MoEx v2 decode engine (Phase 2: everything on GPU, experts fetched into VRAM slots on miss).
 //   moex.exe --ids 760,6511,314 [--n 32] [--ctx 2048] [--stop 248044,248046] [--profile]
 //   moex.exe --check ref/golden          logits vs the PyTorch reference at every golden position
+//   --f16                                 keep dense weights F16 (exact); default is int8 per-row
 // Generated token ids go to stdout one per line; stats go to stderr. Tokenizing is moex.py's job.
 #include <cuda_runtime.h>
 #include <algorithm>
@@ -22,16 +23,18 @@ constexpr float EPS = 1e-6f, THETA = 1e7f;
 static bool is_attn(int l) { return l % 4 == 3; }
 
 struct LayerW {
-    half *in_ln, *post_ln, *router, *sh_g, *sh_u, *sh_d, *sh_gate;
-    half *q, *k, *v, *o, *qn, *kn;                                   // attention
-    half *qkv, *z, *a, *b, *out, *conv, *nw, *alog, *dtb;            // DeltaNet
+    half *in_ln, *post_ln, *router, *sh_gate, *qn, *kn, *a, *b, *conv, *nw, *alog, *dtb;  // small: F16 always
+    Mat sh_g, sh_u, sh_d, q, k, v, o, qkv, z, out;                                        // big: int8 unless --f16
     float *K, *V, *ring, *S;                                          // state
 };
 
 struct Engine {
     Container C;
     std::vector<LayerW> L;
-    half *lm_head, *norm;
+    Mat lm_head;
+    half* norm;
+    bool f16 = false;
+    half* qtmp = nullptr;  // F16 staging for quantization, freed after load
     const half* embed;  // mmapped, stays in RAM
     int ctx;
     // scratch
@@ -59,6 +62,17 @@ struct Engine {
         CK(cudaMemcpy(d, C.map(n), s.bytes, cudaMemcpyHostToDevice));
         return d;
     }
+    Mat wmat(const std::string& n, int64_t O, int64_t I) {
+        if (f16) return {wup(n, O * I)};
+        const StTensor& st = C.at(n);
+        if ((int64_t)st.bytes != O * I * 2) { fprintf(stderr, "shape mismatch %s\n", n.c_str()); exit(1); }
+        CK(cudaMemcpy(qtmp, C.map(n), st.bytes, cudaMemcpyHostToDevice));
+        int8_t* q; float* sc;
+        CK(cudaMalloc(&q, O * I)); CK(cudaMalloc(&sc, O * 4));
+        quantize_rows_i8_k<<<(int)O, 256>>>(qtmp, q, sc, (int)I);
+        CK(cudaGetLastError());
+        return {nullptr, q, sc};
+    }
     static float* falloc(size_t n, bool zero = false) {
         float* d; CK(cudaMalloc(&d, n * 4)); if (zero) CK(cudaMemset(d, 0, n * 4)); return d;
     }
@@ -66,7 +80,8 @@ struct Engine {
     void load() {
         double t0 = now();
         embed = (const half*)C.map("model.embed_tokens.weight");
-        lm_head = wup("lm_head.weight", (int64_t)V * D);
+        if (!f16) CK(cudaMalloc(&qtmp, (size_t)V * D * 2));  // largest matrix
+        lm_head = wmat("lm_head.weight", V, D);
         norm = wup("model.norm.weight", D);
         L.resize(NL);
         for (int i = 0; i < NL; i++) {
@@ -75,27 +90,27 @@ struct Engine {
             w.in_ln = wup(p + "input_layernorm.weight", D);
             w.post_ln = wup(p + "post_attention_layernorm.weight", D);
             w.router = wup(m + "gate.weight", (int64_t)E * D);
-            w.sh_g = wup(m + "shared_expert.gate_proj.weight", (int64_t)SI * D);
-            w.sh_u = wup(m + "shared_expert.up_proj.weight", (int64_t)SI * D);
-            w.sh_d = wup(m + "shared_expert.down_proj.weight", (int64_t)D * SI);
+            w.sh_g = wmat(m + "shared_expert.gate_proj.weight", SI, D);
+            w.sh_u = wmat(m + "shared_expert.up_proj.weight", SI, D);
+            w.sh_d = wmat(m + "shared_expert.down_proj.weight", D, SI);
             w.sh_gate = wup(m + "shared_expert_gate.weight", D);
             if (is_attn(i)) {
                 std::string a = p + "self_attn.";
-                w.q = wup(a + "q_proj.weight", (int64_t)AH * 2 * AHD * D);
-                w.k = wup(a + "k_proj.weight", (int64_t)AKV * AHD * D);
-                w.v = wup(a + "v_proj.weight", (int64_t)AKV * AHD * D);
-                w.o = wup(a + "o_proj.weight", (int64_t)D * AH * AHD);
+                w.q = wmat(a + "q_proj.weight", AH * 2 * AHD, D);
+                w.k = wmat(a + "k_proj.weight", AKV * AHD, D);
+                w.v = wmat(a + "v_proj.weight", AKV * AHD, D);
+                w.o = wmat(a + "o_proj.weight", D, AH * AHD);
                 w.qn = wup(a + "q_norm.weight", AHD);
                 w.kn = wup(a + "k_norm.weight", AHD);
                 w.K = falloc((size_t)AKV * ctx * AHD);
                 w.V = falloc((size_t)AKV * ctx * AHD);
             } else {
                 std::string a = p + "linear_attn.";
-                w.qkv = wup(a + "in_proj_qkv.weight", (int64_t)DC * D);
-                w.z = wup(a + "in_proj_z.weight", (int64_t)DVH * DNV * D);
+                w.qkv = wmat(a + "in_proj_qkv.weight", DC, D);
+                w.z = wmat(a + "in_proj_z.weight", DVH * DNV, D);
                 w.a = wup(a + "in_proj_a.weight", (int64_t)DVH * D);
                 w.b = wup(a + "in_proj_b.weight", (int64_t)DVH * D);
-                w.out = wup(a + "out_proj.weight", (int64_t)D * DVH * DNV);
+                w.out = wmat(a + "out_proj.weight", D, DVH * DNV);
                 w.conv = wup(a + "conv1d.weight", (int64_t)DC * CONVK);
                 w.nw = wup(a + "norm.weight", DNV);
                 w.alog = wup(a + "A_log", DVH);
@@ -104,6 +119,7 @@ struct Engine {
                 w.S = falloc((size_t)DVH * DNK * DNV, true);
             }
         }
+        if (qtmp) { CK(cudaDeviceSynchronize()); CK(cudaFree(qtmp)); qtmp = nullptr; }
         x = falloc(D); h = falloc(D); tmp = falloc(D); moe = falloc(D);
         q = falloc(AH * 2 * AHD); k = falloc(AKV * AHD); v = falloc(AKV * AHD); qo = falloc(AH * AHD); ag = falloc(AH * AHD);
         big = falloc(DC); z = falloc(DVH * DNV); a = falloc(DVH); b = falloc(DVH); conv = falloc(DC); o = falloc(DVH * DNV);
@@ -120,8 +136,8 @@ struct Engine {
         if (nslots < 2 * TOPK) { fprintf(stderr, "only %d expert slots fit; need >= %d\n", nslots, 2 * TOPK); exit(1); }
         CK(cudaMalloc(&arena, (size_t)nslots * EXPERT_BYTES));
         slot_of.assign(NL * E, -1); owner.assign(nslots, -1); last.assign(nslots, 0);
-        fprintf(stderr, "[load] %.1f s, %d expert slots (%.2f GB, %.1f%% of %d experts), ctx %d\n",
-                now() - t0, nslots, nslots * (double)EXPERT_BYTES / 1e9, 100.0 * nslots / (NL * E), NL * E, ctx);
+        fprintf(stderr, "[load] %.1f s, dense %s, %d expert slots (%.2f GB, %.1f%% of %d experts), ctx %d\n",
+                now() - t0, f16 ? "F16" : "int8", nslots, nslots * (double)EXPERT_BYTES / 1e9, 100.0 * nslots / (NL * E), NL * E, ctx);
     }
 
     // Make the layer's selected experts resident and return their slot pointers.
@@ -160,15 +176,15 @@ struct Engine {
             LayerW& w = L[l];
             rmsnorm(x, pending, w.in_ln, h, D, EPS);
             if (is_attn(l)) {
-                gemv_f16(w.q, h, q, D, AH * 2 * AHD); gemv_f16(w.k, h, k, D, AKV * AHD); gemv_f16(w.v, h, v, D, AKV * AHD);
+                gemv(w.q, h, q, D, AH * 2 * AHD); gemv(w.k, h, k, D, AKV * AHD); gemv(w.v, h, v, D, AKV * AHD);
                 attn_decode(q, k, v, w.qn, w.kn, qo, w.K, w.V, ag, AH, AKV, pos, ctx, ROT, THETA, EPS);
-                gemv_f16(w.o, ag, tmp, AH * AHD, D);
+                gemv(w.o, ag, tmp, AH * AHD, D);
                 mark(0, t);
             } else {
-                gemv_f16(w.qkv, h, big, D, DC); gemv_f16(w.z, h, z, D, DVH * DNV);
+                gemv(w.qkv, h, big, D, DC); gemv(w.z, h, z, D, DVH * DNV);
                 gemv_f16(w.a, h, a, D, DVH); gemv_f16(w.b, h, b, D, DVH);
                 deltanet_core(big, z, a, b, w.conv, w.alog, w.dtb, w.nw, w.ring, w.S, conv, o, DC, CONVK, DVH, DKH, EPS);
-                gemv_f16(w.out, o, tmp, DVH * DNV, D);
+                gemv(w.out, o, tmp, DVH * DNV, D);
                 mark(1, t);
             }
             rmsnorm(x, tmp, w.post_ln, h, D, EPS);
@@ -190,7 +206,7 @@ struct Engine {
         // the last MoE output is folded into x here, or by the next token's first norm
         rmsnorm(x, pending, norm, h, D, EPS);
         if (!want_logits) return -1;
-        gemv_f16(lm_head, h, logits, D, V);
+        gemv(lm_head, h, logits, D, V);
         argmax(logits, V, amv, ams, tok_d);
         int id; CK(cudaMemcpy(&id, tok_d, 4, cudaMemcpyDeviceToHost));
         mark(6, t);
@@ -217,7 +233,7 @@ int main(int argc, char** argv) {
     std::vector<int> ids, stop;
     int n = 32, ctx = 2048;
     std::string check;
-    bool prof = false;
+    bool prof = false, f16 = false;
     for (int i = 1; i < argc; i++) {
         std::string s = argv[i];
         auto next = [&] { if (i + 1 >= argc) { fprintf(stderr, "%s needs a value\n", s.c_str()); exit(2); } return std::string(argv[++i]); };
@@ -227,6 +243,7 @@ int main(int argc, char** argv) {
         else if (s == "--stop") stop = parse_ids(next());
         else if (s == "--check") check = next();
         else if (s == "--profile") prof = true;
+        else if (s == "--f16") f16 = true;
         else { fprintf(stderr, "unknown arg %s\n", s.c_str()); return 2; }
     }
     if (!check.empty()) {  // ids come from the golden run's meta.json
@@ -239,10 +256,11 @@ int main(int argc, char** argv) {
     if (ids.empty()) { fprintf(stderr, "usage: moex --ids 1,2,3 [--n N] | --check ref/golden\n"); return 2; }
 
     Engine eng(model, ctx);
+    eng.f16 = f16;
     eng.load();
 
     if (!check.empty()) {
-        int pos = 0, tok = ids[0], bad = 0; double worst = 0;
+        int pos = 0, tok = ids[0], bad = 0; double worst = 0, worst_kl = 0;
         for (;; pos++) {
             auto ref = read_f32(check + "/p" + std::string(pos < 10 ? "00" : pos < 100 ? "0" : "") + std::to_string(pos) + "_logits.bin");
             if (ref.empty()) break;
@@ -251,12 +269,18 @@ int main(int argc, char** argv) {
             double mx = 0, err = 0;
             for (int i = 0; i < V; i++) { mx = std::max(mx, (double)fabsf(ref[i])); err = std::max(err, (double)fabsf(got[i] - ref[i])); }
             int rid = int(std::max_element(ref.begin(), ref.end()) - ref.begin());
-            worst = std::max(worst, err / mx); bad += id != rid;
-            fprintf(stderr, "  pos %2d tok %6d  logits rel %.3e  argmax %6d ref %6d %s\n", pos, tok, err / mx, id, rid, id == rid ? "" : "MISMATCH");
+            // KL(ref || got) of the next-token distributions
+            double mr = ref[rid], mg = *std::max_element(got.begin(), got.end()), zr = 0, zg = 0, kl = 0;
+            for (int i = 0; i < V; i++) { zr += exp(ref[i] - mr); zg += exp(got[i] - mg); }
+            for (int i = 0; i < V; i++) { double lp = ref[i] - mr - log(zr), lq = got[i] - mg - log(zg); kl += exp(lp) * (lp - lq); }
+            worst = std::max(worst, err / mx); worst_kl = std::max(worst_kl, kl); bad += id != rid;
+            fprintf(stderr, "  pos %2d tok %6d  logits rel %.3e  KL %.2e  argmax %6d ref %6d %s\n", pos, tok, err / mx, kl, id, rid, id == rid ? "" : "MISMATCH");
             tok = pos + 1 < (int)ids.size() ? ids[pos + 1] : id;
         }
-        bool ok = pos > 0 && bad == 0 && worst < 1e-4;
-        fprintf(stderr, "[check] %d positions, worst logits rel %.3e, argmax mismatches %d -> %s\n", pos, worst, bad, ok ? "PASS" : "FAIL");
+        // F16 must be numerically identical; int8 is judged by distribution drift (KL) and greedy agreement
+        bool ok = pos > 0 && bad == 0 && (f16 ? worst < 1e-4 : worst_kl < 0.02);
+        fprintf(stderr, "[check] %s, %d positions, worst logits rel %.3e, worst KL %.2e, argmax mismatches %d -> %s\n",
+                f16 ? "F16" : "int8", pos, worst, worst_kl, bad, ok ? "PASS" : "FAIL");
         return ok ? 0 : 1;
     }
 

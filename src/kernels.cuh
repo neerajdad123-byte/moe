@@ -71,6 +71,60 @@ inline void gemv_f16(const half* W, const float* x, float* y, int I, int O, cuda
     gemv_f16_k<WARPS><<<(O + WARPS - 1) / WARPS, WARPS * 32, 0, st>>>(W, x, y, I, O);
 }
 
+// ---- K10: int8 dense GEMV, y[r] = s[r] * (Q[r,:] . x), per-row symmetric scale ----
+// One warp per row, 16-byte loads (16 int8) per lane. Requires I % 512 == 0.
+template <int WARPS>
+__global__ void gemv_i8_k(const int8_t* __restrict__ Q, const float* __restrict__ s, const float* __restrict__ x,
+                          float* __restrict__ y, int I, int O) {
+    int row = blockIdx.x * WARPS + (threadIdx.x >> 5), lane = threadIdx.x & 31;
+    if (row >= O) return;
+    const uint4* wr = reinterpret_cast<const uint4*>(Q + (size_t)row * I);
+    const float4* xv = reinterpret_cast<const float4*>(x);
+    float acc = 0.f;
+#pragma unroll 4
+    for (int c = lane; c < I / 16; c += 32) {
+        uint4 u = __ldcs(wr + c);
+        const uint32_t w[4] = {u.x, u.y, u.z, u.w};
+#pragma unroll
+        for (int j = 0; j < 4; j++) {
+            float4 xx = __ldg(xv + 4 * c + j);
+            acc += (float)(int8_t)(w[j]) * xx.x + (float)(int8_t)(w[j] >> 8) * xx.y +
+                   (float)(int8_t)(w[j] >> 16) * xx.z + (float)(int8_t)(w[j] >> 24) * xx.w;
+        }
+    }
+    acc = warp_sum(acc);
+    if (lane == 0) y[row] = acc * s[row];
+}
+
+// F16 [O,I] -> int8 [O,I] + f32 scale per row (absmax / 127). One block per row.
+__global__ void quantize_rows_i8_k(const half* __restrict__ W, int8_t* __restrict__ Q, float* __restrict__ s, int I) {
+    const half* wr = W + (size_t)blockIdx.x * I;
+    float m = 0.f;
+    for (int i = threadIdx.x; i < I; i += blockDim.x) m = fmaxf(m, fabsf(__half2float(wr[i])));
+    for (int o = 16; o; o >>= 1) m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, o));
+    __shared__ float red[32];
+    if ((threadIdx.x & 31) == 0) red[threadIdx.x >> 5] = m;
+    __syncthreads();
+    m = 0.f; for (int i = 0; i < (int)blockDim.x / 32; i++) m = fmaxf(m, red[i]);
+    float sc = m > 0.f ? m / 127.f : 1.f;
+    for (int i = threadIdx.x; i < I; i += blockDim.x)
+        Q[(size_t)blockIdx.x * I + i] = (int8_t)__float2int_rn(__half2float(wr[i]) / sc);
+    if (threadIdx.x == 0) s[blockIdx.x] = sc;
+}
+
+// A dense matrix in whichever form it was loaded: F16 (exact) or int8 + row scales.
+struct Mat {
+    const half* f16 = nullptr;
+    const int8_t* q = nullptr;
+    const float* s = nullptr;
+};
+
+inline void gemv(const Mat& m, const float* x, float* y, int I, int O, cudaStream_t st = 0) {
+    constexpr int WARPS = 8;
+    if (m.q) gemv_i8_k<WARPS><<<(O + WARPS - 1) / WARPS, WARPS * 32, 0, st>>>(m.q, m.s, x, y, I, O);
+    else gemv_f16(m.f16, x, y, I, O, st);
+}
+
 // ---- K3: router: softmax over E logits, top-K (ties -> lower index), raw probs (norm_topk_prob=false) ----
 // One block of E threads (E <= 1024, multiple of 32).
 __global__ void router_topk_k(const float* __restrict__ logits, int E, int K, int norm,
@@ -360,15 +414,15 @@ inline void argmax(const float* x, int n, float* sv, int* si, int* out, cudaStre
     argmax_k<<<1, 256, 0, st>>>(sv, si, ARGMAX_BLOCKS, sv + ARGMAX_BLOCKS, out);
 }
 
-// Shared expert added into `out`. Weights F16: gate/up [SI,H], down [H,SI], sgate [1,H].
+// Shared expert added into `out`. gate/up [SI,H], down [H,SI], sgate F16 [1,H].
 // scratch: >= 2*SI + H + 1 floats.
-inline void shared_expert_add(const half* Wg, const half* Wu, const half* Wd, const half* Wsg,
+inline void shared_expert_add(const Mat& Wg, const Mat& Wu, const Mat& Wd, const half* Wsg,
                               const float* x, float* out, float* scratch, int H, int SI, cudaStream_t st = 0) {
     float *g = scratch, *u = g + SI, *sh = u + SI, *sl = sh + H;
-    gemv_f16(Wg, x, g, H, SI, st);
-    gemv_f16(Wu, x, u, H, SI, st);
+    gemv(Wg, x, g, H, SI, st);
+    gemv(Wu, x, u, H, SI, st);
     gemv_f16(Wsg, x, sl, H, 1, st);
     silu_mul_k<<<(SI + 255) / 256, 256, 0, st>>>(g, u, SI);
-    gemv_f16(Wd, g, sh, SI, H, st);
+    gemv(Wd, g, sh, SI, H, st);
     gated_add_k<<<(H + 255) / 256, 256, 0, st>>>(out, sh, sl, H);
 }

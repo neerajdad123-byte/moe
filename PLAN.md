@@ -67,7 +67,7 @@ Dense int8 → ~75 tok/s ceiling; dense int4 → ~110. So dense requantization i
 - [ ] B2 llama.cpp / ik_llama `--n-cpu-moe` on a Qwen3.6-35B-A3B GGUF (needs download)
 
 ### Upgrades (only after Phase 2 works)
-- [ ] U1 Dense trunk requant F16 → int8 (then int4 gs64): frees ~2 GB VRAM for experts, halves bytes/token
+- [x] U1 Dense trunk requant F16 → int8 (then int4 gs64): frees ~2 GB VRAM for experts, halves bytes/token
 - [ ] U2 dp4a / int8-activation expert GEMV
 - [ ] U3 CUDA graphs per decode step
 - [ ] U4 Prefill path (batched GEMM, chunked DeltaNet)
@@ -100,4 +100,15 @@ Dense int8 → ~75 tok/s ceiling; dense int4 → ~110. So dense requantization i
 | Decode, warm page cache | **11.2 tok/s**: ~30 ms compute + 59 ms blocking expert copies (45% hit, 175 misses/token) |
 | Decode, cold page cache | 3.4 tok/s (misses read from SSD) |
 | Prompt | token-by-token, 9 tok/s (no prefill path yet) |
+
+**U1 int8 dense (measured):**
+
+| | F16 | int8 |
+|---|---|---|
+| K10 kernel vs exact int8 math | — | rel 1e-7 |
+| lm_head / qkv / out_proj | 6.25 / 0.216 / 0.128 ms | **2.77 / 0.124 / 0.072 ms** (98% / 72% / 62% of 188 GB/s) |
+| `--check` vs reference | KL 1e-11 (exact) | 12/12 greedy identical, KL typ. 1e-3, worst 0.014 (pos 0) |
+| Expert slots | 542 (5.3%) | **1620 (15.8%)** |
+| Expert hit rate (LRU) | 45.2% | **75.5%** |
+| Decode, warm | 11.2 tok/s | **19.2 tok/s** = ~20 ms compute + 32 ms blocking misses |
 

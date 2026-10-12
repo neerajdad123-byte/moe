@@ -154,14 +154,51 @@ int main(int argc, char** argv) {
             half *Wg = wup(C, lp + "shared_expert.gate_proj.weight"), *Wu = wup(C, lp + "shared_expert.up_proj.weight"),
                  *Wd = wup(C, lp + "shared_expert.down_proj.weight"), *Ws = wup(C, lp + "shared_expert_gate.weight");
             experts_forward(slots, w, K, h, act, out);
-            shared_expert_add(Wg, Wu, Wd, Ws, h, out, scr, D, SI);
+            shared_expert_add({Wg}, {Wu}, {Wd}, Ws, h, out, scr, D, SI);
             check((std::string(pf) + "routed+shared -> moe_out").c_str(), down(out, D), golden(pf + std::string("moe_out")), 1e-5f);
             if (L == 0) {
                 bench("router gemv 256x2048 + topk", 256.0 * D * 2, [&] { gemv_f16(Wr, h, logits, D, E); router_topk(logits, E, K, false, idx, w); });
                 bench("experts x8 int4 gs64", (double)K * EXPERT_BYTES, [&] { experts_forward(slots, w, K, h, act, out); });
-                bench("shared expert F16", 3.0 * SI * D * 2, [&] { shared_expert_add(Wg, Wu, Wd, Ws, h, out, scr, D, SI); });
+                bench("shared expert F16", 3.0 * SI * D * 2, [&] { shared_expert_add({Wg}, {Wu}, {Wd}, Ws, h, out, scr, D, SI); });
             }
             for (void* p : {(void*)Wr, (void*)h, (void*)Wg, (void*)Wu, (void*)Wd, (void*)Ws}) CK(cudaFree(p));
+        }
+    }
+
+    if (want(filt, "K10")) {
+        printf("K10 gemv_i8 (per-row int8, quantized on GPU)\n");
+        half* in0 = wup(C, "model.layers.0.input_layernorm.weight");
+        float* x = up(golden(P + "L00_x_in")); float* h = dalloc(D);
+        rmsnorm(x, nullptr, in0, h, D, EPS);
+        auto hh = down(h, D);
+        struct Case { const char* name; int O, I; } cases[] = {
+            {"model.layers.0.linear_attn.in_proj_qkv.weight", 8192, D},
+            {"model.layers.0.linear_attn.out_proj.weight", D, 4096},
+            {"lm_head.weight", 248320, D}};
+        for (auto& cs : cases) {
+            half* W = wup(C, cs.name);
+            int8_t* q; float* s; CK(cudaMalloc(&q, (size_t)cs.O * cs.I)); CK(cudaMalloc(&s, cs.O * 4));
+            quantize_rows_i8_k<<<cs.O, 256>>>(W, q, s, cs.I);
+            std::vector<float> xin(cs.I);
+            for (int i = 0; i < cs.I; i++) xin[i] = hh[i % D] * (1 + (i / D));  // reuse a real activation for I=4096
+            float* xd = up(xin); float* y = dalloc(cs.O); float* yf = dalloc(cs.O);
+            gemv({nullptr, q, s}, xd, y, cs.I, cs.O);
+            gemv_f16(W, xd, yf, cs.I, cs.O);
+            // exact int8 reference on the host, first 4096 rows
+            int R = std::min(cs.O, 4096);
+            std::vector<int8_t> hq((size_t)R * cs.I); std::vector<float> hs(R);
+            CK(cudaMemcpy(hq.data(), q, hq.size(), cudaMemcpyDeviceToHost)); CK(cudaMemcpy(hs.data(), s, R * 4, cudaMemcpyDeviceToHost));
+            std::vector<float> ref(R);
+            for (int r = 0; r < R; r++) { double a = 0; for (int i = 0; i < cs.I; i++) a += (double)hq[(size_t)r * cs.I + i] * xin[i]; ref[r] = float(a * hs[r]); }
+            auto got = down(y, cs.O); got.resize(R);
+            std::string nm = std::string(cs.name).substr(std::string(cs.name).rfind('.', strlen(cs.name) - 8) + 1);
+            check((nm + " kernel vs exact int8").c_str(), got, ref, 1e-5f);
+            // quantization error vs F16 (informational: this is model drift, not a kernel bug)
+            auto gq = down(y, cs.O), gf = down(yf, cs.O);
+            double mx = 0, e = 0; for (int i = 0; i < cs.O; i++) { mx = std::max(mx, (double)fabsf(gf[i])); e = std::max(e, (double)fabsf(gq[i] - gf[i])); }
+            printf("  %-34s int8-vs-F16 rel %.3e (quantization drift)\n", nm.c_str(), e / mx);
+            bench((nm + " int8").c_str(), (double)cs.O * cs.I + cs.O * 4.0, [&] { gemv({nullptr, q, s}, xd, y, cs.I, cs.O); }, cs.O > 100000 ? 20 : 50);
+            for (void* p : {(void*)W, (void*)q, (void*)s, (void*)xd, (void*)y, (void*)yf}) CK(cudaFree(p));
         }
     }
 
