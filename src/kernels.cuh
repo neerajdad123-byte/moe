@@ -184,67 +184,97 @@ constexpr size_t EXPERT_Q_BYTES = (size_t)3 * EH * EI / 2;                      
 constexpr size_t EXPERT_BYTES = EXPERT_Q_BYTES + (size_t)3 * EI * (EH / EGS) * 4;   // + 196,608
 
 // 16 bytes = 32 int4 values; dot with 32 consecutive fp32 x values.
+// Dequant without int->float converts (low-throughput on Ada): u = nibble ^ 8 is v + 8 in [0,15], and the
+// float with bits 0x4B000000 | u is exactly 2^23 + u, so subtracting 2^23 + 8 gives v exactly.
+// x must be 16-byte aligned (read as 8 float4).
 __device__ __forceinline__ float dot32_i4(uint4 u, const float* __restrict__ x) {
-    const uint32_t q[4] = {u.x, u.y, u.z, u.w};
+    const uint32_t q[4] = {u.x ^ 0x88888888u, u.y ^ 0x88888888u, u.z ^ 0x88888888u, u.w ^ 0x88888888u};
+    const float4* xv = reinterpret_cast<const float4*>(x);
     float acc = 0.f;
 #pragma unroll
     for (int j = 0; j < 4; j++) {
+        float4 a = xv[2 * j], b = xv[2 * j + 1];
+        const float xs[8] = {a.x, a.y, a.z, a.w, b.x, b.y, b.z, b.w};
 #pragma unroll
-        for (int n = 0; n < 8; n++) {
-            int v = (int)((q[j] >> (4 * n)) & 0xF);
-            acc += (float)(v - ((v & 8) << 1)) * x[8 * j + n];
-        }
+        for (int n = 0; n < 8; n++)
+            acc += (__int_as_float(0x4B000000u | ((q[j] >> (4 * n)) & 0xFu)) - 8388616.f) * xs[n];
     }
     return acc;
 }
 
-// act[k][I] = silu(gate_k . x) * (up_k . x). One warp per (expert, row); rows are 1024 B = 64 uint4.
-template <int WARPS>
-__global__ void expert_gate_up_k(const uint8_t* const* __restrict__ slots, const int* __restrict__ nh,
-                                 const float* __restrict__ x, float* __restrict__ act) {
-    if (nh && (int)(blockIdx.x * WARPS / EI) >= *nh) return;  // whole block is one expert: past the hit count
-    __shared__ __align__(16) float xs[EH];
-    for (int i = threadIdx.x; i < EH; i += blockDim.x) xs[i] = x[i];
-    __syncthreads();
-    int r = blockIdx.x * WARPS + (threadIdx.x >> 5), lane = threadIdx.x & 31;
-    int k = r / EI, row = r % EI;
-    const uint8_t* s = slots[k];
-    const uint4* g = reinterpret_cast<const uint4*>(s + (size_t)row * (EH / 2));
-    const uint4* u = reinterpret_cast<const uint4*>(s + (size_t)(EI + row) * (EH / 2));
-    const float* sc = reinterpret_cast<const float*>(s + EXPERT_Q_BYTES);
-    const float* gsc = sc + row * (EH / EGS);
-    const float* usc = sc + EI * (EH / EGS) + row * (EH / EGS);
-    float ag = 0.f, au = 0.f;
-#pragma unroll
-    for (int c = lane; c < EH / 32; c += 32) {  // uint4 c covers x[32c..32c+31], group c/2
-        uint4 qg = __ldcs(g + c), qu = __ldcs(u + c);
-        ag += dot32_i4(qg, xs + 32 * c) * gsc[c >> 1];
-        au += dot32_i4(qu, xs + 32 * c) * usc[c >> 1];
-    }
-    ag = warp_sum(ag); au = warp_sum(au);
-    if (lane == 0) act[r] = ag / (1.f + __expf(-ag)) * au;
+// Shared-memory layout for activations read 32 at a time per lane: lane c starts at element 32c, a 128-byte
+// stride that puts every lane on the same banks. Padding 4 floats per 32 shifts each lane by one 16-byte bank group.
+__device__ __forceinline__ int xpad(int i) { return i + (i >> 5) * 4; }
+__host__ __device__ constexpr int xpad_size(int n) { return n + n / 8; }
+
+// Persistent grid: enough blocks to fill the GPU once, each loading its shared inputs once and then
+// looping over rows (a block per 8 rows re-read the 8-16 KB of inputs ~500 times per layer).
+inline int persistent_blocks() {
+    static int n = 0;
+    if (!n) { int sms; cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, 0); n = sms * 4; }
+    return n;
 }
 
-// out[H] = sum_k w[k] * (down_k . act_k). One warp per output row; a down row is 256 B = 16 uint4,
+// act[k][I] = silu(gate_k . x) * (up_k . x). One warp per (expert, row) at a time; rows are 1024 B = 64 uint4.
+// nh: optional device count of valid experts (<= K).
+template <int WARPS>
+__global__ void expert_gate_up_k(const uint8_t* const* __restrict__ slots, int K, const int* __restrict__ nh,
+                                 const float* __restrict__ x, float* __restrict__ act) {
+    __shared__ __align__(16) float xs[xpad_size(EH)];
+    for (int i = threadIdx.x; i < EH; i += blockDim.x) xs[xpad(i)] = x[i];
+    __syncthreads();
+    const int rows = (nh ? *nh : K) * EI, lane = threadIdx.x & 31;
+    for (int r = blockIdx.x * WARPS + (threadIdx.x >> 5); r < rows; r += gridDim.x * WARPS) {
+        int k = r / EI, row = r % EI;
+        const uint8_t* s = slots[k];
+        const uint4* g = reinterpret_cast<const uint4*>(s + (size_t)row * (EH / 2));
+        const uint4* u = reinterpret_cast<const uint4*>(s + (size_t)(EI + row) * (EH / 2));
+        const float* sc = reinterpret_cast<const float*>(s + EXPERT_Q_BYTES);
+        const float* gsc = sc + row * (EH / EGS);
+        const float* usc = sc + EI * (EH / EGS) + row * (EH / EGS);
+        float ag = 0.f, au = 0.f;
+#pragma unroll
+        for (int c = lane; c < EH / 32; c += 32) {  // uint4 c covers x[32c..32c+31], group c/2
+            uint4 qg = __ldcs(g + c), qu = __ldcs(u + c);
+            ag += dot32_i4(qg, xs + 36 * c) * gsc[c >> 1];
+            au += dot32_i4(qu, xs + 36 * c) * usc[c >> 1];
+        }
+        ag = warp_sum(ag); au = warp_sum(au);
+        if (lane == 0) act[r] = ag / (1.f + __expf(-ag)) * au;
+    }
+}
+
+// out[H] = sum_k w[k] * (down_k . act_k). One warp per output row at a time; a down row is 256 B = 16 uint4,
 // so a warp covers two experts per iteration.
 template <int WARPS>
 __global__ void expert_down_k(const uint8_t* const* __restrict__ slots, const float* __restrict__ w, int K,
                               const int* __restrict__ nh, const float* __restrict__ act, float* __restrict__ out) {
     if (nh) K = *nh;
-    extern __shared__ __align__(16) float as[];  // [K][EI]
-    for (int i = threadIdx.x; i < K * EI; i += blockDim.x) as[i] = act[i];
+    extern __shared__ __align__(16) float as[];  // [K][xpad_size(EI)]
+    for (int i = threadIdx.x; i < K * EI; i += blockDim.x) as[(i / EI) * xpad_size(EI) + xpad(i % EI)] = act[i];
     __syncthreads();
-    int d = blockIdx.x * WARPS + (threadIdx.x >> 5), lane = threadIdx.x & 31;
-    int half_ = lane >> 4, c = lane & 15;
-    float acc = 0.f;
-    for (int k = half_; k < K; k += 2) {
-        const uint8_t* s = slots[k];
-        uint4 q = __ldcs(reinterpret_cast<const uint4*>(s + (size_t)2 * EI * (EH / 2) + (size_t)d * (EI / 2)) + c);
-        const float* sc = reinterpret_cast<const float*>(s + EXPERT_Q_BYTES) + 2 * EI * (EH / EGS) + d * (EI / EGS);
-        acc += w[k] * sc[c >> 1] * dot32_i4(q, as + k * EI + 32 * c);
+    const int lane = threadIdx.x & 31, half_ = lane >> 4, c = lane & 15;
+    constexpr int KMAX = 8;  // = top-k; all of a row's loads are issued before any math (latency-bound otherwise)
+    for (int d = blockIdx.x * WARPS + (threadIdx.x >> 5); d < EH; d += gridDim.x * WARPS) {
+        uint4 q[KMAX / 2]; float sw[KMAX / 2];
+#pragma unroll
+        for (int i = 0; i < KMAX / 2; i++) {
+            int k = 2 * i + half_;
+            if (k < K) {
+                const uint8_t* s = slots[k];
+                q[i] = __ldcs(reinterpret_cast<const uint4*>(s + (size_t)2 * EI * (EH / 2) + (size_t)d * (EI / 2)) + c);
+                sw[i] = w[k] * reinterpret_cast<const float*>(s + EXPERT_Q_BYTES)[2 * EI * (EH / EGS) + d * (EI / EGS) + (c >> 1)];
+            }
+        }
+        float acc = 0.f;
+#pragma unroll
+        for (int i = 0; i < KMAX / 2; i++) {
+            int k = 2 * i + half_;
+            if (k < K) acc += sw[i] * dot32_i4(q[i], as + k * xpad_size(EI) + 36 * c);
+        }
+        acc = warp_sum(acc);
+        if (lane == 0) out[d] = acc;
     }
-    acc = warp_sum(acc);
-    if (lane == 0) out[d] = acc;
 }
 
 // slots: device array of up to K slot pointers; w: device weights; act: scratch [K*EI].
@@ -253,8 +283,9 @@ __global__ void expert_down_k(const uint8_t* const* __restrict__ slots, const fl
 inline void experts_forward(const uint8_t* const* slots, const float* w, int K, const float* x,
                             float* act, float* out, cudaStream_t st = 0, const int* nh = nullptr) {
     constexpr int WARPS = 8;
-    expert_gate_up_k<WARPS><<<K * EI / WARPS, WARPS * 32, 0, st>>>(slots, nh, x, act);
-    expert_down_k<WARPS><<<EH / WARPS, WARPS * 32, K * EI * sizeof(float), st>>>(slots, w, K, nh, act, out);
+    int nb = persistent_blocks();
+    expert_gate_up_k<WARPS><<<nb, WARPS * 32, 0, st>>>(slots, K, nh, x, act);
+    expert_down_k<WARPS><<<nb, WARPS * 32, K * xpad_size(EI) * sizeof(float), st>>>(slots, w, K, nh, act, out);
 }
 
 // Batched slot-table writes, passed by value so each lands with the value it had when enqueued.

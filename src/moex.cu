@@ -59,6 +59,7 @@ struct Engine {
     uint64_t clock = 0;
     long long hits = 0, misses = 0, admits = 0;
     double cpu_s = 0;
+    double ht[4] = {};  // host time per phase: launch (poll+flush+graph), wait for routing, CPU misses, admissions
     std::vector<const uint8_t*> eq;  // mmapped expert blobs [NL*E]
     std::vector<const float*> es;    // and their scales
     // CPU side of the MoE
@@ -395,10 +396,14 @@ struct Engine {
         copy_k<<<(D + 255) / 256, 256, 0, cs>>>(x, h_hd, D);  // zero-copy from the mapped host row
         set_int_k<<<1, 1, 0, cs>>>(pos_d, pos);
         for (int l = 0; l < NL; l++) {
+            double h0 = now();
             poll_admissions();
             flush_table();  // the GPU's view of residency for this layer == the host's ready[] below
             if (prof || graphs.empty()) enqueue_layer(l); else CK(cudaGraphLaunch(graphs[l], cs));
+            double h1 = now();
             CK(cudaEventSynchronize(ev_route));  // host needs the routing only for the misses
+            double h2 = now();
+            ht[0] += h1 - h0; ht[1] += h2 - h1;
             mark(0, t);
             if (trace) {
                 int16_t rec[12] = {(int16_t)trace_prompt, (int16_t)pos, (int16_t)l, (int16_t)trace_phase};
@@ -419,10 +424,12 @@ struct Engine {
             if (nm) {
                 double c0 = now();
                 cpu.run(nm, mq, msc, mw, h_h, y_h);
-                cpu_s += now() - c0;
+                double c1 = now();
+                cpu_s += c1 - c0; ht[2] += c1 - c0;
                 add_k<<<(D + 255) / 256, 256, 0, cs>>>(moe, y_hd, D);  // reads the host buffer over PCIe
                 for (int j = 0; j < nm; j++) if (mkey[j] >= 0) admit(mkey[j]);
                 start_admissions();
+                ht[3] += now() - c1;
             }
             mark(1, t);
         }
@@ -510,7 +517,7 @@ int main(int argc, char** argv) {
         return ok ? 0 : 1;
     }
 
-    struct Stats { int dec = 0; double sec = 0; long long hits = 0, misses = 0, admits = 0; double cpu = 0; };
+    struct Stats { int dec = 0; double sec = 0; long long hits = 0, misses = 0, admits = 0; double cpu = 0, ht[4] = {}; };
     // Prompt token-by-token, then up to n greedy tokens. Returns decode-phase stats.
     auto generate = [&](const std::vector<int>& p, std::vector<int>& out, bool stream) {
         Stats st;
@@ -519,6 +526,7 @@ int main(int argc, char** argv) {
         int pos = 0, tok = -1;
         for (; pos < (int)p.size(); pos++) tok = eng.step(p[pos], pos, pos + 1 == (int)p.size());
         long long h0 = eng.hits, m0 = eng.misses, a0 = eng.admits; double c0 = eng.cpu_s, t1 = now();
+        double ht0[4]; for (int i = 0; i < 4; i++) ht0[i] = eng.ht[i];
         eng.trace_phase = 1;
         for (int gen = 0; gen < n; gen++) {
             out.push_back(tok);
@@ -528,6 +536,7 @@ int main(int argc, char** argv) {
             st.dec++;
         }
         st.sec = now() - t1; st.hits = eng.hits - h0; st.misses = eng.misses - m0; st.admits = eng.admits - a0; st.cpu = eng.cpu_s - c0;
+        for (int i = 0; i < 4; i++) st.ht[i] = eng.ht[i] - ht0[i];
         return st;
     };
     auto report = [&](const char* tag, const Stats& st) {
@@ -535,6 +544,8 @@ int main(int argc, char** argv) {
         fprintf(stderr, "[%s] %d tok in %.2f s = %.2f tok/s | expert hit %.1f%% | %.1f misses/tok on CPU = %.1f ms/tok | %lld admitted\n",
                 tag, st.dec, st.sec, st.dec / std::max(st.sec, 1e-9), 100.0 * st.hits / std::max(st.hits + st.misses, 1LL),
                 (double)st.misses / dec, 1e3 * st.cpu / dec, st.admits);
+        fprintf(stderr, "    host ms/tok: launch %.2f  wait-routing %.2f  cpu-misses %.2f  admissions %.2f\n",
+                1e3 * st.ht[0] / dec, 1e3 * st.ht[1] / dec, 1e3 * st.ht[2] / dec, 1e3 * st.ht[3] / dec);
     };
     if (!trace_path.empty() && !(eng.trace = fopen(trace_path.c_str(), "wb"))) { fprintf(stderr, "cannot write %s\n", trace_path.c_str()); return 1; }
 
@@ -556,6 +567,7 @@ int main(int argc, char** argv) {
             char tag[32]; snprintf(tag, sizeof tag, "prompt %zu", i);
             report(tag, st);
             tot.dec += st.dec; tot.sec += st.sec; tot.hits += st.hits; tot.misses += st.misses; tot.admits += st.admits; tot.cpu += st.cpu;
+            for (int k = 0; k < 4; k++) tot.ht[k] += st.ht[k];
         }
         report("batch total", tot);
         if (eng.trace) fclose(eng.trace);
