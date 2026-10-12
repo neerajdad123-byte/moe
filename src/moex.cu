@@ -12,6 +12,7 @@
 #include <chrono>
 #include <cmath>
 #include <iostream>
+#include <intrin.h>
 #include <cstdio>
 #include <deque>
 #include <random>
@@ -148,6 +149,14 @@ struct Engine {
             r.push_back({(void*)eq[k], EXPERT_Q_BYTES});
             r.push_back({(void*)es[k], EXPERT_BYTES - EXPERT_Q_BYTES});
             total += EXPERT_BYTES;
+        }
+        MEMORYSTATUSEX ms{sizeof ms};
+        GlobalMemoryStatusEx(&ms);
+        if (ms.ullTotalPhys < total + (5ull << 30)) {  // the OS and other programs need room too
+            fprintf(stderr, "[ram] %.1f GB of RAM is below the ~%.0f GB needed to keep all %.1f GB of experts in memory: "
+                            "experts are read through the file cache instead, and decode is slower (CPU misses may wait on the disk)\n",
+                    ms.ullTotalPhys / 1e9, (total + (5ull << 30)) / 1e9, total / 1e9);
+            return;
         }
         // ask for the largest minimum working set Windows will grant, in 1 GB steps
         SIZE_T got = 0;
@@ -338,6 +347,7 @@ struct Engine {
         size_t fr, tot; CK(cudaMemGetInfo(&fr, &tot));
         const size_t reserve = 320ull << 20;
         nslots = (int)((fr - std::min(fr, reserve)) / EXPERT_BYTES);
+        nslots = std::min(nslots, NL * E + (int)((carve_prefill(nullptr) + EXPERT_BYTES - 1) / EXPERT_BYTES));  // big GPUs: every expert fits
         nres = (int)((carve_prefill(nullptr) + EXPERT_BYTES - 1) / EXPERT_BYTES);
         if (nslots < nres + 2 * TOPK) { fprintf(stderr, "only %d expert slots fit; need >= %d\n", nslots, 2 * TOPK); exit(1); }
         CK(cudaMalloc(&arena, (size_t)nslots * EXPERT_BYTES));
@@ -768,7 +778,18 @@ static std::vector<float> read_f32(const std::string& p) {
     return v;
 }
 
+// The CPU expert kernels are AVX2 (every x86 CPU since ~2013); say so instead of crashing on an illegal instruction.
+static bool has_avx2() {
+    int r[4];
+    __cpuid(r, 1);
+    bool osxsave = (r[2] >> 27) & 1, avx = (r[2] >> 28) & 1, fma = (r[2] >> 12) & 1;
+    if (!osxsave || !avx || !fma || (_xgetbv(0) & 6) != 6) return false;
+    __cpuidex(r, 7, 0);
+    return (r[1] >> 5) & 1;
+}
+
 int main(int argc, char** argv) {
+    if (!has_avx2()) { fprintf(stderr, "moex needs a CPU with AVX2 and FMA (Intel Haswell / AMD Zen or newer).\n"); return 1; }
     std::string model = getenv("QWEN36_MODEL") ? getenv("QWEN36_MODEL") : "C:\\models\\qwen36_i4_gs64";
     std::string mode, system_prompt;
     bool think = false, samp_set = false, n_set = false;
