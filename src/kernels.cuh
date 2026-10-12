@@ -25,6 +25,19 @@ __device__ __forceinline__ float block_sum(float v) {
     return warp_sum(v);
 }
 
+// Block-wide max; every thread gets the result. blockDim.x multiple of 32, <= 1024.
+__device__ __forceinline__ float block_max(float v) {
+    __shared__ float s[32];
+    for (int o = 16; o; o >>= 1) v = fmaxf(v, __shfl_xor_sync(0xffffffffu, v, o));
+    int w = threadIdx.x >> 5, l = threadIdx.x & 31;
+    __syncthreads();
+    if (l == 0) s[w] = v;
+    __syncthreads();
+    v = l < (blockDim.x >> 5) ? s[l] : -INFINITY;
+    for (int o = 16; o; o >>= 1) v = fmaxf(v, __shfl_xor_sync(0xffffffffu, v, o));
+    return v;
+}
+
 // ---- K1: RMSNorm, Qwen3.5 style: y = x * rsqrt(mean(x^2)+eps) * (1 + w) ----
 // One block per row. If `delta` is set, x += delta first (residual add) and x is written back.
 __global__ void rmsnorm_k(float* __restrict__ x, const float* __restrict__ delta,
@@ -532,12 +545,13 @@ __global__ void gated_add_k(float* __restrict__ out, const float* __restrict__ s
 
 // ---- K6: per-head RMSNorm(1+w) + partial RoPE, then append k/v to the cache ----
 // q: [H][2*HD] (query ++ gate per head, from q_proj) -> query written to qo [H][HD].
-// k, v: [KV][HD]. Cache layout [KV][max_t][HD] fp32.
-// shortcut: fp32 KV cache (exact vs reference); F16/int8 KV when long contexts need the VRAM.
+// k, v: [KV][HD]. KV cache: int8 [KV][max_t][HD] + one f32 scale per (head, position), quantized when written
+// (4x less VRAM than fp32: the difference goes to expert slots, and long contexts fit).
 constexpr int AHD = 256;
+struct KVCache { int8_t *k, *v; float *ks, *vs; };
 __global__ void qk_norm_rope_k(const float* __restrict__ q, const float* __restrict__ k, const float* __restrict__ v,
                                const half* __restrict__ qn, const half* __restrict__ kn,
-                               float* __restrict__ qo, float* __restrict__ Kc, float* __restrict__ Vc,
+                               float* __restrict__ qo, KVCache kv,
                                int H, int KV, const int* __restrict__ pos_d, int max_t, int rot, float theta, float eps, int ld) {
     __shared__ float t[AHD];
     // token blockIdx.y of a chunk is at *pos_d + y (device-side so a captured CUDA graph sees each token's position)
@@ -558,10 +572,14 @@ __global__ void qk_norm_rope_k(const float* __restrict__ q, const float* __restr
         x = d < h2 ? t[d] * cs - t[d + h2] * sn : t[d] * cs + t[d - h2] * sn;
     }
     if (isq) qo[hh * AHD + d] = x;
-    else {
-        size_t o = ((size_t)(hh - H) * max_t + pos) * AHD + d;
-        Kc[o] = x;
-        Vc[o] = v[(hh - H) * AHD + d];
+    else {  // the whole block is a key head: quantize k and v of this position, one scale each
+        const size_t row = (size_t)(hh - H) * max_t + pos, o = row * AHD + d;
+        const float vv = v[(hh - H) * AHD + d];
+        float mk = block_max(fabsf(x)), mv = block_max(fabsf(vv));
+        float sk = mk > 0.f ? mk / 127.f : 1.f, sv = mv > 0.f ? mv / 127.f : 1.f;
+        kv.k[o] = (int8_t)__float2int_rn(x / sk);
+        kv.v[o] = (int8_t)__float2int_rn(vv / sv);
+        if (d == 0) { kv.ks[row] = sk; kv.vs[row] = sv; }
     }
 }
 
@@ -569,8 +587,7 @@ __global__ void qk_norm_rope_k(const float* __restrict__ q, const float* __restr
 // ctx = softmax(q.K^T / sqrt(HD)) V over t in [0, T); out = ctx * sigmoid(gate).
 // shortcut: whole score row in shared memory (T <= ~24k with opt-in smem); split-K when contexts grow.
 __global__ void attn_decode_k(const float* __restrict__ qo, const float* __restrict__ q_gate,
-                              const float* __restrict__ Kc, const float* __restrict__ Vc,
-                              float* __restrict__ out, int H, int KV, const int* __restrict__ pos_d, int max_t, int ld) {
+                              KVCache kv, float* __restrict__ out, int H, int KV, const int* __restrict__ pos_d, int max_t, int ld) {
     extern __shared__ float sc[];  // [max_t]
     const int tok = blockIdx.y, T = *pos_d + tok + 1;  // causal: token tok sees positions up to its own
     qo += (size_t)tok * H * AHD; q_gate += (size_t)tok * ld; out += (size_t)tok * H * AHD;
@@ -578,15 +595,19 @@ __global__ void attn_decode_k(const float* __restrict__ qo, const float* __restr
     int h = blockIdx.x, kvh = h / (H / KV), tid = threadIdx.x, lane = tid & 31, wid = tid >> 5;
     qs[tid] = qo[h * AHD + tid];
     __syncthreads();
-    const float* K = Kc + (size_t)kvh * max_t * AHD;
-    const float* V = Vc + (size_t)kvh * max_t * AHD;
+    const int8_t* K = kv.k + (size_t)kvh * max_t * AHD;
+    const int8_t* V = kv.v + (size_t)kvh * max_t * AHD;
+    const float* Ks = kv.ks + (size_t)kvh * max_t;
+    const float* Vs = kv.vs + (size_t)kvh * max_t;
     const float scale = rsqrtf((float)AHD);
     for (int t = wid; t < T; t += blockDim.x / 32) {  // warp per key, 8 dims per lane
-        const float4* kr = reinterpret_cast<const float4*>(K + (size_t)t * AHD) + lane * 2;
+        uint2 u = *reinterpret_cast<const uint2*>(K + (size_t)t * AHD + lane * 8);
         const float4* qr = reinterpret_cast<const float4*>(qs) + lane * 2;
-        float4 a = kr[0], b = kr[1], qa = qr[0], qb = qr[1];
-        float s = warp_sum(a.x * qa.x + a.y * qa.y + a.z * qa.z + a.w * qa.w + b.x * qb.x + b.y * qb.y + b.z * qb.z + b.w * qb.w);
-        if (lane == 0) sc[t] = s * scale;
+        float4 qa = qr[0], qb = qr[1];
+        float s = (float)(int8_t)(u.x) * qa.x + (float)(int8_t)(u.x >> 8) * qa.y + (float)(int8_t)(u.x >> 16) * qa.z + (float)(int8_t)(u.x >> 24) * qa.w +
+                  (float)(int8_t)(u.y) * qb.x + (float)(int8_t)(u.y >> 8) * qb.y + (float)(int8_t)(u.y >> 16) * qb.z + (float)(int8_t)(u.y >> 24) * qb.w;
+        s = warp_sum(s);
+        if (lane == 0) sc[t] = s * Ks[t] * scale;
     }
     __syncthreads();
     float m = -INFINITY;
@@ -597,10 +618,10 @@ __global__ void attn_decode_k(const float* __restrict__ qo, const float* __restr
     __syncthreads();
     m = red[0]; for (int i = 1; i < blockDim.x / 32; i++) m = fmaxf(m, red[i]);
     float s = 0.f;
-    for (int t = tid; t < T; t += blockDim.x) { float e = __expf(sc[t] - m); sc[t] = e; s += e; }
+    for (int t = tid; t < T; t += blockDim.x) { float e = __expf(sc[t] - m); s += e; sc[t] = e * Vs[t]; }  // V's scale folded in
     float inv = 1.f / block_sum(s);  // block_sum syncs, so sc[] is complete after it
     float acc = 0.f;
-    for (int t = 0; t < T; t++) acc += sc[t] * V[(size_t)t * AHD + tid];
+    for (int t = 0; t < T; t++) acc += sc[t] * (float)V[(size_t)t * AHD + tid];
     float g = q_gate[h * 2 * AHD + AHD + tid];
     out[h * AHD + tid] = acc * inv / (1.f + __expf(-g));
 }
@@ -610,10 +631,17 @@ __global__ void attn_decode_k(const float* __restrict__ qo, const float* __restr
 // T tokens (a prefill chunk): q/k/v rows have stride ld; all K/V are appended before any token attends.
 // shortcut: one block per (head, token) re-reads K/V per token; a flash-style tile for long prompts.
 inline void attn_decode(const float* q, const float* k, const float* v, const half* qn, const half* kn,
-                        float* qo, float* Kc, float* Vc, float* out, int H, int KV, const int* pos_d, int max_t,
+                        float* qo, KVCache kv, float* out, int H, int KV, const int* pos_d, int max_t,
                         int rot, float theta, float eps, int T, int ld, cudaStream_t st = 0) {
-    qk_norm_rope_k<<<dim3(H + KV, T), AHD, 0, st>>>(q, k, v, qn, kn, qo, Kc, Vc, H, KV, pos_d, max_t, rot, theta, eps, ld);
-    attn_decode_k<<<dim3(H, T), AHD, max_t * sizeof(float), st>>>(qo, q, Kc, Vc, out, H, KV, pos_d, max_t, ld);
+    qk_norm_rope_k<<<dim3(H + KV, T), AHD, 0, st>>>(q, k, v, qn, kn, qo, kv, H, KV, pos_d, max_t, rot, theta, eps, ld);
+    attn_decode_k<<<dim3(H, T), AHD, max_t * sizeof(float), st>>>(qo, q, kv, out, H, KV, pos_d, max_t, ld);
+}
+
+inline KVCache kv_alloc(int KV, int max_t) {
+    KVCache c;
+    CK(cudaMalloc(&c.k, (size_t)KV * max_t * AHD)); CK(cudaMalloc(&c.v, (size_t)KV * max_t * AHD));
+    CK(cudaMalloc(&c.ks, (size_t)KV * max_t * 4)); CK(cudaMalloc(&c.vs, (size_t)KV * max_t * 4));
+    return c;
 }
 
 __global__ void set_int_k(int* p, int v) { *p = v; }

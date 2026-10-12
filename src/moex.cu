@@ -42,7 +42,8 @@ struct LayerW {
     half *in_ln, *post_ln, *router, *sh_gate, *qn, *kn, *conv, *nw, *alog, *dtb;  // small: F16 always
     // big: int8 unless --f16. Projections that share an input are one fused matrix (one launch, less tail):
     Mat sh_gu, sh_d, attn_qkv, o, dn_in, out;  // sh_gu=[gate;up], attn_qkv=[q;k;v], dn_in=[qkv;z;a;b]
-    float *K, *V, *ring, *S;                                          // state
+    KVCache kv;
+    float *ring, *S;                                          // state
 };
 
 struct Engine {
@@ -298,8 +299,7 @@ struct Engine {
                 w.o = wmat({{a + "o_proj.weight", D}}, AH * AHD, "attn_o");
                 w.qn = wup(a + "q_norm.weight", AHD);
                 w.kn = wup(a + "k_norm.weight", AHD);
-                w.K = falloc((size_t)AKV * ctx * AHD);
-                w.V = falloc((size_t)AKV * ctx * AHD);
+                w.kv = kv_alloc(AKV, ctx);
             } else {
                 std::string a = p + "linear_attn.";
                 w.dn_in = wmat({{a + "in_proj_qkv.weight", DC}, {a + "in_proj_z.weight", DVH * DNV},
@@ -384,7 +384,7 @@ struct Engine {
         rmsnorm(x, l ? moe : nullptr, w.in_ln, h, D, EPS, 1, cs);  // folds in the previous layer's MoE output
         if (is_attn(l)) {
             gemv(w.attn_qkv, h, q, D, AH * 2 * AHD + 2 * AKV * AHD, cs);  // -> q, k, v
-            attn_decode(q, k, v, w.qn, w.kn, qo, w.K, w.V, ag, AH, AKV, pos_d, ctx, ROT, THETA, EPS, 1, 0, cs);
+            attn_decode(q, k, v, w.qn, w.kn, qo, w.kv, ag, AH, AKV, pos_d, ctx, ROT, THETA, EPS, 1, 0, cs);
             gemv(w.o, ag, tmp, AH * AHD, D, cs);
         } else {
             gemv(w.dn_in, h, big, D, DC + DVH * DNV + 2 * DVH, cs);  // -> qkv, z, a, b
@@ -515,7 +515,7 @@ struct Engine {
                 rmsnorm(Xc, l ? moec : nullptr, w.in_ln, hc, D, EPS, T, cs);
                 if (is_attn(l)) {
                     gemm(w.attn_qkv, hc, qkvc, T, D, LQ, cs);
-                    attn_decode(qkvc, qkvc + AH * 2 * AHD, qkvc + AH * 2 * AHD + AKV * AHD, w.qn, w.kn, qoc, w.K, w.V, agc,
+                    attn_decode(qkvc, qkvc + AH * 2 * AHD, qkvc + AH * 2 * AHD + AKV * AHD, w.qn, w.kn, qoc, w.kv, agc,
                                 AH, AKV, pos_d, ctx, ROT, THETA, EPS, T, LQ, cs);
                     gemm(w.o, agc, tmpc, T, AH * AHD, D, cs);
                 } else {
