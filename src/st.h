@@ -28,6 +28,7 @@ struct Container {
         if (t.empty()) { fprintf(stderr, "no safetensors in %s\n", dir.c_str()); exit(1); }
     }
 
+    bool has(const std::string& name) const { return t.count(name) > 0; }
     const StTensor& at(const std::string& name) const {
         auto it = t.find(name);
         if (it == t.end()) { fprintf(stderr, "missing tensor %s\n", name.c_str()); exit(1); }

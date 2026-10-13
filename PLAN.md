@@ -241,3 +241,15 @@ locked). `MOEX_LOW_RAM=1` forces the mode on a big machine to exercise the path.
 ~20 reads/token, from ~48 ms/token of faults toward ~8-10 ms: to be measured on a 16 GB machine.
 Also fixed: use counts (moex_hot.bin) are now always merged with the saved file; before, a session without --load
 overwrote them with its own counts only.
+
+## MTP in the engine (opt-in: MOEX_MTP=1, needs mtp.safetensors from tools/fetch_mtp.py)
+
+Reference (tools/mtp_accept.py, fp32, our int4 MTP experts): draft acceptance 89.6% greedy (pre-final-norm hidden
+state; post-norm 88.9%). Engine: 86.5-92% on the 10-prompt set; 9/10 outputs identical to plain greedy (one near-tie).
+Speed, back to back on the same (thermally slower) machine state: 42.7 tok/s off, 40.1 on. A round (2 tokens,
+1.92 kept on average) costs ~46 ms: 40 layers 36.3 (CPU experts 18.1, GPU routing wait 8.5, ~10 launch/host
+overhead), lm_head 2.9, MTP layer 3.9, rejected-draft redo 2.3, state snapshot 0.9.
+Why it doesn't pay yet: two adjacent tokens share few experts, so a round misses ~1.9x as many experts as one token
+(hit 70.6% -> 66.9%) and the CPU work nearly doubles; the dense-weight saving (gemv_i8 NT=2 reads W once) is smaller.
+To reach 70: CUDA graphs for the 2-token layers (~-8 ms), CPU misses at decode efficiency + more VRAM hits for the
+union (-8..10 ms), redo without a full step (chunked DeltaNet saving the state after token 0).

@@ -88,14 +88,15 @@ inline void gemv_f16(const half* W, const float* x, float* y, int I, int O, cuda
 
 // ---- K10: int8 dense GEMV, y[r] = s[r] * (Q[r,:] . x), per-row symmetric scale ----
 // R rows per warp (their loads are issued together for memory-level parallelism), 16-byte loads
-// (16 int8) per lane. Requires I % 512 == 0.
-template <int WARPS, int R>
+// (16 int8) per lane. Requires I % 512 == 0. NT vectors at once (x [NT][I], y [NT][O]): the weights are read once
+// for all of them (the MTP round's 2 tokens).
+template <int WARPS, int R, int NT = 1>
 __global__ void gemv_i8_k(const int8_t* __restrict__ Q, const float* __restrict__ s, const float* __restrict__ x,
                           float* __restrict__ y, int I, int O) {
     int row0 = (blockIdx.x * WARPS + (threadIdx.x >> 5)) * R, lane = threadIdx.x & 31;
     if (row0 >= O) return;
     const float4* xv = reinterpret_cast<const float4*>(x);
-    float acc[R] = {};
+    float acc[NT][R] = {};
 #pragma unroll 2
     for (int c = lane; c < I / 16; c += 32) {
         uint4 u[R];
@@ -103,26 +104,31 @@ __global__ void gemv_i8_k(const int8_t* __restrict__ Q, const float* __restrict_
         for (int r = 0; r < R; r++) u[r] = row0 + r < O ? __ldcs(reinterpret_cast<const uint4*>(Q + (size_t)(row0 + r) * I) + c) : make_uint4(0, 0, 0, 0);
 #pragma unroll
         for (int j = 0; j < 4; j++) {
-            float4 xx = __ldg(xv + 4 * c + j);
 #pragma unroll
-            for (int r = 0; r < R; r++) {
-                uint32_t w = (&u[r].x)[j];
-                acc[r] += (float)(int8_t)(w) * xx.x + (float)(int8_t)(w >> 8) * xx.y +
-                          (float)(int8_t)(w >> 16) * xx.z + (float)(int8_t)(w >> 24) * xx.w;
+            for (int t = 0; t < NT; t++) {
+                float4 xx = __ldg(xv + (size_t)t * (I / 4) + 4 * c + j);
+#pragma unroll
+                for (int r = 0; r < R; r++) {
+                    uint32_t w = (&u[r].x)[j];
+                    acc[t][r] += (float)(int8_t)(w) * xx.x + (float)(int8_t)(w >> 8) * xx.y +
+                                 (float)(int8_t)(w >> 16) * xx.z + (float)(int8_t)(w >> 24) * xx.w;
+                }
             }
         }
     }
 #pragma unroll
-    for (int r = 0; r < R; r++) {
-        float v = warp_sum(acc[r]);
-        if (lane == 0 && row0 + r < O) y[row0 + r] = v * s[row0 + r];
-    }
+    for (int t = 0; t < NT; t++)
+#pragma unroll
+        for (int r = 0; r < R; r++) {
+            float v = warp_sum(acc[t][r]);
+            if (lane == 0 && row0 + r < O) y[(size_t)t * O + row0 + r] = v * s[row0 + r];
+        }
 }
 
-template <int WARPS, int R>
+template <int WARPS, int R, int NT = 1>
 inline void gemv_i8(const int8_t* q, const float* s, const float* x, float* y, int I, int O, cudaStream_t st = 0) {
     int rows_per_block = WARPS * R;
-    gemv_i8_k<WARPS, R><<<(O + rows_per_block - 1) / rows_per_block, WARPS * 32, 0, st>>>(q, s, x, y, I, O);
+    gemv_i8_k<WARPS, R, NT><<<(O + rows_per_block - 1) / rows_per_block, WARPS * 32, 0, st>>>(q, s, x, y, I, O);
 }
 
 // F16 [O,I] -> int8 [O,I] + f32 scale per row (absmax / 127). One block per row.
@@ -212,6 +218,11 @@ __global__ void gemm_wmma_k(const WT* __restrict__ W, const float* __restrict__ 
 
 // Y[S][O] = X[S][I] . W^T for a dense matrix in either form.
 inline void gemm(const Mat& m, const float* X, float* Y, int S, int I, int O, cudaStream_t st = 0) {
+    if (S <= 2) {  // the MTP round: tensor-core tiles of 64 tokens would waste 62 of them; GEMV reads W once for both
+        if (S == 2 && m.q) gemv_i8<8, 1, 2>(m.q, m.s, X, Y, I, O, st);
+        else for (int t = 0; t < S; t++) gemv(m, X + (size_t)t * I, Y + (size_t)t * O, I, O, st);
+        return;
+    }
     dim3 grid((O + 63) / 64, (S + 63) / 64);
     if (m.q4) gemm_wmma_k<uint8_t, true><<<grid, 128, 0, st>>>(m.q4, m.s, X, Y, S, I, O);
     else if (m.q) gemm_wmma_k<int8_t><<<grid, 128, 0, st>>>(m.q, m.s, X, Y, S, I, O);

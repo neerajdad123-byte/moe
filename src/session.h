@@ -57,12 +57,20 @@ struct Session {
         }
         ctx = prompt;
         std::vector<int> out;
-        for (int i = 0; i < max_new && next != im_end && next != eot; i++) {
-            out.push_back(next);
-            if (!on_tok(next) || (int)ctx.size() + 1 >= eng.ctx) break;
-            int pos = (int)ctx.size();
-            ctx.push_back(next);
-            next = eng.step(next, pos, true);
+        std::deque<int> q{next};  // generated, not yet emitted; with MTP a round can yield two
+        while (!q.empty() && (int)out.size() < max_new) {
+            const int t = q.front(); q.pop_front();
+            if (t == im_end || t == eot) break;
+            out.push_back(t);
+            if (!on_tok(t) || (int)ctx.size() + 3 >= eng.ctx) break;
+            if (!q.empty()) continue;  // t was already fed (an accepted MTP draft)
+            const int pos = (int)ctx.size();
+            ctx.push_back(t);
+            if (eng.has_mtp) {
+                auto ts = eng.mtp_round(t, pos);
+                if (ts.size() == 2) ctx.push_back(ts[0]);
+                q.insert(q.end(), ts.begin(), ts.end());
+            } else q.push_back(eng.step(t, pos, true));
         }
         return out;
     }

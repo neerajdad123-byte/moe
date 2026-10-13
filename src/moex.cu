@@ -37,7 +37,8 @@ constexpr float EPS = 1e-6f, THETA = 1e7f;
 // Top-8 router weights renormalized to sum to 1: the HF config omits norm_topk_prob, the Qwen3.5-MoE default is
 // true, and llama.cpp normalizes for this architecture (colibri's converter wrote false into its meta).
 static bool NORM_TOPK = !getenv("MOEX_NO_NORM_TOPK");
-static bool is_attn(int l) { return l % 4 == 3; }
+static bool is_attn(int l) { return l % 4 == 3 || l == NL; }  // layer NL = the MTP head's layer
+constexpr int NKEY = (NL + 1) * E;  // expert keys: 40 layers + the MTP layer
 
 struct LayerW {
     half *in_ln, *post_ln, *router, *sh_gate, *qn, *kn, *conv, *nw, *alog, *dtb;  // small: F16 always
@@ -58,6 +59,14 @@ struct Engine {
     half* qtmp = nullptr;  // F16 staging for quantization, freed after load
     const half* embed;  // mmapped, stays in RAM
     int ctx;
+    // MTP (multi-token prediction): the model's own draft head (mtp.safetensors from tools/fetch_mtp.py). Each decode
+    // round runs [token, draft] through the model as one 2-token chunk; a right draft gives 2 tokens for ~1.3x the cost.
+    bool has_mtp = false;
+    Mat mtp_fc;
+    half *mtp_ne = nullptr, *mtp_nh = nullptr, *mtp_norm = nullptr;
+    float *mtp_cat = nullptr, *lg2 = nullptr, *snap = nullptr;
+    uint8_t* vbuf = nullptr;  // the 2-token round's scratch (the prefill scratch lives in expert slots)
+    int draft = -1;
     // scratch
     float *x, *h, *tmp, *moe, *big, *q, *k, *v, *qo, *ag, *apart, *z, *a, *b, *conv, *o, *act, *scr, *logits, *rw, *amv;
     int *ridx, *ams;
@@ -181,7 +190,8 @@ struct Engine {
         double t0 = now();
         std::vector<WIN32_MEMORY_RANGE_ENTRY> r;
         size_t total = 0;
-        for (int k = 0; k < NL * E; k++) {
+        for (int k = 0; k < NKEY; k++) {
+            if (!eq[k]) continue;  // no MTP head
             r.push_back({(void*)eq[k], EXPERT_Q_BYTES});
             r.push_back({(void*)es[k], EXPERT_BYTES - EXPERT_Q_BYTES});
             total += EXPERT_BYTES;
@@ -250,12 +260,12 @@ struct Engine {
     // Eviction score: decayed use count with a 10-token half-life (log domain). Measured on 80-prompt
     // traces (tools/sim.py): 82.0% hit vs 80.8% LRU; longer half-lives lose (tau 200: 69%).
     static constexpr double TAU = 10.0;
-    std::vector<double> G = std::vector<double>(NL * E, -INFINITY);
+    std::vector<double> G = std::vector<double>(NKEY, -INFINITY);
 
     // Warm start (--load): use counts per expert, summed over past sessions in hot_file (moex_hot.bin in the
     // model folder; the release ships one from our test prompts for the first run). The hottest experts fill
     // the VRAM slots at load instead of arriving one miss at a time during the first replies.
-    std::vector<uint32_t> uses = std::vector<uint32_t>(NL * E, 0);
+    std::vector<uint32_t> uses = std::vector<uint32_t>(NKEY, 0);
     std::string hot_file;
     bool warm = false;
     bool quiet = false;  // chat/serve: no per-prefill stats line
@@ -266,7 +276,7 @@ struct Engine {
             std::vector<uint32_t> u(NL * E);
             bool ok = fread(u.data(), 4, u.size(), f) == u.size();
             fclose(f);
-            if (ok) { uses = u; return; }
+            if (ok) { std::copy(u.begin(), u.end(), uses.begin()); return; }
         }
     }
     void save_hot() {
@@ -280,7 +290,7 @@ struct Engine {
         for (int i = 0; i < NL * E; i++) keys[i] = i;
         std::sort(keys.begin(), keys.end(), [&](int a, int b) { return uses[a] > uses[b]; });
         const double mx = std::max(uses[keys[0]], 1u);
-        std::vector<const uint8_t*> tab(NL * E, nullptr);
+        std::vector<const uint8_t*> tab(NKEY, nullptr);
         int n = 0;
         for (; n < nslots - nres && uses[keys[n]]; n++) {  // the tail slots belong to prefill
             const int key = keys[n];
@@ -376,9 +386,10 @@ struct Engine {
         if (!f16) CK(cudaMalloc(&qtmp, (size_t)V * D * 2));  // largest matrix
         lm_head = wmat({{"lm_head.weight", V}}, D, "lm_head");
         norm = wup("model.norm.weight", D);
-        L.resize(NL);
-        for (int i = 0; i < NL; i++) {
-            std::string p = "model.layers." + std::to_string(i) + ".", m = p + "mlp.";
+        has_mtp = C.has("mtp.fc.weight") && getenv("MOEX_MTP");  // opt-in: 40 tok/s with vs 47 without, for now (PLAN.md)
+        L.resize(NL + has_mtp);
+        for (int i = 0; i < NL + has_mtp; i++) {
+            std::string p = i < NL ? "model.layers." + std::to_string(i) + "." : "mtp.layers.0.", m = p + "mlp.";
             LayerW& w = L[i];
             w.in_ln = wup(p + "input_layernorm.weight", D);
             w.post_ln = wup(p + "post_attention_layernorm.weight", D);
@@ -406,6 +417,12 @@ struct Engine {
                 w.S = falloc((size_t)DVH * DNK * DNV, true);
             }
         }
+        if (has_mtp) {
+            mtp_fc = wmat({{"mtp.fc.weight", D}}, 2 * D, "mtp_fc");
+            mtp_ne = wup("mtp.pre_fc_norm_embedding.weight", D);
+            mtp_nh = wup("mtp.pre_fc_norm_hidden.weight", D);
+            mtp_norm = wup("mtp.norm.weight", D);
+        }
         if (qtmp) { CK(cudaDeviceSynchronize()); CK(cudaFree(qtmp)); qtmp = nullptr; }
         CK(cudaStreamCreateWithFlags(&cs, cudaStreamNonBlocking));
         CK(cudaStreamCreateWithFlags(&cp, cudaStreamNonBlocking));
@@ -419,9 +436,14 @@ struct Engine {
         CK(cudaMalloc(&slots_d, TOPK * sizeof(void*)));
         apart = falloc(AH * ASPLIT * (AHD + 2));
         alloc_prefill();
-        eq.resize(NL * E); es.resize(NL * E);
-        for (int l = 0; l < NL; l++) for (int e = 0; e < E; e++) {
-            std::string ep = "model.layers." + std::to_string(l) + ".mlp.experts." + std::to_string(e) + ".";
+        if (has_mtp) {
+            CK(cudaMalloc(&vbuf, carve_prefill(nullptr, VT)));
+            mtp_cat = falloc((size_t)CH * 2 * D); lg2 = falloc((size_t)VT * V);
+            snap = falloc((size_t)(NL - NL / 4) * (DVH * DNK * DNV + DC * (CONVK - 1)));
+        }
+        eq.assign(NKEY, nullptr); es.assign(NKEY, nullptr);
+        for (int l = 0; l < NL + has_mtp; l++) for (int e = 0; e < E; e++) {
+            std::string ep = (l < NL ? "model.layers." + std::to_string(l) + "." : std::string("mtp.layers.0.")) + "mlp.experts." + std::to_string(e) + ".";
             eq[l * E + e] = C.map(ep + "merged_weight");
             es[l * E + e] = (const float*)C.map(ep + "qs");
         }
@@ -436,12 +458,12 @@ struct Engine {
         size_t fr, tot; CK(cudaMemGetInfo(&fr, &tot));
         const size_t reserve = 320ull << 20;
         nslots = (int)((fr - std::min(fr, reserve)) / EXPERT_BYTES);
-        nslots = std::min(nslots, NL * E + (int)((carve_prefill(nullptr) + EXPERT_BYTES - 1) / EXPERT_BYTES));  // big GPUs: every expert fits
+        nslots = std::min(nslots, NKEY + (int)((carve_prefill(nullptr) + EXPERT_BYTES - 1) / EXPERT_BYTES));  // big GPUs: every expert fits
         nres = (int)((carve_prefill(nullptr) + EXPERT_BYTES - 1) / EXPERT_BYTES);
         if (nslots < nres + 2 * TOPK) { fprintf(stderr, "only %d expert slots fit; need >= %d\n", nslots, 2 * TOPK); exit(1); }
         CK(cudaMalloc(&arena, (size_t)nslots * EXPERT_BYTES));
         carve_prefill(arena + (size_t)(nslots - nres) * EXPERT_BYTES);
-        slot_of.assign(NL * E, -1); owner.assign(nslots, -1); last.assign(nslots, 0);
+        slot_of.assign(NKEY, -1); owner.assign(nslots, -1); last.assign(nslots, 0);
         ready.assign(nslots, 0); inflight.assign(nslots, 0);
         auto mapped = [](auto** hp, auto** dp, size_t bytes) {
             CK(cudaHostAlloc((void**)hp, bytes, cudaHostAllocMapped));
@@ -449,7 +471,7 @@ struct Engine {
         };
         mapped(&h_h, &h_hd, D * 4); mapped(&y_h, &y_hd, D * 4); mapped(&w_h, &w_hd, TOPK * 4); mapped(&ids_h, &ids_hd, TOPK * 4);
         CK(cudaMalloc(&hw_d, TOPK * 4)); CK(cudaMalloc(&nh_d, 4));
-        CK(cudaMalloc(&table_d, NL * E * sizeof(void*))); CK(cudaMemset(table_d, 0, NL * E * sizeof(void*)));
+        CK(cudaMalloc(&table_d, NKEY * sizeof(void*))); CK(cudaMemset(table_d, 0, NKEY * sizeof(void*)));
         CK(cudaEventCreateWithFlags(&ev_route, cudaEventDisableTiming));
         CK(cudaMalloc(&pos_d, 4));
         for (int i = 0; i < NSTAGE; i++) {
@@ -461,8 +483,9 @@ struct Engine {
         if (warm) warm_slots();
         loader = std::thread([this] { loader_main(); });
         capture_graphs();
-        fprintf(stderr, "[load] %.1f s, dense %s, %d expert slots (%.2f GB, %.1f%% of %d experts), ctx %d\n",
-                now() - t0, f16 ? "F16" : q4groups.empty() ? "int8" : ("int8, int4: " + q4groups).c_str(), nslots, nslots * (double)EXPERT_BYTES / 1e9, 100.0 * nslots / (NL * E), NL * E, ctx);
+        fprintf(stderr, "[load] %.1f s, dense %s, %d expert slots (%.2f GB, %.1f%% of %d experts), ctx %d%s\n",
+                now() - t0, f16 ? "F16" : q4groups.empty() ? "int8" : ("int8, int4: " + q4groups).c_str(), nslots, nslots * (double)EXPERT_BYTES / 1e9, 100.0 * nslots / (NL * E), NL * E, ctx,
+                has_mtp ? ", MTP on" : "");
     }
 
     // New conversation: recurrent state back to zero (KV rows are overwritten position by position).
@@ -547,16 +570,18 @@ struct Engine {
     // they are ordinary cache slots, a prefill evicts them first (measured: as separate allocations they cost
     // ~90 slots and decode 54 -> 52 tok/s). base == nullptr only measures.
     int nres = 0;
-    size_t carve_prefill(uint8_t* base) {
+    static constexpr int VT = 4;  // rows of the MTP round's scratch
+    size_t carve_prefill(uint8_t* base, int ch = CH) {
         const int LQ = AH * 2 * AHD + 2 * AKV * AHD, LB = DC + DVH * DNV + 2 * DVH;
         size_t off = 0;
         auto f = [&](float*& p, size_t n) { if (base) p = (float*)(base + off); off += (n * 4 + 255) & ~(size_t)255; };
-        f(Xc, (size_t)CH * D); f(hc, (size_t)CH * D); f(tmpc, (size_t)CH * D); f(moec, (size_t)CH * D);
-        f(qkvc, (size_t)CH * LQ); f(bigc, (size_t)CH * LB); f(convc, (size_t)CH * DC); f(oc, (size_t)CH * DVH * DNV);
-        f(qoc, (size_t)CH * AH * AHD); f(agc, (size_t)CH * AH * AHD); f(lgc, (size_t)CH * E); f(rwc, (size_t)CH * TOPK);
-        f(actp, (size_t)CH * TOPK * EI); f(ypair, (size_t)CH * TOPK * D);
-        f(shgu, (size_t)CH * 2 * SI); f(sha, (size_t)CH * SI); f(shs, (size_t)CH * D); f(shl, CH);
-        float* ri; f(ri, (size_t)CH * TOPK); if (base) ridxc = (int*)ri;
+        f(Xc, (size_t)ch * D); f(hc, (size_t)ch * D); f(tmpc, (size_t)ch * D); f(moec, (size_t)ch * D);
+        f(qkvc, (size_t)ch * LQ); f(bigc, (size_t)ch * LB); f(convc, (size_t)ch * DC); f(oc, (size_t)ch * DVH * DNV);
+        f(qoc, (size_t)ch * AH * AHD); f(agc, (size_t)ch * AH * AHD); f(lgc, (size_t)ch * E); f(rwc, (size_t)ch * TOPK);
+        f(actp, (size_t)ch * TOPK * EI); f(ypair, (size_t)ch * TOPK * D);
+        f(shgu, (size_t)ch * 2 * SI); f(sha, (size_t)ch * SI); f(shs, (size_t)ch * D); f(shl, ch);
+        float* ri; f(ri, (size_t)ch * TOPK); if (base) ridxc = (int*)ri;
+        if (ch != CH) return off;  // the MTP round streams nothing
         if (base) stage_p = base + off;
         return off + (size_t)2 * SB * EXPERT_BYTES;
     }
@@ -610,9 +635,32 @@ struct Engine {
                 for (int i = 0; i < D; i++) rows_h[(size_t)t * D + i] = __half2float(embed[(size_t)ids[c0 + t] * D + i]);
             copy_k<<<(T * D + 255) / 256, 256, 0, cs>>>(Xc, rows_d, T * D);
             set_int_k<<<1, 1, 0, cs>>>(pos_d, pos0 + c0);
-            for (int l = 0; l < NL; l++) {
+            for (int l = 0; l < NL; l++) chunk_layer(l, T, pt, false);
+            if (has_mtp) {  // fill the MTP layer's cache for these positions; the last chunk also makes the first draft
+                rmsnorm(Xc, moec, norm, hc, D, EPS, T, cs);  // Xc = final hidden of every row, hc = normed
+                if (c0 + T == n) { gemv(lm_head, hc + (size_t)(T - 1) * D, logits, D, V, cs); next = pick_token(); }
+                draft = mtp_forward(ids + c0 + 1, T, c0 + T < n ? ids[c0 + T] : next, pos0 + c0 + 1, pt, false);
+            } else if (c0 + T == n) {  // the last prompt token: its logits pick the first generated token
+                rmsnorm(Xc + (size_t)(T - 1) * D, moec + (size_t)(T - 1) * D, norm, h, D, EPS, 1, cs);
+                gemv(lm_head, h, logits, D, V, cs);
+                next = pick_token();
+            }
+        }
+        release_prefill_slots();
+        cpool.spin = false;
+        if (!quiet) fprintf(stderr, "[prefill] %d tok in %.2f s = %.1f tok/s | host: gpu-wait %.2f  streaming-wait %.2f  cpu-experts %.2f s | streamed %lld experts"
+                " | copier: wait-dma %.2f  memcpy %.2f s | page faults %lu\n",
+                n, now() - pt0, n / (now() - pt0), pt[0], pt[1], pt[2], streamed_n - sn0, pt[3], pt[4], page_faults() - pf0);
+        return next;
+    }
+
+    // One layer over the T rows in Xc (positions *pos_d..). verify: the MTP round (2 rows, private scratch): no
+    // streaming, misses run on the CPU and are admitted to VRAM as in step(); otherwise prefill (streaming).
+    void chunk_layer(int l, int T, double* pt, bool verify) {
+                const int LQ = AH * 2 * AHD + 2 * AKV * AHD, LB = DC + DVH * DNV + 2 * DVH;
                 LayerW& w = L[l];
-                rmsnorm(Xc, l ? moec : nullptr, w.in_ln, hc, D, EPS, T, cs);
+                if (verify) { poll_admissions(); flush_table(); clock++; }
+                rmsnorm(Xc, l % NL ? moec : nullptr, w.in_ln, hc, D, EPS, T, cs);  // layers 0 and NL (MTP) start fresh
                 if (is_attn(l)) {
                     gemm(w.attn_qkv, hc, qkvc, T, D, LQ, cs);
                     attn_decode(qkvc, qkvc + AH * 2 * AHD, qkvc + AH * 2 * AHD + AKV * AHD, w.qn, w.kn, qoc, w.kv, agc,
@@ -652,9 +700,11 @@ struct Engine {
                 for (int e = 0; e < E; e++) {
                     if (per[e].empty()) continue;
                     int key = l * E + e, sl = slot_of[key];
+                    if (verify && sl >= 0) last[sl] = clock;  // protects this layer's experts (incl. in-flight) from eviction
                     if (sl >= 0 && ready[sl]) { add_item(e, arena + (size_t)sl * EXPERT_BYTES); hits += per[e].size(); continue; }
                     misses += per[e].size();
-                    if ((int)per[e].size() >= STREAM_MIN) { streamed.push_back(e); continue; }
+                    if (verify && sl < 0) admits_todo.push_back(key);
+                    if (!verify && (int)per[e].size() >= STREAM_MIN) { streamed.push_back(e); continue; }
                     job_of[e] = (int)jobs.size();
                     jobs.push_back({eq[key], es[key], {}, {}, {}});
                     for (auto& pr : per[e]) { jobs.back().toks.push_back(pr.t); jobs.back().pids.push_back(pr.p); jobs.back().ws.push_back(pr.w); }
@@ -678,7 +728,8 @@ struct Engine {
                     add_item(streamed[k], stage_p + ((size_t)((k / SB) & 1) * SB + k % SB) * EXPERT_BYTES);
                 // a copier thread stages + transfers + launches the streamed batches (it alone enqueues on cs
                 // until joined) while this thread computes the CPU experts
-                std::thread copier([&] {
+                std::thread copier;
+                if (!streamed.empty()) copier = std::thread([&] {
                     for (int b0 = 0, bi = 0; b0 < (int)streamed.size(); b0 += SB, bi++) {
                         const int half_ = bi & 1, nb = std::min(SB, (int)streamed.size() - b0);
                         uint8_t* base = stage_p + (size_t)half_ * SB * EXPERT_BYTES;
@@ -719,23 +770,87 @@ struct Engine {
                 cpu_s += now() - c1;
                 pt[2] += now() - c1;
                 double j0 = now();
-                copier.join();
+                if (copier.joinable()) copier.join();
                 pt[1] += now() - j0;  // time the main thread waited on the streaming
                 pairs_reduce_k<<<dim3((D + 255) / 256, T), 256, 0, cs>>>(ypair, ycpu_d, moec, TOPK, D);
                 gated_add_rows_k<<<dim3((D + 255) / 256, T), 256, 0, cs>>>(moec, shs, shl, D);
-            }
-            if (c0 + T == n) {  // the last prompt token: its logits pick the first generated token
-                rmsnorm(Xc + (size_t)(T - 1) * D, moec + (size_t)(T - 1) * D, norm, h, D, EPS, 1, cs);
-                gemv(lm_head, h, logits, D, V, cs);
-                next = pick_token();
-            }
+                if (verify) { for (int key : admits_todo) admit(key); admits_todo.clear(); start_admissions(); }
+    }
+    std::vector<int> admits_todo;
+
+    // The MTP layer over T rows: row t gets the token at position pos+t (toks[t], the last row `last`) and the main
+    // model's final hidden state at pos+t-1 (Xc). Returns the draft for the token after the last row (greedy).
+    int mtp_forward(const int* toks, int T, int last, int pos, double* pt, bool verify) {
+        for (int t = 0; t < T; t++) {
+            const int tok = t < T - 1 ? toks[t] : last;
+            for (int i = 0; i < D; i++) rows_h[(size_t)t * D + i] = __half2float(embed[(size_t)tok * D + i]);
         }
-        release_prefill_slots();
-        cpool.spin = false;
-        if (!quiet) fprintf(stderr, "[prefill] %d tok in %.2f s = %.1f tok/s | host: gpu-wait %.2f  streaming-wait %.2f  cpu-experts %.2f s | streamed %lld experts"
-                " | copier: wait-dma %.2f  memcpy %.2f s | page faults %lu\n",
-                n, now() - pt0, n / (now() - pt0), pt[0], pt[1], pt[2], streamed_n - sn0, pt[3], pt[4], page_faults() - pf0);
-        return next;
+        copy_k<<<(T * D + 255) / 256, 256, 0, cs>>>(tmpc, rows_d, T * D);
+        rmsnorm(tmpc, nullptr, mtp_ne, hc, D, EPS, T, cs);
+        rmsnorm(Xc, nullptr, mtp_nh, tmpc, D, EPS, T, cs);
+        CK(cudaMemcpy2DAsync(mtp_cat, 2 * D * 4, hc, D * 4, D * 4, T, cudaMemcpyDeviceToDevice, cs));        // [embedding | hidden]
+        CK(cudaMemcpy2DAsync(mtp_cat + D, 2 * D * 4, tmpc, D * 4, D * 4, T, cudaMemcpyDeviceToDevice, cs));
+        gemm(mtp_fc, mtp_cat, Xc, T, 2 * D, D, cs);
+        set_int_k<<<1, 1, 0, cs>>>(pos_d, pos);
+        chunk_layer(NL, T, pt, verify);
+        rmsnorm(Xc + (size_t)(T - 1) * D, moec + (size_t)(T - 1) * D, mtp_norm, h, D, EPS, 1, cs);
+        gemv(lm_head, h, logits, D, V, cs);
+        argmax(logits, V, amv, ams, ids_hd, cs);
+        CK(cudaStreamSynchronize(cs));
+        return ids_h[0];
+    }
+
+    // DeltaNet + conv state of every linear-attention layer <-> snap (a rejected draft rolls the state back)
+    void dn_state(bool save) {
+        const size_t nS = (size_t)DVH * DNK * DNV, nR = (size_t)DC * (CONVK - 1);
+        size_t off = 0;
+        for (int l = 0; l < NL; l++) if (!is_attn(l)) {
+            CK(cudaMemcpyAsync(save ? snap + off : L[l].S, save ? L[l].S : snap + off, nS * 4, cudaMemcpyDeviceToDevice, cs));
+            CK(cudaMemcpyAsync(save ? snap + off + nS : L[l].ring, save ? L[l].ring : snap + off + nS, nR * 4, cudaMemcpyDeviceToDevice, cs));
+            off += nS + nR;
+        }
+    }
+
+    // One MTP decode round: feeds y at position p and the draft at p+1 together. Returns the new tokens: [t1] if the
+    // draft was wrong (only y was kept), [t1, t2] if right (y and the draft kept). The last one is not yet fed.
+    long long mtp_rounds = 0, mtp_acc = 0;
+    double vpt[2] = {};  // in the 40 layers: waiting for the GPU's routing, CPU experts
+    double mt[5] = {};  // MTP round time: snapshot, 40 layers, lm_head+pick, mtp layer, rejected-draft redo
+    std::vector<int> mtp_round(int y, int p) {
+        const int d = draft;
+        double pt[5] = {}, t0 = now();
+        mtp_rounds++;
+        dn_state(true);
+        CK(cudaStreamSynchronize(cs)); mt[0] += now() - t0; t0 = now();
+        carve_prefill(vbuf, VT);
+        for (int i = 0; i < D; i++) { rows_h[i] = __half2float(embed[(size_t)y * D + i]); rows_h[D + i] = __half2float(embed[(size_t)d * D + i]); }
+        copy_k<<<(2 * D + 255) / 256, 256, 0, cs>>>(Xc, rows_d, 2 * D);
+        set_int_k<<<1, 1, 0, cs>>>(pos_d, p);
+        for (int l = 0; l < NL; l++) chunk_layer(l, 2, pt, true);
+        CK(cudaStreamSynchronize(cs)); mt[1] += now() - t0; t0 = now();
+        vpt[0] += pt[0]; vpt[1] += pt[2];
+        rmsnorm(Xc, moec, norm, hc, D, EPS, 2, cs);  // Xc = final hidden at p, p+1
+        gemm(lm_head, hc, lg2, 2, D, V, cs);
+        auto pick_row = [&](int r) { float* sv = logits; logits = lg2 + (size_t)r * V; int t = pick_token(); logits = sv; return t; };
+        const int t1 = pick_row(0);
+        std::vector<int> out{t1};
+        if (t1 == d) {
+            out.push_back(pick_row(1));
+            mt[2] += now() - t0; t0 = now();
+            mtp_acc++;
+            tokens += 2; note(y); note(d);
+            draft = mtp_forward(&d, 2, out[1], p + 1, pt, true);
+            mt[3] += now() - t0;
+        } else {
+            mt[2] += now() - t0; t0 = now();
+            dn_state(false);
+            step(y, p, false);  // y alone: the recurrent state without the draft (Xc row 0 is untouched)
+            CK(cudaStreamSynchronize(cs)); mt[4] += now() - t0; t0 = now();
+            draft = mtp_forward(nullptr, 1, t1, p + 1, pt, true);
+            mt[3] += now() - t0;
+        }
+        carve_prefill(arena + (size_t)(nslots - nres) * EXPERT_BYTES);
+        return out;
     }
 
     // ---- token choice: greedy (GPU argmax) or sampled (temperature / top-k / top-p), repetition penalty ----
@@ -1071,12 +1186,23 @@ int main(int argc, char** argv) {
         long long h0 = eng.hits, m0 = eng.misses, a0 = eng.admits; double c0 = eng.cpu_s, t1 = now();
         double ht0[4]; for (int i = 0; i < 4; i++) ht0[i] = eng.ht[i];
         eng.trace_phase = 1;
-        for (int gen = 0; gen < n; gen++) {
-            out.push_back(tok);
-            if (stream) { printf("%d\n", tok); fflush(stdout); }
-            if (std::find(stop.begin(), stop.end(), tok) != stop.end() || gen + 1 == n) break;
-            tok = eng.step(tok, pos++, true);
-            st.dec++;
+        const bool mtp = eng.has_mtp && use_prefill && !eng.trace;
+        auto emit = [&](int t) {  // false: stop
+            out.push_back(t);
+            if (stream) { printf("%d\n", t); fflush(stdout); }
+            return std::find(stop.begin(), stop.end(), t) == stop.end() && (int)out.size() < n;
+        };
+        for (bool more = emit(tok); more;) {
+            if (mtp) {
+                auto ts = eng.mtp_round(tok, pos);
+                pos += (int)ts.size();
+                for (int t : ts) { st.dec++; if (!(more = emit(t))) break; }
+                tok = ts.back();
+            } else {
+                tok = eng.step(tok, pos++, true);
+                st.dec++;
+                more = emit(tok);
+            }
         }
         st.ttft = t1 - t0;
         st.sec = now() - t1; st.hits = eng.hits - h0; st.misses = eng.misses - m0; st.admits = eng.admits - a0; st.cpu = eng.cpu_s - c0;
@@ -1114,6 +1240,12 @@ int main(int argc, char** argv) {
             for (int k = 0; k < 4; k++) tot.ht[k] += st.ht[k];
         }
         report("batch total", tot);
+        if (eng.mtp_rounds) {
+            const double r = (double)eng.mtp_rounds;
+            fprintf(stderr, "[mtp] %lld rounds, draft accepted %.1f%% | ms/round: snapshot %.2f  40 layers %.2f  lm_head+pick %.2f  mtp layer %.2f  redo %.2f | layers: gpu-wait %.2f  cpu-experts %.2f\n",
+                    eng.mtp_rounds, 100.0 * eng.mtp_acc / r, 1e3 * eng.mt[0] / r, 1e3 * eng.mt[1] / r, 1e3 * eng.mt[2] / r, 1e3 * eng.mt[3] / r, 1e3 * eng.mt[4] / r,
+                    1e3 * eng.vpt[0] / r, 1e3 * eng.vpt[1] / r);
+        }
         if (getenv("MOEX_SAVE_HOT")) { eng.hot_file = getenv("MOEX_SAVE_HOT"); eng.save_hot(); }  // makes the shipped moex_hot.bin
         if (eng.trace) fclose(eng.trace);
         return 0;

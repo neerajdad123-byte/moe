@@ -102,18 +102,44 @@ class Qwen36Ref:
                 names += ["linear_attn." + n for n in ("in_proj_qkv.weight", "in_proj_z.weight", "in_proj_a.weight",
                           "in_proj_b.weight", "out_proj.weight", "conv1d.weight", "norm.weight", "A_log", "dt_bias")]
             self.W.append({n: g(p + n) for n in names})
+        # MTP head (mtp.safetensors from tools/fetch_mtp.py): one more attention + MoE layer, registered as layer L
+        self.has_mtp = "mtp.fc.weight" in self.st.index
+        if self.has_mtp:
+            m = "mtp.layers.0."
+            names = ["input_layernorm.weight", "post_attention_layernorm.weight", "mlp.gate.weight",
+                     "mlp.shared_expert.gate_proj.weight", "mlp.shared_expert.up_proj.weight",
+                     "mlp.shared_expert.down_proj.weight", "mlp.shared_expert_gate.weight"]
+            names += [f"self_attn.{n}.weight" for n in ("q_proj", "k_proj", "v_proj", "o_proj", "q_norm", "k_norm")]
+            self.W.append({n: g(m + n) for n in names})
+            self.is_attn.append(True)
+            self.mtp_w = {n: g("mtp." + n) for n in ("fc.weight", "norm.weight", "pre_fc_norm_embedding.weight", "pre_fc_norm_hidden.weight")}
         self.reset()
+
+    @torch.no_grad()
+    def mtp(self, tok, h, pos, kvi):
+        """Draft logits for the token after `tok`: tok at position `pos`, h = the main model's hidden state at pos-1."""
+        w, eps, L = self.mtp_w, self.c["rms_eps"], self.L
+        e = torch.from_numpy(self.embed[tok].astype(np.float32)).to(self.dev)
+        x = self.mv(w["fc.weight"], torch.cat([rmsnorm(e, w["pre_fc_norm_embedding.weight"].float(), eps),
+                                               rmsnorm(h, w["pre_fc_norm_hidden.weight"].float(), eps)]))
+        nop = lambda *a: None
+        saved, self.pos = self.pos, pos
+        routes = list(getattr(self, "routes", []))  # moe() appends; keep the main model's routes
+        x = x + self.attention(L, rmsnorm(x, self.W[L]["input_layernorm.weight"].float(), eps), nop, kvi)
+        x = x + self.moe(L, rmsnorm(x, self.W[L]["post_attention_layernorm.weight"].float(), eps), nop)
+        self.pos, self.routes = saved, routes
+        return self.mv(self.lm_head, rmsnorm(x, w["norm.weight"].float(), eps))
 
     def reset(self):
         c, dev = self.c, self.dev
         self.pos = 0
-        self.K = [[] for _ in range(self.L)]
-        self.V = [[] for _ in range(self.L)]
+        self.K = [[] for _ in range(self.L + 2)]  # + the MTP layer's caches (two hidden-state variants)
+        self.V = [[] for _ in range(self.L + 2)]
         self.ring = [torch.zeros(c["dn_conv_dim"], c["dn_convk"] - 1, device=dev) for _ in range(self.L)]
         self.S = [torch.zeros(c["dn_vheads"], c["dn_kdim"], c["dn_vdim"], device=dev) for _ in range(self.L)]
 
     def expert(self, i, e):
-        p = f"model.layers.{i}.mlp.experts.{e}."
+        p = (f"model.layers.{i}." if i < self.L else "mtp.layers.0.") + f"mlp.experts.{e}."
         return dequant_expert(self.st.t(p + "merged_weight", self.dev), self.st.t(p + "qs", self.dev),
                               self.c["hidden"], self.c["moe_inter"], self.gs)
 
@@ -121,8 +147,9 @@ class Qwen36Ref:
     def mv(w, x):
         return w.float() @ x
 
-    def attention(self, i, x, dump):
+    def attention(self, i, x, dump, kvi=None):
         c, w = self.c, self.W[i]
+        kvi = i if kvi is None else kvi
         H, KV, hd = c["q_heads"], c["kv_heads"], c["head_dim"]
         q = self.mv(w["self_attn.q_proj.weight"], x).view(H, 2 * hd)
         query, gate = q[:, :hd].clone(), q[:, hd:]
@@ -130,8 +157,8 @@ class Qwen36Ref:
         v = self.mv(w["self_attn.v_proj.weight"], x).view(KV, hd)
         query = rope_partial(rmsnorm(query, w["self_attn.q_norm.weight"].float(), c["rms_eps"]), self.pos, self.rot, c["rope_theta"])
         k = rope_partial(rmsnorm(k, w["self_attn.k_norm.weight"].float(), c["rms_eps"]), self.pos, self.rot, c["rope_theta"])
-        self.K[i].append(k); self.V[i].append(v)
-        Kc, Vc = torch.stack(self.K[i], 1), torch.stack(self.V[i], 1)     # [KV, T, hd]
+        self.K[kvi].append(k); self.V[kvi].append(v)
+        Kc, Vc = torch.stack(self.K[kvi], 1), torch.stack(self.V[kvi], 1)     # [KV, T, hd]
         Kr, Vr = Kc.repeat_interleave(H // KV, 0), Vc.repeat_interleave(H // KV, 0)
         sc = torch.einsum("hd,htd->ht", query, Kr) / hd ** 0.5
         ctx = torch.einsum("ht,htd->hd", torch.softmax(sc, -1), Vr)
@@ -214,6 +241,7 @@ class Qwen36Ref:
             dump("moe_in", h)
             x = x + self.moe(i, h, dump)
         cur = None
+        self.last_x = x
         dump("x_final", x)
         logits = self.mv(self.lm_head, rmsnorm(x, self.norm, eps))
         dump("logits", logits)
