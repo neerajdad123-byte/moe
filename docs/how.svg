@@ -1,0 +1,64 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 300" width="760" height="300" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" role="img" aria-labelledby="t d">
+  <title id="t">How moex runs one MoE layer</title>
+  <desc id="d">The router picks 8 of 256 experts. Experts cached in VRAM run on the GPU while missing experts run on the CPU at the same time; their outputs are combined. Missing experts are copied into VRAM in the background, and the least-used cached experts are evicted.</desc>
+  <defs>
+    <marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0 0 L10 5 L0 10 z" class="ah"/>
+    </marker>
+  </defs>
+  <style>
+    .t1 { fill: #0b0b0b; } .t2 { fill: #52514e; }
+    .box { fill: #f6f5f2; stroke: #c9c8c2; } .gpu { fill: #e3eefb; stroke: #2a78d6; } .cpu { fill: #fbe9e1; stroke: #eb6834; }
+    .ln { stroke: #77766f; fill: none; } .ah { fill: #77766f; } .bg { stroke: #2a78d6; fill: none; }
+    @media (prefers-color-scheme: dark) {
+      .t1 { fill: #f0f0ee; } .t2 { fill: #a9a89f; }
+      .box { fill: #22221f; stroke: #4a4945; } .gpu { fill: #14243a; stroke: #3987e5; } .cpu { fill: #33201a; stroke: #d95926; }
+      .ln { stroke: #8f8e86; } .ah { fill: #8f8e86; } .bg { stroke: #3987e5; }
+    }
+  </style>
+
+  <!-- token -->
+  <rect x="0" y="122" width="96" height="56" rx="8" class="box"/>
+  <text x="48" y="148" class="t1" font-size="14" font-weight="600" text-anchor="middle">token</text>
+  <text x="48" y="166" class="t2" font-size="11" text-anchor="middle">each layer</text>
+
+  <!-- router -->
+  <rect x="132" y="122" width="150" height="56" rx="8" class="box"/>
+  <text x="207" y="148" class="t1" font-size="14" font-weight="600" text-anchor="middle">router</text>
+  <text x="207" y="166" class="t2" font-size="11" text-anchor="middle">picks 8 of 256 experts</text>
+
+  <!-- GPU -->
+  <rect x="346" y="40" width="220" height="74" rx="8" class="gpu" stroke-width="1.5"/>
+  <text x="456" y="66" class="t1" font-size="14" font-weight="600" text-anchor="middle">GPU · experts in VRAM</text>
+  <text x="456" y="85" class="t2" font-size="11" text-anchor="middle">~70% of picks are already cached</text>
+  <text x="456" y="101" class="t2" font-size="11" text-anchor="middle">+ attention, DeltaNet, output head</text>
+
+  <!-- CPU -->
+  <rect x="346" y="186" width="220" height="74" rx="8" class="cpu" stroke-width="1.5"/>
+  <text x="456" y="212" class="t1" font-size="14" font-weight="600" text-anchor="middle">CPU · the missing experts</text>
+  <text x="456" y="231" class="t2" font-size="11" text-anchor="middle">AVX2, at the same time as the GPU</text>
+  <text x="456" y="247" class="t2" font-size="11" text-anchor="middle">faster than copying them over PCIe</text>
+
+  <!-- combine -->
+  <rect x="630" y="122" width="130" height="56" rx="8" class="box"/>
+  <text x="695" y="148" class="t1" font-size="14" font-weight="600" text-anchor="middle">combine</text>
+  <text x="695" y="166" class="t2" font-size="11" text-anchor="middle">next layer</text>
+
+  <!-- flow -->
+  <g class="ln" stroke-width="1.5">
+    <line x1="96" y1="150" x2="128" y2="150" marker-end="url(#a)"/>
+    <path d="M282 140 C310 140 310 77 342 77" marker-end="url(#a)"/>
+    <path d="M282 160 C310 160 310 223 342 223" marker-end="url(#a)"/>
+    <path d="M566 77 C598 77 598 140 626 140" marker-end="url(#a)"/>
+    <path d="M566 223 C598 223 598 160 626 160" marker-end="url(#a)"/>
+  </g>
+  <text x="302" y="102" class="t2" font-size="11" text-anchor="end">hit</text>
+  <text x="302" y="206" class="t2" font-size="11" text-anchor="end">miss</text>
+
+  <!-- background admission -->
+  <path d="M372 186 V118" class="bg" stroke-width="1.5" stroke-dasharray="5 4" marker-end="url(#a)"/>
+  <text x="384" y="150" class="t2" font-size="11">copied into VRAM in the</text>
+  <text x="384" y="164" class="t2" font-size="11">background for next time</text>
+
+  <text x="0" y="292" class="t2" font-size="11">Which experts stay in VRAM: a use count that fades with a 10-token half-life; the lowest score is evicted. --load starts with your most-used ones.</text>
+</svg>
