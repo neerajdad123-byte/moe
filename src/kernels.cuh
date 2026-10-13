@@ -583,15 +583,20 @@ __global__ void qk_norm_rope_k(const float* __restrict__ q, const float* __restr
     }
 }
 
-// ---- K7: decode attention, one block (256 threads = head dim) per query head ----
+// ---- K7: decode attention (flash-decoding) ----
 // ctx = softmax(q.K^T / sqrt(HD)) V over t in [0, T); out = ctx * sigmoid(gate).
-// shortcut: whole score row in shared memory (T <= ~24k with opt-in smem); split-K when contexts grow.
+// grid (H, tokens, ns): block s covers keys [s*L, (s+1)*L), L = ceil(T/ns), in tiles of ATILE scores with an online
+// softmax, so shared memory is fixed and any context fits. ns > 1 (decode: H=16 blocks alone leave most SMs idle)
+// writes partials {m, l, acc[HD]} to part, merged by attn_combine_k; ns == 1 (prefill chunks) writes out directly.
+constexpr int ATILE = 2048;
 __global__ void attn_decode_k(const float* __restrict__ qo, const float* __restrict__ q_gate,
-                              KVCache kv, float* __restrict__ out, int H, int KV, const int* __restrict__ pos_d, int max_t, int ld) {
-    extern __shared__ float sc[];  // [max_t]
-    const int tok = blockIdx.y, T = *pos_d + tok + 1;  // causal: token tok sees positions up to its own
-    qo += (size_t)tok * H * AHD; q_gate += (size_t)tok * ld; out += (size_t)tok * H * AHD;
+                              KVCache kv, float* __restrict__ out, int H, int KV, const int* __restrict__ pos_d, int max_t, int ld,
+                              float* __restrict__ part) {
+    __shared__ float sc[ATILE];
     __shared__ __align__(16) float qs[AHD];
+    const int tok = blockIdx.y, T = *pos_d + tok + 1;  // causal: token tok sees positions up to its own
+    const int ns = gridDim.z, L = (T + ns - 1) / ns, lo = blockIdx.z * L, hi = min(T, lo + L);
+    qo += (size_t)tok * H * AHD; q_gate += (size_t)tok * ld; out += (size_t)tok * H * AHD;
     int h = blockIdx.x, kvh = h / (H / KV), tid = threadIdx.x, lane = tid & 31, wid = tid >> 5;
     qs[tid] = qo[h * AHD + tid];
     __syncthreads();
@@ -600,41 +605,66 @@ __global__ void attn_decode_k(const float* __restrict__ qo, const float* __restr
     const float* Ks = kv.ks + (size_t)kvh * max_t;
     const float* Vs = kv.vs + (size_t)kvh * max_t;
     const float scale = rsqrtf((float)AHD);
-    for (int t = wid; t < T; t += blockDim.x / 32) {  // warp per key, 8 dims per lane
-        uint2 u = *reinterpret_cast<const uint2*>(K + (size_t)t * AHD + lane * 8);
-        const float4* qr = reinterpret_cast<const float4*>(qs) + lane * 2;
-        float4 qa = qr[0], qb = qr[1];
-        float s = (float)(int8_t)(u.x) * qa.x + (float)(int8_t)(u.x >> 8) * qa.y + (float)(int8_t)(u.x >> 16) * qa.z + (float)(int8_t)(u.x >> 24) * qa.w +
-                  (float)(int8_t)(u.y) * qb.x + (float)(int8_t)(u.y >> 8) * qb.y + (float)(int8_t)(u.y >> 16) * qb.z + (float)(int8_t)(u.y >> 24) * qb.w;
-        s = warp_sum(s);
-        if (lane == 0) sc[t] = s * Ks[t] * scale;
+    float m = -INFINITY, l = 0.f, acc = 0.f;
+    for (int t0 = lo; t0 < hi; t0 += ATILE) {
+        const int n = min(ATILE, hi - t0);
+        for (int i = wid; i < n; i += blockDim.x / 32) {  // warp per key, 8 dims per lane
+            const int t = t0 + i;
+            uint2 u = *reinterpret_cast<const uint2*>(K + (size_t)t * AHD + lane * 8);
+            const float4* qr = reinterpret_cast<const float4*>(qs) + lane * 2;
+            float4 qa = qr[0], qb = qr[1];
+            float s = (float)(int8_t)(u.x) * qa.x + (float)(int8_t)(u.x >> 8) * qa.y + (float)(int8_t)(u.x >> 16) * qa.z + (float)(int8_t)(u.x >> 24) * qa.w +
+                      (float)(int8_t)(u.y) * qb.x + (float)(int8_t)(u.y >> 8) * qb.y + (float)(int8_t)(u.y >> 16) * qb.z + (float)(int8_t)(u.y >> 24) * qb.w;
+            s = warp_sum(s);
+            if (lane == 0) sc[i] = s * Ks[t] * scale;
+        }
+        __syncthreads();
+        float mt = -INFINITY;
+        for (int i = tid; i < n; i += blockDim.x) mt = fmaxf(mt, sc[i]);
+        const float mn = fmaxf(m, block_max(mt)), c = __expf(m - mn);  // m = -inf on the first tile: c = 0
+        float s = 0.f;
+        for (int i = tid; i < n; i += blockDim.x) { float e = __expf(sc[i] - mn); s += e; sc[i] = e * Vs[t0 + i]; }  // V's scale folded in
+        l = l * c + block_sum(s);  // block_sum syncs, so sc[] is complete after it
+        acc *= c;
+        for (int i = 0; i < n; i++) acc += sc[i] * (float)V[(size_t)(t0 + i) * AHD + tid];
+        m = mn;
+        __syncthreads();  // sc[] is overwritten by the next tile
     }
-    __syncthreads();
-    float m = -INFINITY;
-    for (int t = tid; t < T; t += blockDim.x) m = fmaxf(m, sc[t]);
-    for (int o = 16; o; o >>= 1) m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, o));
-    __shared__ float red[32];
-    if (lane == 0) red[wid] = m;
-    __syncthreads();
-    m = red[0]; for (int i = 1; i < blockDim.x / 32; i++) m = fmaxf(m, red[i]);
-    float s = 0.f;
-    for (int t = tid; t < T; t += blockDim.x) { float e = __expf(sc[t] - m); s += e; sc[t] = e * Vs[t]; }  // V's scale folded in
-    float inv = 1.f / block_sum(s);  // block_sum syncs, so sc[] is complete after it
-    float acc = 0.f;
-    for (int t = 0; t < T; t++) acc += sc[t] * (float)V[(size_t)t * AHD + tid];
-    float g = q_gate[h * 2 * AHD + AHD + tid];
-    out[h * AHD + tid] = acc * inv / (1.f + __expf(-g));
+    if (ns == 1) {
+        float g = q_gate[h * 2 * AHD + AHD + tid];
+        out[h * AHD + tid] = acc / l / (1.f + __expf(-g));
+        return;
+    }
+    float* p = part + (((size_t)tok * H + h) * ns + blockIdx.z) * (AHD + 2);
+    p[2 + tid] = acc;
+    if (tid == 0) { p[0] = m; p[1] = l; }  // an empty split (T < ns) leaves m = -inf, l = 0, acc = 0
 }
 
-// pos_d: device int, the position of the first token. Shared memory is sized for max_t (fixed per launch
-// shape, so the same launch can be replayed from a graph at any position).
+__global__ void attn_combine_k(const float* __restrict__ part, const float* __restrict__ q_gate,
+                               float* __restrict__ out, int H, int ns, int ld) {
+    const int tok = blockIdx.y, h = blockIdx.x, tid = threadIdx.x;
+    const float* p = part + ((size_t)tok * H + h) * ns * (AHD + 2);
+    float M = -INFINITY;
+    for (int s = 0; s < ns; s++) M = fmaxf(M, p[s * (AHD + 2)]);  // split 0 is never empty, so M is finite
+    float l = 0.f, acc = 0.f;
+    for (int s = 0; s < ns; s++) {
+        const float* q = p + s * (AHD + 2), w = __expf(q[0] - M);
+        l += q[1] * w; acc += q[2 + tid] * w;
+    }
+    float g = q_gate[(size_t)tok * ld + h * 2 * AHD + AHD + tid];
+    out[((size_t)tok * H + h) * AHD + tid] = acc / l / (1.f + __expf(-g));
+}
+
+// pos_d: device int, the position of the first token, so the same launch can be replayed from a graph at any position.
 // T tokens (a prefill chunk): q/k/v rows have stride ld; all K/V are appended before any token attends.
+// ns > 1 needs part = T * H * ns * (AHD + 2) floats.
 // shortcut: one block per (head, token) re-reads K/V per token; a flash-style tile for long prompts.
 inline void attn_decode(const float* q, const float* k, const float* v, const half* qn, const half* kn,
                         float* qo, KVCache kv, float* out, int H, int KV, const int* pos_d, int max_t,
-                        int rot, float theta, float eps, int T, int ld, cudaStream_t st = 0) {
+                        int rot, float theta, float eps, int T, int ld, cudaStream_t st = 0, float* part = nullptr, int ns = 1) {
     qk_norm_rope_k<<<dim3(H + KV, T), AHD, 0, st>>>(q, k, v, qn, kn, qo, kv, H, KV, pos_d, max_t, rot, theta, eps, ld);
-    attn_decode_k<<<dim3(H, T), AHD, max_t * sizeof(float), st>>>(qo, q, kv, out, H, KV, pos_d, max_t, ld);
+    attn_decode_k<<<dim3(H, T, ns), AHD, 0, st>>>(qo, q, kv, out, H, KV, pos_d, max_t, ld, part);
+    if (ns > 1) attn_combine_k<<<dim3(H, T), AHD, 0, st>>>(part, q, out, H, ns, ld);
 }
 
 inline KVCache kv_alloc(int KV, int max_t) {

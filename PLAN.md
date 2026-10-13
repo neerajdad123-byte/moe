@@ -84,7 +84,7 @@ Dense int8 → ~75 tok/s ceiling; dense int4 → ~110. So dense requantization i
 | K3 router | top-8 ids identical L0/L3/L39 | 21 µs | |
 | K4 experts int4 | moe_out rel 1e-7 | 8 experts 0.146 ms, 97 GB/s (51%) | main upgrade target (U2) |
 | K5 shared expert | (in moe_out) | 71 µs, 89 GB/s | 6 launches; fuse/graph later |
-| K6+K7 attention | rel 5e-7 over 12 chained positions | layer 0.337 ms (86%); core T=4096 45 GB/s | split-K needed for long context |
+| K6+K7 attention | rel 5e-7 over 12 chained positions | layer 0.337 ms (86%); core T=4096 45 GB/s | flash-decoding: core T=4096 0.13 ms (16 splits) |
 | K8 DeltaNet | rel 5e-7 over 12 chained positions | layer 0.430 ms (88%); core 32 µs | state column held in registers |
 | K9 argmax | 12/12 | 20 µs | |
 
@@ -201,6 +201,10 @@ Routing changed with the fix (10-prompt hit 76% -> 71%): traces must be re-colle
 5. [x] C++ tokenizer, no Python needed (identical to HF on 54 cases / 66k tokens)
 6. [x] other GPUs: fat binary sm_75/80/86/89/90/120 + PTX (4.5 MB exe), slot cap for big GPUs, RAM check (no locking below ~23 GB), AVX2 check
 7. [x] `moex download` (WinHTTP, resumable, size-checked) into models\ next to moex.exe; missing model -> clear message
-8. [~] long context: int8 KV cache done (KL 2.95e-3, top-1 unchanged); split-K attention for >24k still to do
+8. [x] long context: int8 KV cache (KL 2.95e-3, top-1 unchanged) + flash-decoding attention (16 key splits, online softmax in
+   2048-key tiles, fixed 8 KB smem). Core T=4096: 0.49 -> 0.13 ms/layer. 10-prompt decode: 46.2 fresh process / 47.3 warm (was 41.1 / 42.3).
+   26.5k-token prompt: prefill 107 tok/s, decode 29.9 tok/s, coherent (was impossible: score row in smem capped ~24k)
 9. [x] README (results, quick start, API, how it works, accuracy, limits), package.bat -> dist/moex-windows-x64.zip (1.2 MB; needs only the NVIDIA driver)
-
+10. [x] `--load` warm start: per-expert use counts kept in moex_hot.bin (model folder; release ships one from 80 prompts),
+    hottest fill VRAM at load, RAM locked before the prompt. First reply 44.5 tok/s (was ~6-9 while RAM filled).
+    RAM/VRAM free printed before/after load; per-reply tok/s in chat and serve.

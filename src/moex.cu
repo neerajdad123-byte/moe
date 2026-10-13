@@ -31,7 +31,7 @@ static double now() { return std::chrono::duration<double>(std::chrono::steady_c
 
 // Qwen3.6-35B-A3B geometry (checked against the container shapes at load).
 constexpr int D = 2048, NL = 40, E = 256, TOPK = 8, SI = 512, V = 248320;
-constexpr int AH = 16, AKV = 2, ROT = 64;            // attention
+constexpr int AH = 16, AKV = 2, ROT = 64, ASPLIT = 16;  // attention; ASPLIT: decode attention splits (16 blocks alone leave SMs idle)
 constexpr int DC = 8192, DVH = 32, DKH = 16, CONVK = 4;  // DeltaNet
 constexpr float EPS = 1e-6f, THETA = 1e7f;
 // Top-8 router weights renormalized to sum to 1: the HF config omits norm_topk_prob, the Qwen3.5-MoE default is
@@ -59,7 +59,7 @@ struct Engine {
     const half* embed;  // mmapped, stays in RAM
     int ctx;
     // scratch
-    float *x, *h, *tmp, *moe, *big, *q, *k, *v, *qo, *ag, *z, *a, *b, *conv, *o, *act, *scr, *logits, *rw, *amv;
+    float *x, *h, *tmp, *moe, *big, *q, *k, *v, *qo, *ag, *apart, *z, *a, *b, *conv, *o, *act, *scr, *logits, *rw, *amv;
     int *ridx, *ams;
     const uint8_t** slots_d;
     cudaStream_t cs, cp;  // compute, copy (both non-blocking: the legacy default stream would serialize them)
@@ -214,8 +214,52 @@ struct Engine {
     // traces (tools/sim.py): 82.0% hit vs 80.8% LRU; longer half-lives lose (tau 200: 69%).
     static constexpr double TAU = 10.0;
     std::vector<double> G = std::vector<double>(NL * E, -INFINITY);
+
+    // Warm start (--load): use counts per expert, summed over past sessions in hot_file (moex_hot.bin in the
+    // model folder; the release ships one from our test prompts for the first run). The hottest experts fill
+    // the VRAM slots at load instead of arriving one miss at a time during the first replies.
+    std::vector<uint32_t> uses = std::vector<uint32_t>(NL * E, 0);
+    std::string hot_file;
+    bool warm = false;
+    bool quiet = false;  // chat/serve: no per-prefill stats line
+    void load_hot(const std::vector<std::string>& paths) {
+        for (auto& p : paths) {
+            FILE* f = fopen(p.c_str(), "rb");
+            if (!f) continue;
+            std::vector<uint32_t> u(NL * E);
+            bool ok = fread(u.data(), 4, u.size(), f) == u.size();
+            fclose(f);
+            if (ok) { uses = u; return; }
+        }
+    }
+    void save_hot() {
+        FILE* f = fopen(hot_file.c_str(), "wb");
+        if (!f) return;  // read-only model folder: the counts just aren't kept
+        fwrite(uses.data(), 4, uses.size(), f);
+        fclose(f);
+    }
+    void warm_slots() {
+        std::vector<int> keys(NL * E);
+        for (int i = 0; i < NL * E; i++) keys[i] = i;
+        std::sort(keys.begin(), keys.end(), [&](int a, int b) { return uses[a] > uses[b]; });
+        const double mx = std::max(uses[keys[0]], 1u);
+        std::vector<const uint8_t*> tab(NL * E, nullptr);
+        int n = 0;
+        for (; n < nslots - nres && uses[keys[n]]; n++) {  // the tail slots belong to prefill
+            const int key = keys[n];
+            uint8_t* dst = arena + (size_t)n * EXPERT_BYTES;
+            memcpy(stage[0].buf, eq[key], EXPERT_Q_BYTES);
+            memcpy(stage[0].buf + EXPERT_Q_BYTES, es[key], EXPERT_BYTES - EXPERT_Q_BYTES);
+            CK(cudaMemcpy(dst, stage[0].buf, EXPERT_BYTES, cudaMemcpyHostToDevice));
+            owner[n] = key; slot_of[key] = n; ready[n] = 1; tab[key] = dst;
+            G[key] = log(uses[key] / mx);  // <= 0: ranked like recent uses, then decays as usual
+        }
+        CK(cudaMemcpy(table_d, tab.data(), tab.size() * sizeof(void*), cudaMemcpyHostToDevice));
+        fprintf(stderr, "[load] %d most-used experts preloaded into VRAM\n", n);
+    }
     long long tokens = 0;
     void touch(int key) {
+        uses[key]++;
         double v = tokens / TAU, g = G[key];
         G[key] = g == -INFINITY ? v : std::max(g, v) + log1p(exp(-fabs(g - v)));
     }
@@ -336,8 +380,7 @@ struct Engine {
         amv = falloc(ARGMAX_BLOCKS + 1);
         CK(cudaMalloc(&ridx, TOPK * 4)); CK(cudaMalloc(&ams, ARGMAX_BLOCKS * 4));
         CK(cudaMalloc(&slots_d, TOPK * sizeof(void*)));
-        if (ctx * 4 > 48 * 1024)
-            CK(cudaFuncSetAttribute(attn_decode_k, cudaFuncAttributeMaxDynamicSharedMemorySize, ctx * 4));
+        apart = falloc(AH * ASPLIT * (AHD + 2));
         alloc_prefill();
         eq.resize(NL * E); es.resize(NL * E);
         for (int l = 0; l < NL; l++) for (int e = 0; e < E; e++) {
@@ -373,6 +416,7 @@ struct Engine {
             CK(cudaEventCreateWithFlags(&stage[i].done, cudaEventDisableTiming));
             free_st.push_back(i);
         }
+        if (warm) warm_slots();
         loader = std::thread([this] { loader_main(); });
         capture_graphs();
         fprintf(stderr, "[load] %.1f s, dense %s, %d expert slots (%.2f GB, %.1f%% of %d experts), ctx %d\n",
@@ -398,7 +442,7 @@ struct Engine {
         rmsnorm(x, l ? moe : nullptr, w.in_ln, h, D, EPS, 1, cs);  // folds in the previous layer's MoE output
         if (is_attn(l)) {
             gemv(w.attn_qkv, h, q, D, AH * 2 * AHD + 2 * AKV * AHD, cs);  // -> q, k, v
-            attn_decode(q, k, v, w.qn, w.kn, qo, w.kv, ag, AH, AKV, pos_d, ctx, ROT, THETA, EPS, 1, 0, cs);
+            attn_decode(q, k, v, w.qn, w.kn, qo, w.kv, ag, AH, AKV, pos_d, ctx, ROT, THETA, EPS, 1, 0, cs, apart, ASPLIT);
             gemv(w.o, ag, tmp, AH * AHD, D, cs);
         } else {
             gemv(w.dn_in, h, big, D, DC + DVH * DNV + 2 * DVH, cs);  // -> qkv, z, a, b
@@ -640,7 +684,7 @@ struct Engine {
         }
         release_prefill_slots();
         cpool.spin = false;
-        fprintf(stderr, "[prefill] %d tok in %.2f s = %.1f tok/s | host: gpu-wait %.2f  streaming-wait %.2f  cpu-experts %.2f s | streamed %lld experts"
+        if (!quiet) fprintf(stderr, "[prefill] %d tok in %.2f s = %.1f tok/s | host: gpu-wait %.2f  streaming-wait %.2f  cpu-experts %.2f s | streamed %lld experts"
                 " | copier: wait-dma %.2f  memcpy %.2f s | page faults %lu\n",
                 n, now() - pt0, n / (now() - pt0), pt[0], pt[1], pt[2], streamed_n - sn0, pt[3], pt[4], page_faults() - pf0);
         return next;
@@ -797,7 +841,7 @@ int main(int argc, char** argv) {
     if (!has_avx2()) { fprintf(stderr, "moex needs a CPU with AVX2 and FMA (Intel Haswell / AMD Zen or newer).\n"); return 1; }
     std::string model = default_model_dir(), only;
     std::string mode, system_prompt;
-    bool think = false, samp_set = false, n_set = false;
+    bool think = false, samp_set = false, n_set = false, warm = false;
     std::string host = "127.0.0.1";
     int port = 8765;
     if (argc > 1 && argv[1][0] != '-') { mode = argv[1]; argv++; argc--; }  // moex chat | moex serve
@@ -816,6 +860,7 @@ int main(int argc, char** argv) {
         else if (s == "--only") only = next();
         else if (s == "--system") system_prompt = next();
         else if (s == "--think") think = true;
+        else if (s == "--load") warm = true;
         else if (s == "--host") host = next();
         else if (s == "--port") port = std::stoi(next());
         else if (s == "--ctx") ctx = std::stoi(next());
@@ -843,8 +888,8 @@ int main(int argc, char** argv) {
     }
     if (mode.empty() && ids.empty() && batch.empty()) {
         fprintf(stderr, "usage: moex download                                 fetch the model (~22 GB, resumable)\n"
-                        "       moex chat [--system TEXT] [--think] [--temp T ...]\n"
-                        "       moex serve [--port 8765] [--host 127.0.0.1]     OpenAI-compatible API\n"
+                        "       moex chat [--load] [--system TEXT] [--think] [--temp T ...]\n"
+                        "       moex serve [--load] [--port 8765] [--host 127.0.0.1]     OpenAI-compatible API\n"
                         "       moex --ids 1,2,3 [--n N] | --batch ids.txt | --check ref/golden\n"
                         "       options: --model DIR (default %s) --ctx N\n", model.c_str());
         return 2;
@@ -858,10 +903,17 @@ int main(int argc, char** argv) {
         return 1;
     }
 
+    const bool interactive = mode == "chat" || mode == "serve";
+    if (interactive) mem_report("before load");
     Engine eng(model.c_str(), ctx);
     eng.f16 = f16; eng.q4groups = q4groups; eng.samp = samp;
-    eng.pin_async = mode == "chat" || mode == "serve";
+    eng.warm = warm;
+    eng.quiet = interactive;
+    eng.pin_async = interactive && !warm;  // --load waits for every expert to be in RAM before the prompt
+    eng.hot_file = model + "/moex_hot.bin";
+    if (warm) eng.load_hot({eng.hot_file, exe_dir() + "/moex_hot.bin"});
     eng.load();
+    if (interactive) mem_report("after load");
 
     if (mode == "serve") {
         Tokenizer tk(model + "/tokenizer.json");
@@ -877,8 +929,9 @@ int main(int argc, char** argv) {
         std::vector<ChatMsg> msgs;
         if (!system_prompt.empty()) msgs.push_back({"system", system_prompt});
         const int max_new = n_set ? n : 2048;
-        fprintf(stderr, "\nmoex chat - Qwen3.6-35B-A3B. /reset starts over, /exit quits.\n"
-                        "(experts are still loading into RAM for ~20 s: the first reply can be slower)\n");
+        fprintf(stderr, warm ? "\nNow the stage is yours. (moex chat - Qwen3.6-35B-A3B. /reset starts over, /exit quits.)\n"
+                             : "\nmoex chat - Qwen3.6-35B-A3B. /reset starts over, /exit quits.\n"
+                               "(experts are still loading into RAM for ~20 s: the first reply can be slower; `moex chat --load` waits instead)\n");
         std::string line;
         while (true) {
             fprintf(stdout, "\n> "); fflush(stdout);
@@ -898,6 +951,7 @@ int main(int argc, char** argv) {
             });
             reply += us.held;
             ss.replies[reply] = out;
+            eng.save_hot();
             msgs.push_back({"assistant", reply});
             double t2 = now();
             fprintf(stderr, "\n[%d tokens, %.1f tok/s, first token %.2f s, context %zu]\n", ntok,
@@ -984,8 +1038,8 @@ int main(int argc, char** argv) {
         FILE* f = fopen(batch.c_str(), "rb");
         if (!f) { fprintf(stderr, "no %s\n", batch.c_str()); return 1; }
         std::vector<std::vector<int>> prompts;
-        char line[1 << 16];
-        while (fgets(line, sizeof line, f)) { auto v = parse_ids(line); if (!v.empty()) prompts.push_back(v); }
+        std::vector<char> line(1 << 24);  // one prompt per line, up to ~2M tokens
+        while (fgets(line.data(), (int)line.size(), f)) { auto v = parse_ids(line.data()); if (!v.empty()) prompts.push_back(v); }
         fclose(f);
         Stats tot;
         for (size_t i = 0; i < prompts.size(); i++) {
@@ -1001,6 +1055,7 @@ int main(int argc, char** argv) {
             for (int k = 0; k < 4; k++) tot.ht[k] += st.ht[k];
         }
         report("batch total", tot);
+        if (getenv("MOEX_SAVE_HOT")) { eng.hot_file = getenv("MOEX_SAVE_HOT"); eng.save_hot(); }  // makes the shipped moex_hot.bin
         if (eng.trace) fclose(eng.trace);
         return 0;
     }

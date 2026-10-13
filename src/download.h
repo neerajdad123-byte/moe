@@ -99,12 +99,25 @@ static int download_model(const std::string& dir, const std::string& only) {
 }
 
 // Where the model lives: --model, else MOEX_MODEL, else models\ next to moex.exe (falling back to the dev path).
+static std::string exe_dir() {
+    wchar_t exe[MAX_PATH]; GetModuleFileNameW(nullptr, exe, MAX_PATH);
+    return std::filesystem::path(exe).parent_path().string();
+}
 static std::string default_model_dir() {
     if (const char* e = getenv("MOEX_MODEL")) return e;
     if (const char* e = getenv("QWEN36_MODEL")) return e;
-    wchar_t exe[MAX_PATH]; GetModuleFileNameW(nullptr, exe, MAX_PATH);
-    std::filesystem::path p = std::filesystem::path(exe).parent_path() / "models" / "qwen36-35b-a3b-i4-gs64";
+    std::filesystem::path p = std::filesystem::path(exe_dir()) / "models" / "qwen36-35b-a3b-i4-gs64";
     if (!std::filesystem::exists(p / "config.json") && std::filesystem::exists("C:\\models\\qwen36_i4_gs64\\config.json"))
         return "C:\\models\\qwen36_i4_gs64";
     return p.string();
+}
+
+// Free RAM and VRAM, printed around loading. Afterwards both look nearly full by design: free VRAM became expert
+// slots and the experts are locked in RAM (so CPU misses never wait on the disk).
+static void mem_report(const char* when) {
+    MEMORYSTATUSEX ms{sizeof ms}; GlobalMemoryStatusEx(&ms);
+    size_t fr = 0, tot = 0; CK(cudaMemGetInfo(&fr, &tot));
+    fprintf(stderr, "[%s] RAM %.1f GB free of %.1f GB | VRAM %.1f GB free of %.1f GB%s\n", when,
+            ms.ullAvailPhys / 1e9, ms.ullTotalPhys / 1e9, fr / 1e9, tot / 1e9,
+            strcmp(when, "after load") ? "" : "  (by design: free VRAM became expert slots, RAM holds the experts)");
 }

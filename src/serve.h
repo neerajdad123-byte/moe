@@ -174,6 +174,7 @@ static void serve(Session& ss, Tokenizer& tk, const std::string& host, int port,
                        (finish ? "\"" + std::string(finish) + "\"" : "null") + "}]}\n\n";
             };
             Utf8Stream us; std::string text; bool alive = true, hit_stop = false; size_t sent = 0;
+            const double t0 = now();
             auto out = ss.generate(prompt, max_new, [&](int t) {
                 text += us.push(tk.piece(t));
                 for (auto& s : stops) { size_t k = text.find(s); if (k != std::string::npos) { text.resize(k); hit_stop = true; } }
@@ -185,6 +186,9 @@ static void serve(Session& ss, Tokenizer& tk, const std::string& host, int port,
             });
             if (!hit_stop) text += us.held;
             ss.replies[text] = out;
+            ss.eng.save_hot();
+            fprintf(stderr, "[serve] %zu prompt tokens, %zu generated, %.1f s, %.1f tok/s overall\n", prompt.size(), out.size(), now() - t0,
+                    out.size() / std::max(now() - t0, 1e-9));
             const char* finish = hit_stop || (int)out.size() < max_new ? "stop" : "length";
             if (stream) {
                 if (text.size() > sent) send_all(c, chunk(text.substr(sent), nullptr));
