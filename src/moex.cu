@@ -131,6 +131,7 @@ struct Engine {
             }
             if (i < 0) { std::this_thread::sleep_for(std::chrono::microseconds(50)); continue; }
             Stage& st = stage[i];
+            prefetch_experts(&st.key, 1);
             memcpy(st.buf, eq[st.key], EXPERT_Q_BYTES);  // may page-fault from SSD: this thread absorbs it
             memcpy(st.buf + EXPERT_Q_BYTES, es[st.key], EXPERT_BYTES - EXPERT_Q_BYTES);
             CK(cudaStreamWaitEvent(cp, st.after_compute));  // nothing still reads the victim slot
@@ -139,6 +140,38 @@ struct Engine {
             std::lock_guard<std::mutex> g(mu);
             flying.push_back(i);
         }
+    }
+
+    // Low-RAM mode (all experts don't fit in RAM, e.g. 16 GB machines): experts stay memory-mapped and Windows'
+    // file cache keeps the recently used ones. Replaying route traces (tools/ram_sim.py), that recency policy is
+    // close to the best possible (8 GB of experts: 20 SSD reads/token; locking a fixed hot set: 41), so what matters
+    // is how each read happens: page faults pull an expert in small pieces (~2.4 ms, K14) while one large read of
+    // 1.77 MB takes ~0.3-0.5 ms on NVMe. So every layer's missing experts are requested together, as large
+    // parallel reads, as soon as the routing is known.
+    bool low_ram = false;
+    void prefetch_experts(const int* keys, int n) {
+        if (!low_ram || n <= 0) return;
+        std::vector<WIN32_MEMORY_RANGE_ENTRY> r;
+        for (int i = 0; i < n; i++) {
+            r.push_back({(void*)eq[keys[i]], EXPERT_Q_BYTES});
+            r.push_back({(void*)es[keys[i]], EXPERT_BYTES - EXPERT_Q_BYTES});
+        }
+        PrefetchVirtualMemory(GetCurrentProcess(), r.size(), r.data(), 0);  // a hint: failure only costs speed
+    }
+    // Fills Windows' file cache with the most-used experts that fit in free RAM (not locked: the cache then
+    // follows what is actually used).
+    void prewarm_file_cache() {
+        MEMORYSTATUSEX ms{sizeof ms};
+        GlobalMemoryStatusEx(&ms);
+        const size_t margin = 3ull << 30;  // the OS, other programs, and this process's own buffers
+        const int n = (int)std::min<size_t>(NL * E, ms.ullAvailPhys > margin ? (ms.ullAvailPhys - margin) / EXPERT_BYTES : 0);
+        std::vector<int> keys(NL * E);
+        for (int i = 0; i < NL * E; i++) keys[i] = i;
+        const std::vector<uint32_t> u = uses;  // snapshot: runs on the pinner thread while decode updates uses
+        std::stable_sort(keys.begin(), keys.end(), [&](int a, int b) { return u[a] > u[b]; });
+        double t0 = now();
+        for (int i = 0; i < n; i += 256) prefetch_experts(keys.data() + i, std::min(256, n - i));
+        fprintf(stderr, "[ram] %d of %d experts (%.1f GB) read into the file cache, %.1f s\n", n, NL * E, n * (double)EXPERT_BYTES / 1e9, now() - t0);
     }
 
     // A CPU miss on a mapped page this process hasn't touched costs ~2.4 ms vs ~0.06 ms touched
@@ -155,10 +188,11 @@ struct Engine {
         }
         MEMORYSTATUSEX ms{sizeof ms};
         GlobalMemoryStatusEx(&ms);
-        if (ms.ullTotalPhys < total + (5ull << 30)) {  // the OS and other programs need room too
+        if (low_ram) {
             fprintf(stderr, "[ram] %.1f GB of RAM is below the ~%.0f GB needed to keep all %.1f GB of experts in memory: "
-                            "experts are read through the file cache instead, and decode is slower (CPU misses may wait on the disk)\n",
+                            "the most-used experts are cached in RAM and the rest are read from the SSD when needed (slower decode)\n",
                     ms.ullTotalPhys / 1e9, (total + (5ull << 30)) / 1e9, total / 1e9);
+            prewarm_file_cache();
             return;
         }
         // ask for the largest minimum working set Windows will grant, in 1 GB steps
@@ -387,6 +421,11 @@ struct Engine {
             std::string ep = "model.layers." + std::to_string(l) + ".mlp.experts." + std::to_string(e) + ".";
             eq[l * E + e] = C.map(ep + "merged_weight");
             es[l * E + e] = (const float*)C.map(ep + "qs");
+        }
+        {
+            MEMORYSTATUSEX ms{sizeof ms};
+            GlobalMemoryStatusEx(&ms);
+            low_ram = ms.ullTotalPhys < (size_t)NL * E * EXPERT_BYTES + (5ull << 30) || getenv("MOEX_LOW_RAM");  // the OS and other programs need room too
         }
         if (pin_async) pinner = std::thread([this] { pin_experts_in_ram(); });  // until done, misses may page-fault
         else pin_experts_in_ram();
@@ -617,6 +656,12 @@ struct Engine {
                     jobs.push_back({eq[key], es[key], {}, {}, {}});
                     for (auto& pr : per[e]) { jobs.back().toks.push_back(pr.t); jobs.back().pids.push_back(pr.p); jobs.back().ws.push_back(pr.w); }
                 }
+                {
+                    std::vector<int> pk;
+                    for (int e = 0; e < E; e++) if (job_of[e] >= 0) pk.push_back(l * E + e);
+                    for (int e : streamed) pk.push_back(l * E + e);
+                    prefetch_experts(pk.data(), (int)pk.size());
+                }
                 // GPU: resident experts and the shared expert first (all async)
                 CK(cudaMemsetAsync(ypair, 0, (size_t)T * TOPK * D * 4, cs));
                 const int nres = nitems;
@@ -758,15 +803,16 @@ struct Engine {
                 fwrite(rec, sizeof rec, 1, trace);
             }
             clock++;
-            int nm = 0, mkey[TOPK];
+            int nm = 0, mkey[TOPK], mall[TOPK];
             const uint8_t* mq[TOPK]; const float* msc[TOPK]; float mw[TOPK];
             for (int j = 0; j < TOPK; j++) {
                 int key = l * E + ids_h[j], sl = slot_of[key];
                 touch(key);
                 if (sl >= 0) last[sl] = clock;  // protects this step's experts (incl. in-flight) from eviction
                 if (sl >= 0 && ready[sl]) hits++;
-                else { mq[nm] = eq[key]; msc[nm] = es[key]; mw[nm] = w_h[j]; mkey[nm++] = sl < 0 ? key : -1; misses++; }
+                else { mq[nm] = eq[key]; msc[nm] = es[key]; mw[nm] = w_h[j]; mall[nm] = key; mkey[nm++] = sl < 0 ? key : -1; misses++; }
             }
+            prefetch_experts(mall, nm);
             // CPU: misses, overlapped with the GPU's experts + shared expert
             if (nm) {
                 double c0 = now();
@@ -911,7 +957,7 @@ int main(int argc, char** argv) {
     eng.quiet = interactive;
     eng.pin_async = interactive && !warm;  // --load waits for every expert to be in RAM before the prompt
     eng.hot_file = model + "/moex_hot.bin";
-    if (warm) eng.load_hot({eng.hot_file, exe_dir() + "/moex_hot.bin"});
+    eng.load_hot({eng.hot_file, exe_dir() + "/moex_hot.bin"});  // counts accumulate across sessions
     eng.load();
     if (interactive) mem_report("after load");
 

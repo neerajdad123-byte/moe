@@ -208,3 +208,36 @@ Routing changed with the fix (10-prompt hit 76% -> 71%): traces must be re-colle
 10. [x] `--load` warm start: per-expert use counts kept in moex_hot.bin (model folder; release ships one from 80 prompts),
     hottest fill VRAM at load, RAM locked before the prompt. First reply 44.5 tok/s (was ~6-9 while RAM filled).
     RAM/VRAM free printed before/after load; per-reply tok/s in chat and serve.
+
+## After v0.1.0: studies on route traces (no model run)
+
+**MTP, 1 draft token/step** (`tools/mtp_sim.py build/routes_v2.bin`): per-layer time model calibrated to the measured
+46.2 tok/s (dense+overhead 0.368 ms/layer, CPU expert 0.071 ms, GPU expert 0.012 ms), cache replayed with the union of
+both tokens' experts (hit 72.8% -> 66-70%, CPU misses 87 -> 154-175 per step), MTP head ~ one more layer, 0.4 ms state
+snapshot for rollback.
+
+| draft acceptance | 0.6 | 0.7 | 0.8 | 0.9 |
+|---|---|---|---|---|
+| tok/s, batched CPU kernel (2nd token +30%) | 54.5 (1.18x) | 56.9 (1.23x) | 59.4 (1.29x) | 62.0 (1.34x) |
+| tok/s, no batching (2nd token +100%) | 53.4 (1.16x) | 55.6 (1.20x) | 58.0 (1.26x) | 60.5 (1.31x) |
+
+Verdict: worth building. Dense weights are read once for both tokens, which outweighs the extra misses. Blocker: the
+int4 container has no MTP head, so it needs our own int4 conversion from the official BF16 weights.
+
+**RAM tier for 16 GB machines** (`tools/ram_sim.py build/routes_v2.bin`): SSD reads on the critical path per token
+(CPU misses whose expert isn't in RAM), scored on prompts 40-79, static ranks from prompts 0-39:
+
+| RAM for experts | 4 GB | 6 GB | 8 GB | 10 GB | 12 GB | 14 GB | 18.2 GB |
+|---|---|---|---|---|---|---|---|
+| LRU (~ Windows file cache) | 49.3 | 32.8 | 20.8 | 12.7 | 7.3 | 3.6 | 0.1 |
+| decayed freq, tau 200 | 43.3 | 30.2 | 19.9 | 12.2 | 6.6 | 3.4 | 0.1 |
+| lock a fixed top-R set | 64.9 | 53.4 | 41.3 | 30.0 | 21.2 | 12.8 | 0 |
+
+Verdict: locking a hot set is the worst policy; the file cache's recency is close to the best. What costs is each read:
+a page-faulted expert ~2.4 ms (K14) vs ~0.3-0.5 ms as one large NVMe read. Change (untested on hardware): in low-RAM
+mode each layer's missing experts (decode, prefill, admissions) are requested together with PrefetchVirtualMemory as
+soon as routing is known, and the most-used experts that fit in free RAM are read into the file cache at load (not
+locked). `MOEX_LOW_RAM=1` forces the mode on a big machine to exercise the path. Expected at ~8 GB for experts:
+~20 reads/token, from ~48 ms/token of faults toward ~8-10 ms: to be measured on a 16 GB machine.
+Also fixed: use counts (moex_hot.bin) are now always merged with the saved file; before, a session without --load
+overwrote them with its own counts only.
