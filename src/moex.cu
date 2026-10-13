@@ -192,6 +192,9 @@ struct Engine {
             fprintf(stderr, "[ram] %.1f GB of RAM is below the ~%.0f GB needed to keep all %.1f GB of experts in memory: "
                             "the most-used experts are cached in RAM and the rest are read from the SSD when needed (slower decode)\n",
                     ms.ullTotalPhys / 1e9, (total + (5ull << 30)) / 1e9, total / 1e9);
+            // the dense weights (~4 GB) were read through the map and already live in VRAM: hand their pages back.
+            // (A working-set minimum to stop re-faults was measured: 21 -> 17 tok/s under memory pressure.)
+            SetProcessWorkingSetSize(GetCurrentProcess(), (SIZE_T)-1, (SIZE_T)-1);
             prewarm_file_cache();
             return;
         }
@@ -949,11 +952,21 @@ int main(int argc, char** argv) {
         return 1;
     }
 
+    {  // the only thing moex needs besides itself: an NVIDIA GPU with a recent driver
+        int ndev = 0;
+        cudaError_t e = cudaGetDeviceCount(&ndev);
+        if (e == cudaErrorInsufficientDriver || e == cudaErrorNoDevice || ndev == 0) {
+            fprintf(stderr, e == cudaErrorInsufficientDriver
+                ? "Your NVIDIA driver is too old for moex. Install the latest one (free, ~700 MB):\n  https://www.nvidia.com/Download/index.aspx\n"
+                : "moex needs an NVIDIA GPU (RTX 20 series or newer, 6 GB+ VRAM) with its driver installed:\n  https://www.nvidia.com/Download/index.aspx\n");
+            return 1;
+        }
+    }
     const bool interactive = mode == "chat" || mode == "serve";
     if (interactive) mem_report("before load");
     Engine eng(model.c_str(), ctx);
     eng.f16 = f16; eng.q4groups = q4groups; eng.samp = samp;
-    eng.warm = warm;
+    eng.warm = warm || interactive;
     eng.quiet = interactive;
     eng.pin_async = interactive && !warm;  // --load waits for every expert to be in RAM before the prompt
     eng.hot_file = model + "/moex_hot.bin";
