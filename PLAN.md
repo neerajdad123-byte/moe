@@ -278,3 +278,13 @@ Verified: --check with MOEX_MTP=1 runs teacher-forced MTP rounds (true next toke
 rollback compared with the reference): mean KL 3.01e-3, top-1 98.6% (plain 2.89e-3, 98.6%). Forced wrong draft
 every round (1234 rollbacks): 8/10 outputs identical to plain, the 2 splits at the same near-ties as normal MTP.
 Fixed: the draft head wrote into logits[] (the real model's scores) after prefill; it has its own buffer now.
+
+## 16 GB machines: RAM tier study (tools/prefetch_sim.py, tools/ssd_bench.py, tests/ssd_test.cpp)
+
+Cold expert reads on this laptop (C, overlapped, unbuffered): one whole-expert read 0.7-0.9 ms; split into 2-16 pieces
+no reliable gain (0.7-2.4 ms, varies with the SSD's power state). Background throughput 3.8-4.2 GB/s (~47 experts per token).
+Simulated tok/s with RAM for experts 6 / 8 / 10 GB: recency (today) 16.3 / 20.2 / 25.0, static top-R 12.7 / 14.4 / 16.9,
+recency + lag-2/4 co-occurrence prefetch 16.2 / 20.0 / 24.6 (only ~1/3 of prefetches used). Top-N coverage: 90% of
+expert uses = 4,891 experts (8.7 GB), 95% = 6,026 (10.7 GB). SSD waits/token ~ 136 e^(-0.24 GB); tok/s ~ 1000 /
+(21.6 + t_read x waits). The lever left: the engine reads missing experts through the file map (~2.4 ms, K14); a
+private RAM cache with direct reads (~0.8 ms) would be ~+30% at 8 GB. Startup tip printed in low-RAM mode.
