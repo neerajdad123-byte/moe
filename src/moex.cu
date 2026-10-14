@@ -64,7 +64,7 @@ struct Engine {
     bool has_mtp = false;
     Mat mtp_fc;
     half *mtp_ne = nullptr, *mtp_nh = nullptr, *mtp_norm = nullptr;
-    float *mtp_cat = nullptr, *lg2 = nullptr, *snap = nullptr;
+    float *mtp_cat = nullptr, *lg2 = nullptr, *snap = nullptr, *dlog = nullptr;
     uint8_t* vbuf = nullptr;  // the 2-token round's scratch (the prefill scratch lives in expert slots)
     int draft = -1;
     // scratch
@@ -438,7 +438,7 @@ struct Engine {
         alloc_prefill();
         if (has_mtp) {
             CK(cudaMalloc(&vbuf, carve_prefill(nullptr, VT)));
-            mtp_cat = falloc((size_t)CH * 2 * D); lg2 = falloc((size_t)VT * V);
+            mtp_cat = falloc((size_t)CH * 2 * D); lg2 = falloc((size_t)VT * V); dlog = falloc(V);
             snap = falloc((size_t)(NL - NL / 4) * (DVH * DNK * DNV + DC * (CONVK - 1)));
         }
         eq.assign(NKEY, nullptr); es.assign(NKEY, nullptr);
@@ -672,7 +672,8 @@ struct Engine {
                 } else {
                     gemm(w.dn_in, hc, bigc, T, D, LB, cs);
                     deltanet_core(bigc, bigc + DC, bigc + DC + DVH * DNV, bigc + DC + DVH * DNV + DVH, LB, w.conv, w.alog, w.dtb, w.nw,
-                                  w.ring, w.S, convc, oc, DC, CONVK, DVH, DKH, EPS, T, cs);
+                                  w.ring, w.S, convc, oc, DC, CONVK, DVH, DKH, EPS, T, cs,
+                                  verify ? snap_S(l) : nullptr, verify ? snap_S(l) + DVH * DNK * DNV : nullptr);  // state after the real token
                     gemm(w.out, oc, tmpc, T, DVH * DNV, D, cs);
                 }
                 rmsnorm(Xc, tmpc, w.post_ln, hc, D, EPS, T, cs);
@@ -827,20 +828,20 @@ struct Engine {
         set_int_k<<<1, 1, 0, cs>>>(pos_d, pos);
         chunk_layer(NL, T, pt, verify);
         rmsnorm(Xc + (size_t)(T - 1) * D, moec + (size_t)(T - 1) * D, mtp_norm, h, D, EPS, 1, cs);
-        gemv(lm_head, h, logits, D, V, cs);
-        argmax(logits, V, amv, ams, ids_hd, cs);
+        gemv(lm_head, h, dlog, D, V, cs);  // own buffer: logits[] holds the real model's last scores
+        argmax(dlog, V, amv, ams, ids_hd, cs);
         CK(cudaStreamSynchronize(cs));
         return ids_h[0];
     }
 
-    // DeltaNet + conv state of every linear-attention layer <-> snap (a rejected draft rolls the state back)
-    void dn_state(bool save) {
+    // snap: per linear-attention layer, its DeltaNet state + conv ring after the real token of the MTP round (written
+    // by the kernels as they go). A wrong draft copies it back: the state as if only the real token had been fed.
+    float* snap_S(int l) { return snap + (size_t)(l - (l + 1) / 4) * (DVH * DNK * DNV + DC * (CONVK - 1)); }
+    void dn_rollback() {
         const size_t nS = (size_t)DVH * DNK * DNV, nR = (size_t)DC * (CONVK - 1);
-        size_t off = 0;
         for (int l = 0; l < NL; l++) if (!is_attn(l)) {
-            CK(cudaMemcpyAsync(save ? snap + off : L[l].S, save ? L[l].S : snap + off, nS * 4, cudaMemcpyDeviceToDevice, cs));
-            CK(cudaMemcpyAsync(save ? snap + off + nS : L[l].ring, save ? L[l].ring : snap + off + nS, nR * 4, cudaMemcpyDeviceToDevice, cs));
-            off += nS + nR;
+            CK(cudaMemcpyAsync(L[l].S, snap_S(l), nS * 4, cudaMemcpyDeviceToDevice, cs));
+            CK(cudaMemcpyAsync(L[l].ring, snap_S(l) + nS, nR * 4, cudaMemcpyDeviceToDevice, cs));
         }
     }
 
@@ -853,8 +854,6 @@ struct Engine {
         const int d = draft;
         double pt[5] = {}, t0 = now();
         mtp_rounds++;
-        dn_state(true);
-        CK(cudaStreamSynchronize(cs)); mt[0] += now() - t0; t0 = now();
         carve_prefill(vbuf, VT);
         for (int i = 0; i < D; i++) { rows_h[i] = __half2float(embed[(size_t)y * D + i]); rows_h[D + i] = __half2float(embed[(size_t)d * D + i]); }
         copy_k<<<(2 * D + 255) / 256, 256, 0, cs>>>(Xc, rows_d, 2 * D);
@@ -876,8 +875,8 @@ struct Engine {
             mt[3] += now() - t0;
         } else {
             mt[2] += now() - t0; t0 = now();
-            dn_state(false);
-            step(y, p, false);  // y alone: the recurrent state without the draft (Xc row 0 is untouched)
+            dn_rollback();  // keep y only (KV row p+1 holds the draft; it is overwritten when p+1 is fed)
+            tokens++; note(y);
             CK(cudaStreamSynchronize(cs)); mt[4] += now() - t0; t0 = now();
             draft = mtp_forward(nullptr, 1, t1, p + 1, pt, true);
             mt[3] += now() - t0;
@@ -1177,11 +1176,28 @@ int main(int argc, char** argv) {
             if (k != std::string::npos) np = std::stoi(m.substr(m.find(':', k) + 1));
         }
         if (use_prefill) pos = np - 1;  // the prompt runs as one prefill; compare from its last position on
+        std::vector<float> pend;  // MTP: the second row's logits of an accepted round, for the next position
+        int pend_pos = -1, pend_id = -1;
         for (;; pos++) {
             auto ref = read_f32(check + "/p" + std::string(pos < 10 ? "00" : pos < 100 ? "0" : "") + std::to_string(pos) + "_logits.bin");
             if (ref.empty()) break;
-            int id = use_prefill && pos == np - 1 ? eng.prefill(ids.data(), np, 0) : eng.step(tok, pos, true);
-            std::vector<float> got(V); CK(cudaMemcpy(got.data(), eng.logits, V * 4, cudaMemcpyDeviceToHost));
+            std::vector<float> got(V);
+            int id;
+            if (pend_pos == pos) { got = pend; id = pend_id; }
+            else if (eng.has_mtp && pos > np - 1 && pos + 1 < (int)ids.size()) {
+                // MTP rounds, teacher-forced: the true next token is the draft, so both rows are checked (row 1 when
+                // the model agrees with it); a disagreement exercises the rollback
+                {
+                    eng.draft = ids[pos + 1];
+                    auto ts = eng.mtp_round(tok, pos);
+                    CK(cudaMemcpy(got.data(), eng.lg2, V * 4, cudaMemcpyDeviceToHost));
+                    id = ts[0];
+                    if (ts.size() == 2) { pend.resize(V); CK(cudaMemcpy(pend.data(), eng.lg2 + V, V * 4, cudaMemcpyDeviceToHost)); pend_pos = pos + 1; pend_id = ts[1]; }
+                }
+            } else {
+                id = use_prefill && pos == np - 1 ? eng.prefill(ids.data(), np, 0) : eng.step(tok, pos, true);
+                CK(cudaMemcpy(got.data(), eng.logits, V * 4, cudaMemcpyDeviceToHost));
+            }
             double mx = 0, err = 0;
             for (int i = 0; i < V; i++) { mx = std::max(mx, (double)fabsf(ref[i])); err = std::max(err, (double)fabsf(got[i] - ref[i])); }
             int rid = int(std::max_element(ref.begin(), ref.end()) - ref.begin());

@@ -270,3 +270,11 @@ RAM free 71 / 12-47 slots for extra CPU work every token: net loss. Decode is bo
 int4 gs64 per group, alone (ref/eval1, int8 = mean KL 3.0e-3, top-1 98.6%): lm_head KL 8.0e-3 / 95.8%, dn_out 6.1e-3 /
 98.6%, attn_qkv 1.3e-2 / 98.6%, attn_o 7.8e-3 / 100%. All above the 5e-3 bar: plain symmetric gs64 is too coarse for
 the trunk; a better 4-6 bit scheme is the lever (and MTP, which reads the dense weights once per 2 tokens).
+
+MTP rollback without redo: the DeltaNet kernels (dn_conv_k / dn_recur_k) write the state after the round's first token
+into snap as they go; a wrong draft copies it back (no pre-round snapshot, no re-run of the token). Round: snapshot
+0.87 -> 0, redo 2.15 -> 0.13 ms. 10 prompts: plain 47.7-47.9 tok/s, MTP 51.1-52.6 (+7-10%), acceptance 86.6%.
+Verified: --check with MOEX_MTP=1 runs teacher-forced MTP rounds (true next token as the draft: both rows and the
+rollback compared with the reference): mean KL 3.01e-3, top-1 98.6% (plain 2.89e-3, 98.6%). Forced wrong draft
+every round (1234 rollbacks): 8/10 outputs identical to plain, the 2 splits at the same near-ties as normal MTP.
+Fixed: the draft head wrote into logits[] (the real model's scores) after prefill; it has its own buffer now.
