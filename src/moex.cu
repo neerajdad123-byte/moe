@@ -456,7 +456,7 @@ struct Engine {
         else pin_experts_in_ram();
         // every byte of VRAM left (minus headroom for the driver) becomes expert slots
         size_t fr, tot; CK(cudaMemGetInfo(&fr, &tot));
-        const size_t reserve = 320ull << 20;
+        const size_t reserve = (getenv("MOEX_RESERVE_MB") ? atoi(getenv("MOEX_RESERVE_MB")) : 320) * (1ull << 20);  // env: testing smaller caches
         nslots = (int)((fr - std::min(fr, reserve)) / EXPERT_BYTES);
         nslots = std::min(nslots, NKEY + (int)((carve_prefill(nullptr) + EXPERT_BYTES - 1) / EXPERT_BYTES));  // big GPUs: every expert fits
         nres = (int)((carve_prefill(nullptr) + EXPERT_BYTES - 1) / EXPERT_BYTES);

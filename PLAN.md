@@ -259,3 +259,14 @@ pre-routing part of each 2-token layer (40 layers 36.3 -> 32.4 ms); 47.9 with th
 shared expert overlaps the CPU work (layers 28.9 ms, CPU experts 13.5, GPU wait 11.0; round 38.8 ms for 1.86 tokens).
 Draft-vocab trimming rejected: 5.4% of generated tokens have ids >= 65536. Plain decode is itself run-to-run
 non-deterministic in late tokens (CPU vs GPU rounding depends on which experts are resident): 3/10 prompts split.
+
+## Aggressive VRAM mode: measured, small lever
+
+More expert slots (MOEX_RESERVE_MB shrinks the cache to measure the slope; 10 prompts): 1623 slots 47.9 tok/s, 1473 47.2,
+1321 45.9. Simulator agrees: ~0.044 CPU misses/token less per extra slot (cap 1623 -> 1911: 84.3 -> 73.4). So +288 slots
+(moving all of lm_head out of VRAM) would give ~+4%, while lm_head on the CPU costs ~8 ms/token. Shared experts or KV in
+RAM free 71 / 12-47 slots for extra CPU work every token: net loss. Decode is bound by the dense weights (~1.9 GB/token
+= ~10 ms at 188 GB/s of the 21 ms), not the experts.
+int4 gs64 per group, alone (ref/eval1, int8 = mean KL 3.0e-3, top-1 98.6%): lm_head KL 8.0e-3 / 95.8%, dn_out 6.1e-3 /
+98.6%, attn_qkv 1.3e-2 / 98.6%, attn_o 7.8e-3 / 100%. All above the 5e-3 bar: plain symmetric gs64 is too coarse for
+the trunk; a better 4-6 bit scheme is the lever (and MTP, which reads the dense weights once per 2 tokens).
