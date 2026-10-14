@@ -699,6 +699,8 @@ struct Engine {
                 double w0 = now();
                 if (verify) CK(cudaEventSynchronize(ev_route)); else CK(cudaStreamSynchronize(cs));
                 pt[0] += now() - w0;
+                const double hb0 = now();
+                const bool vs_on = verify && T == 2 && l < NL;
                 // group the chunk's (token, expert) pairs by expert: resident -> GPU, non-resident with
                 // >= STREAM_MIN tokens -> streamed to the GPU, the rest -> CPU
                 for (auto& v : per) v.clear();
@@ -721,7 +723,9 @@ struct Engine {
                     if (per[e].empty()) continue;
                     int key = l * E + e, sl = slot_of[key];
                     if (verify && sl >= 0) last[sl] = clock;  // protects this layer's experts (incl. in-flight) from eviction
-                    if (sl >= 0 && ready[sl]) { add_item(e, arena + (size_t)sl * EXPERT_BYTES); hits += per[e].size(); continue; }
+                    if (vs_on) vs[0]++;
+                    if (sl >= 0 && ready[sl]) { add_item(e, arena + (size_t)sl * EXPERT_BYTES); hits += per[e].size(); if (vs_on) vs[1]++; continue; }
+                    if (vs_on) vs[per[e].size() == 2 ? 4 : per[e][0].t == 0 ? 2 : 3]++;
                     misses += per[e].size();
                     if (verify && sl < 0) admits_todo.push_back(key);
                     if (!verify && (int)per[e].size() >= STREAM_MIN) { streamed.push_back(e); continue; }
@@ -773,6 +777,7 @@ struct Engine {
                 streamed_n += streamed.size();
                 // CPU: non-resident experts, each read once for all of its tokens, overlapped with the above
                 double c1 = now();
+                if (vs_on) vt[0] += c1 - hb0;
                 cpu.run_pairs(jobs, rows_h, T, T * TOPK, ypair_cpu.data());
                 for (int t = 0; t < T; t++) {
                     float* y = ycpu_h + (size_t)t * D;
@@ -792,7 +797,11 @@ struct Engine {
                 pairs_reduce_k<<<dim3((D + 255) / 256, T), 256, 0, cs>>>(ypair, ycpu_d, moec, TOPK, D);
                 gated_add_rows_k<<<dim3((D + 255) / 256, T), 256, 0, cs>>>(moec, shs, shl, D);
                 if (verify) { for (int key : admits_todo) admit(key); admits_todo.clear(); start_admissions(); }
+                if (vs_on) vt[1] += now() - j0;
     }
+    // MTP round profile, main layers only: unique experts needed, hits, misses used by the real token only, the draft
+    // only, both; host time building the work before the CPU starts, and after it (launches + admissions)
+    double vs[5] = {}, vt[2] = {};
     std::vector<int> admits_todo;
     cudaGraphExec_t vgraph[2][NL + 1] = {};  // MTP round: per (rows - 1, layer), see chunk_layer
     void shared_rows(LayerW& w, int T) {  // shared expert over T rows of hc -> shs, gate logits -> shl
@@ -1269,6 +1278,10 @@ int main(int argc, char** argv) {
             fprintf(stderr, "[mtp] %lld rounds, draft accepted %.1f%% | ms/round: snapshot %.2f  40 layers %.2f  lm_head+pick %.2f  mtp layer %.2f  redo %.2f | layers: gpu-wait %.2f  cpu-experts %.2f\n",
                     eng.mtp_rounds, 100.0 * eng.mtp_acc / r, 1e3 * eng.mt[0] / r, 1e3 * eng.mt[1] / r, 1e3 * eng.mt[2] / r, 1e3 * eng.mt[3] / r, 1e3 * eng.mt[4] / r,
                     1e3 * eng.vpt[0] / r, 1e3 * eng.vpt[1] / r);
+            const double* v = eng.vs;
+            fprintf(stderr, "[mtp] per round, 40 layers: %.0f experts needed, %.0f in VRAM | CPU misses: real token only %.0f, draft only %.0f, both %.0f"
+                            " | host: before CPU %.2f ms, after CPU %.2f ms\n",
+                    v[0] / r, v[1] / r, v[2] / r, v[3] / r, v[4] / r, 1e3 * eng.vt[0] / r, 1e3 * eng.vt[1] / r);
         }
         if (getenv("MOEX_SAVE_HOT")) { eng.hot_file = getenv("MOEX_SAVE_HOT"); eng.save_hot(); }  // makes the shipped moex_hot.bin
         if (eng.trace) fclose(eng.trace);
