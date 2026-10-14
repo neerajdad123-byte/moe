@@ -19,10 +19,17 @@ A 35-billion-parameter model, 2.3x faster than llama.cpp, with nothing to instal
 You need: Windows 10/11, an NVIDIA RTX 20 series or newer GPU with 6 GB+ VRAM, a recent NVIDIA driver, 22 GB of free
 disk and ideally 24 GB of RAM (less works, more slowly). No CUDA toolkit, no Python.
 
-**1. Download moex.** Get [`moex-windows-x64.zip`](https://github.com/neerajdad123-byte/moe/releases/latest) (1.3 MB)
-and unzip it anywhere.
+**1. Install moex.** In PowerShell:
 
-**2. Download the model.** Open a terminal in that folder and run:
+```powershell
+irm https://raw.githubusercontent.com/neerajdad123-byte/moe/main/install.ps1 | iex
+```
+
+This puts `moex` (1.3 MB) in `%LOCALAPPDATA%\Programs\moex` and on your PATH, so it works in any terminal (open a new
+one after installing). Run it again to update. Or download
+[`moex-windows-x64.zip`](https://github.com/neerajdad123-byte/moe/releases/latest) and unzip it anywhere.
+
+**2. Download the model.** In any terminal:
 
 ```bat
 moex download
