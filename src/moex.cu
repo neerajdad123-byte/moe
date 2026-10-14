@@ -660,6 +660,9 @@ struct Engine {
                 const int LQ = AH * 2 * AHD + 2 * AKV * AHD, LB = DC + DVH * DNV + 2 * DVH;
                 LayerW& w = L[l];
                 if (verify) { poll_admissions(); flush_table(); clock++; }
+                // everything up to the routing (+ the shared expert, which doesn't depend on it). In the MTP round the
+                // shapes and buffers are fixed, so it is captured once per (layer, rows) and replayed as one graph launch.
+                auto pre = [&] {
                 rmsnorm(Xc, l % NL ? moec : nullptr, w.in_ln, hc, D, EPS, T, cs);  // layers 0 and NL (MTP) start fresh
                 if (is_attn(l)) {
                     gemm(w.attn_qkv, hc, qkvc, T, D, LQ, cs);
@@ -676,8 +679,25 @@ struct Engine {
                 for (int t = 0; t < T; t++) gemv_f16(w.router, hc + (size_t)t * D, lgc + (size_t)t * E, D, E, cs);  // fp32 routing, as decode
                 router_topk(lgc, E, TOPK, NORM_TOPK, ridxc, rwc, cs, T);
                 export_route_k<<<(T * D + 255) / 256, 256, 0, cs>>>(hc, ridxc, rwc, rows_d, ridxc_d, rwc_d, T * D, T * TOPK);
+                if (verify) {  // the host only needs the routing: signal it, then the shared expert overlaps the CPU work
+                    CK(cudaEventRecordWithFlags(ev_route, cs, cudaEventRecordExternal));
+                    shared_rows(w, T);
+                }
+                };
+                if (verify) {
+                    cudaGraphExec_t& g = vgraph[T - 1][l];
+                    if (!g) {
+                        cudaGraph_t gr;
+                        CK(cudaStreamBeginCapture(cs, cudaStreamCaptureModeThreadLocal));
+                        pre();
+                        CK(cudaStreamEndCapture(cs, &gr));
+                        CK(cudaGraphInstantiate(&g, gr, 0));
+                        CK(cudaGraphDestroy(gr));
+                    }
+                    CK(cudaGraphLaunch(g, cs));
+                } else pre();
                 double w0 = now();
-                CK(cudaStreamSynchronize(cs));
+                if (verify) CK(cudaEventSynchronize(ev_route)); else CK(cudaStreamSynchronize(cs));
                 pt[0] += now() - w0;
                 // group the chunk's (token, expert) pairs by expert: resident -> GPU, non-resident with
                 // >= STREAM_MIN tokens -> streamed to the GPU, the rest -> CPU
@@ -719,10 +739,7 @@ struct Engine {
                 CK(cudaMemsetAsync(ypair, 0, (size_t)T * TOPK * D * 4, cs));
                 const int nres = nitems;
                 pairs_forward(items_d, nres, pairs_d, hc, actp, ypair, cs);
-                gemm(w.sh_gu, hc, shgu, T, D, 2 * SI, cs);
-                silu_mul_rows_k<<<dim3((SI + 255) / 256, T), 256, 0, cs>>>(shgu, sha, SI);
-                gemm(w.sh_d, sha, shs, T, SI, D, cs);
-                for (int t = 0; t < T; t++) gemv_f16(w.sh_gate, hc + (size_t)t * D, shl + t, D, 1, cs);
+                if (!verify) shared_rows(w, T);
                 // streamed experts: items point at their staging slot (batch bi uses half bi&1)
                 for (int k = 0; k < (int)streamed.size(); k++)
                     add_item(streamed[k], stage_p + ((size_t)((k / SB) & 1) * SB + k % SB) * EXPERT_BYTES);
@@ -777,6 +794,13 @@ struct Engine {
                 if (verify) { for (int key : admits_todo) admit(key); admits_todo.clear(); start_admissions(); }
     }
     std::vector<int> admits_todo;
+    cudaGraphExec_t vgraph[2][NL + 1] = {};  // MTP round: per (rows - 1, layer), see chunk_layer
+    void shared_rows(LayerW& w, int T) {  // shared expert over T rows of hc -> shs, gate logits -> shl
+        gemm(w.sh_gu, hc, shgu, T, D, 2 * SI, cs);
+        silu_mul_rows_k<<<dim3((SI + 255) / 256, T), 256, 0, cs>>>(shgu, sha, SI);
+        gemm(w.sh_d, sha, shs, T, SI, D, cs);
+        for (int t = 0; t < T; t++) gemv_f16(w.sh_gate, hc + (size_t)t * D, shl + t, D, 1, cs);
+    }
 
     // The MTP layer over T rows: row t gets the token at position pos+t (toks[t], the last row `last`) and the main
     // model's final hidden state at pos+t-1 (Xc). Returns the draft for the token after the last row (greedy).

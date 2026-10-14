@@ -253,3 +253,9 @@ Why it doesn't pay yet: two adjacent tokens share few experts, so a round misses
 (hit 70.6% -> 66.9%) and the CPU work nearly doubles; the dense-weight saving (gemv_i8 NT=2 reads W once) is smaller.
 To reach 70: CUDA graphs for the 2-token layers (~-8 ms), CPU misses at decode efficiency + more VRAM hits for the
 union (-8..10 ms), redo without a full step (chunked DeltaNet saving the state after token 0).
+
+MTP round optimizations (full-speed machine state, 10 prompts): off 47.5 tok/s; MTP 43.8 with CUDA graphs for the
+pre-routing part of each 2-token layer (40 layers 36.3 -> 32.4 ms); 47.9 with the routing signalled by an event so the
+shared expert overlaps the CPU work (layers 28.9 ms, CPU experts 13.5, GPU wait 11.0; round 38.8 ms for 1.86 tokens).
+Draft-vocab trimming rejected: 5.4% of generated tokens have ids >= 65536. Plain decode is itself run-to-run
+non-deterministic in late tokens (CPU vs GPU rounding depends on which experts are resident): 3/10 prompts split.
