@@ -1073,6 +1073,7 @@ int main(int argc, char** argv) {
         else if (s == "--seed") samp.seed = std::stoull(next());
         else if (s == "--batch") batch = next();
         else if (s == "--trace") trace_path = next();
+        else if (s == "-h" || s == "--help") mode = "help";
         else { fprintf(stderr, "unknown arg %s\n", s.c_str()); return 2; }
     }
     if (!check.empty()) {  // ids come from the golden run's meta.json
@@ -1082,13 +1083,13 @@ int main(int argc, char** argv) {
         size_t a = m.find('[', m.find("\"ids\"")) + 1, b = m.find(']', a);
         ids = parse_ids(m.substr(a, b - a));
     }
-    if (mode.empty() && ids.empty() && batch.empty()) {
+    if (mode == "help" || (mode.empty() && ids.empty() && batch.empty())) {
         fprintf(stderr, "usage: moex download                                 fetch the model (~22 GB, resumable)\n"
                         "       moex chat [--load] [--system TEXT] [--think] [--temp T ...]\n"
                         "       moex serve [--load] [--port 8765] [--host 127.0.0.1]     OpenAI-compatible API\n"
                         "       moex --ids 1,2,3 [--n N] | --batch ids.txt | --check ref/golden\n"
                         "       options: --model DIR (default %s) --ctx N\n", model.c_str());
-        return 2;
+        return mode == "help" ? 0 : 2;
     }
     if (mode == "chat" && !samp_set) { samp.temp = 0.7f; samp.top_p = 0.8f; samp.top_k = 20; }  // Qwen non-thinking defaults
     if (mode == "chat" && think && !samp_set) { samp.temp = 1.0f; samp.top_p = 0.95f; samp.top_k = 20; }  // thinking defaults
