@@ -199,9 +199,11 @@ struct Engine {
         MEMORYSTATUSEX ms{sizeof ms};
         GlobalMemoryStatusEx(&ms);
         if (low_ram) {
-            fprintf(stderr, "[ram] %.1f GB of RAM is below the ~%.0f GB needed to keep all %.1f GB of experts in memory: "
-                            "the most-used experts are cached in RAM and the rest are read from the SSD when needed (slower decode)\n",
-                    ms.ullTotalPhys / 1e9, (total + (5ull << 30)) / 1e9, total / 1e9);
+            if (ms.ullTotalPhys < total + (5ull << 30))
+                fprintf(stderr, "[ram] %.1f GB of RAM is below the ~%.0f GB needed to keep all %.1f GB of experts in memory: "
+                                "the most-used experts are cached in RAM and the rest are read from the SSD when needed (slower decode)\n",
+                        ms.ullTotalPhys / 1e9, (total + (5ull << 30)) / 1e9, total / 1e9);
+            else fprintf(stderr, "[ram] low-RAM mode forced by MOEX_LOW_RAM (for testing): experts are read from the SSD when needed\n");
             // tools/prefetch_sim.py: ~+2.3 tok/s per extra GB free for experts in the 6-10 GB range
             fprintf(stderr, "[ram] TIP: %.1f GB of RAM is free right now. Close browser tabs and other apps before starting moex:\n"
                             "      every extra GB of free RAM is about +2 tokens/s.\n", ms.ullAvailPhys / 1e9);
