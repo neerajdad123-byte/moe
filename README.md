@@ -132,6 +132,16 @@ which uses the same bit widths where it matters (int4 experts, int8 everything e
 of the 10,240 experts (15%), an 8 GB card ~2,700 (26%), a 12 GB card about half, and a 24 GB card all of them. Every
 expert in VRAM is one the CPU doesn't have to compute.
 
+**Tested machines** (v0.1.1, `moex chat`):
+
+| GPU | CPU | RAM | decode |
+|---|---|---|---|
+| RTX 4050 Laptop, 6 GB | i7-13650HX | 24 GB | ~46 tokens/s (10-prompt benchmark above) |
+| RTX 4060 Laptop, 8 GB | i7-13th gen HX | 24 GB | ~60 tokens/s (reported by a tester) |
+
+Ran it on something else? Please [open an issue](https://github.com/neerajdad123-byte/moe/issues) with your GPU, RAM,
+the `[load]` line and the tok/s you see.
+
 ## How it works
 
 <div align="center">
