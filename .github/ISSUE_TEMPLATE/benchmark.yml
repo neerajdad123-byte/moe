@@ -1,0 +1,33 @@
+name: Benchmark report
+description: Share your `moex bench` result, so the tested machines table grows
+title: "Bench: <your GPU>, <avg> tok/s"
+labels: [benchmark]
+body:
+  - type: textarea
+    id: line
+    attributes:
+      label: The line from `moex bench`
+      description: Run `moex bench` (and `moex bench --mtp` if you like) and paste the line(s) it tells you to share.
+      placeholder: moex 0.1.2 | NVIDIA GeForce RTX 4050 Laptop GPU 6.4 GB | ... | avg 47.9, low 45.2, high 49.6 tok/s
+      render: text
+    validations:
+      required: true
+  - type: input
+    id: machine
+    attributes:
+      label: Laptop or desktop model
+      placeholder: e.g. Lenovo Legion 5 (2023), or a desktop
+  - type: dropdown
+    id: power
+    attributes:
+      label: Plugged in, and power mode
+      options:
+        - Plugged in, Best performance / performance mode
+        - Plugged in, Balanced
+        - On battery
+        - Desktop
+  - type: textarea
+    id: notes
+    attributes:
+      label: Anything else
+      description: Other apps open, driver version, anything odd you saw.

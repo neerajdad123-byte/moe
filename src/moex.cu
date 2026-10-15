@@ -1001,6 +1001,7 @@ struct Engine {
 #include "session.h"
 #include "serve.h"
 #include "download.h"
+#include "bench.h"
 
 // One line of user input as UTF-8 (the Windows console delivers non-ASCII input correctly only as UTF-16).
 static bool read_line(std::string& out) {
@@ -1097,7 +1098,7 @@ int main(int argc, char** argv) {
         ids = parse_ids(m.substr(a, b - a));
     }
     if (mode == "version") { printf("moex %s\n", VERSION); return 0; }
-    const bool bad = !mode.empty() && mode != "help" && mode != "download" && mode != "chat" && mode != "serve" && mode != "install";
+    const bool bad = !mode.empty() && mode != "help" && mode != "download" && mode != "chat" && mode != "serve" && mode != "install" && mode != "bench";
     if (bad && mode != "badarg") fprintf(stderr, "unknown command: %s\n\n", mode.c_str());
     if (bad || mode == "help" || (mode.empty() && ids.empty() && batch.empty())) {  // unknown input: the help page, exit 2
         fprintf(mode == "help" ? stdout : stderr,
@@ -1106,6 +1107,7 @@ int main(int argc, char** argv) {
                 "  moex download          download the model (~22 GB, resumable: run again if it stops)\n"
                 "  moex chat              chat in this terminal (/reset new conversation, /exit quit)\n"
                 "  moex serve             OpenAI-compatible API on http://127.0.0.1:8765/v1\n"
+                "  moex bench             measure speed on this PC (~2 min), with a line to share and tips\n"
                 "  moex install           put moex on your PATH, so `moex` works in any terminal\n"
                 "  moex help | -h | --help, moex --version\n\n"
                 "Options:\n"
@@ -1122,9 +1124,10 @@ int main(int argc, char** argv) {
         return mode == "help" ? 0 : 2;
     }
     if (mode == "install") return install_moex();
-    if (mode == "chat" && !samp_set) { samp.temp = 0.7f; samp.top_p = 0.8f; samp.top_k = 20; }  // Qwen non-thinking defaults
+    if ((mode == "chat" || mode == "bench") && !samp_set) { samp.temp = 0.7f; samp.top_p = 0.8f; samp.top_k = 20; }  // Qwen non-thinking defaults
     if (mode == "chat" && think && !samp_set) { samp.temp = 1.0f; samp.top_p = 0.95f; samp.top_k = 20; }  // thinking defaults
-    if ((mode == "chat" || mode == "serve") && ctx == 2048) ctx = 8192;
+    if ((mode == "chat" || mode == "serve" || mode == "bench") && ctx == 2048) ctx = 8192;
+    if (mode == "bench") { warm = true; if (!samp.seed) samp.seed = 1; }  // what `moex chat --load` gets, same text every run
     if (mode == "download") return download_model(model, only);
     if (!std::filesystem::exists(std::filesystem::path(model) / "config.json")) {
         fprintf(stderr, "No model at %s.\nRun `moex download` first (or pass --model DIR).\n", model.c_str());
@@ -1141,7 +1144,7 @@ int main(int argc, char** argv) {
             return 1;
         }
     }
-    const bool interactive = mode == "chat" || mode == "serve";
+    const bool interactive = mode == "chat" || mode == "serve" || mode == "bench";
     if (interactive) mem_report("before load");
     Engine eng(model.c_str(), ctx);
     eng.f16 = f16; eng.q4groups = q4groups; eng.samp = samp; eng.want_mtp = want_mtp;
@@ -1152,10 +1155,14 @@ int main(int argc, char** argv) {
     eng.load_hot({eng.hot_file, exe_dir() + "/moex_hot.bin"});  // counts accumulate across sessions
     eng.load();
     if (interactive) mem_report("after load");
-    if (interactive && !eng.has_mtp && !eng.low_ram)  // every expert fits in RAM: the case where MTP was measured faster
+    if (interactive && mode != "bench" && !eng.has_mtp && !eng.low_ram)  // every expert fits in RAM: the case where MTP was measured faster
         fprintf(stderr, "[tip] this PC can try multi-token prediction: `moex %s --mtp` is often ~10%% faster%s\n", mode.c_str(),
                 std::filesystem::exists(std::filesystem::path(model) / "mtp.safetensors") ? "" : " (run `moex download` first to get the MTP head)");
 
+    if (mode == "bench") {
+        Tokenizer tk(model + "/tokenizer.json");
+        return run_bench(eng, tk, model);
+    }
     if (mode == "serve") {
         Tokenizer tk(model + "/tokenizer.json");
         Session ss(eng, tk);
