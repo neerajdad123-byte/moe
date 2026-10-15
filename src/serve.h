@@ -1,4 +1,4 @@
-// OpenAI-compatible HTTP server (Winsock, no dependencies): GET /v1/models, GET /health, POST /v1/chat/completions
+// OpenAI-compatible HTTP server (Winsock, no dependencies): GET /v1/models, GET /health, GET /api (help), POST /v1/chat/completions
 // (streaming SSE or a single JSON response). One request at a time; listens on 127.0.0.1 unless told otherwise.
 // Included by moex.cu after Session.
 #pragma once
@@ -108,7 +108,27 @@ static void serve(Session& ss, Tokenizer& tk, const std::string& host, int port,
     inet_pton(AF_INET, host.c_str(), &a.sin_addr);
     BOOL yes = TRUE; setsockopt(ls, SOL_SOCKET, SO_REUSEADDR, (const char*)&yes, sizeof yes);
     if (bind(ls, (sockaddr*)&a, sizeof a) || listen(ls, 16)) { fprintf(stderr, "[serve] cannot listen on %s:%d (port in use? choose another with --port)\n", host.c_str(), port); return; }
-    fprintf(stderr, "[serve] OpenAI-compatible API on http://%s:%d/v1  (model id \"%s\")\n", host.c_str(), port, model_id.c_str());
+    const std::string base = "http://" + std::string(host == "0.0.0.0" ? "127.0.0.1" : host) + ":" + std::to_string(port);
+    const std::string ps_example = "Invoke-RestMethod " + base + "/v1/chat/completions -Method Post -ContentType application/json "
+                                   "-Body '{\"model\":\"" + model_id + "\",\"messages\":[{\"role\":\"user\",\"content\":\"Hello!\"}]}'";
+    const std::string py_example = "from openai import OpenAI; c = OpenAI(base_url=\"" + base + "/v1\", api_key=\"none\"); "
+                                   "print(c.chat.completions.create(model=\"" + model_id + "\", messages=[{\"role\": \"user\", \"content\": \"Hello!\"}]).choices[0].message.content)";
+    // GET /api (and /): what this server offers and how to call it
+    const std::string api_help = "{\"server\":\"moex\",\"model\":\"" + jesc(model_id) + "\",\"base_url\":\"" + jesc(base) + "/v1\",\"api_key\":\"any\","
+        "\"endpoints\":{\"POST /v1/chat/completions\":\"OpenAI chat completions; set \\\"stream\\\": true for streaming. Also: temperature, top_p, top_k, "
+        "seed, stop, max_tokens, chat_template_kwargs.enable_thinking\",\"GET /v1/models\":\"the model id\",\"GET /health\":\"{\\\"status\\\":\\\"ok\\\"}\","
+        "\"GET /api\":\"this page\"},\"examples\":{\"powershell\":\"" + jesc(ps_example) + "\",\"python\":\"" + jesc(py_example) + "\"}}";
+    fprintf(stderr,
+            "\n[serve] moex is serving %s - OpenAI-compatible API\n"
+            "  Base URL:   %s/v1   (model \"%s\", any API key)\n"
+            "  Endpoints:  POST /v1/chat/completions   GET /v1/models   GET /health   GET /api (help)\n"
+            "  Try it in PowerShell:\n    %s\n"
+            "  Python (pip install openai):\n    %s\n"
+            "  Open WebUI, editors and other apps: add an OpenAI-compatible connection with the base URL above.\n"
+            "  %s\n"
+            "  Ctrl+C stops the server.\n\n",
+            model_id.c_str(), base.c_str(), model_id.c_str(), ps_example.c_str(), py_example.c_str(),
+            host == "127.0.0.1" ? "Only this PC can connect (--host 0.0.0.0 opens it to your network)." : "Other devices on your network can connect too.");
     while (true) {
         SOCKET c = accept(ls, nullptr, nullptr);
         if (c == INVALID_SOCKET) continue;
@@ -132,7 +152,8 @@ static void serve(Session& ss, Tokenizer& tk, const std::string& host, int port,
         std::string path = req.substr(ps, req.find(' ', ps) - ps);
         std::string body = hdr_end == std::string::npos ? "" : req.substr(hdr_end + 4);
         if (method == "OPTIONS") { respond(c, 200, "text/plain", ""); }
-        else if (method == "GET" && (path == "/health" || path == "/")) respond(c, 200, "application/json", "{\"status\":\"ok\"}");
+        else if (method == "GET" && path == "/health") respond(c, 200, "application/json", "{\"status\":\"ok\"}");
+        else if (method == "GET" && (path == "/api" || path == "/")) respond(c, 200, "application/json", api_help);
         else if (method == "GET" && path == "/v1/models")
             respond(c, 200, "application/json", "{\"object\":\"list\",\"data\":[{\"id\":\"" + jesc(model_id) + "\",\"object\":\"model\",\"owned_by\":\"moex\"}]}");
         else if (method == "POST" && path == "/v1/chat/completions") {

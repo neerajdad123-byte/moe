@@ -17,17 +17,22 @@ A 35-billion-parameter model, 2.3x faster than llama.cpp, with nothing to instal
 ## Get started in 3 steps
 
 You need: Windows 10/11, an NVIDIA RTX 20 series or newer GPU with 6 GB+ VRAM, a recent NVIDIA driver, 22 GB of free
-disk and ideally 24 GB of RAM (less works, more slowly). No CUDA toolkit, no Python.
+disk and ideally 24 GB of RAM (16 GB works, more slowly). No CUDA toolkit, no Python.
 
-**1. Install moex.** In PowerShell:
+**1. Install moex.** Pick one:
 
-```powershell
-irm https://raw.githubusercontent.com/neerajdad123-byte/moe/main/install.ps1 | iex
-```
+- **Installer (recommended): `moex` works in every terminal, from any folder.** In PowerShell:
 
-This puts `moex` (1.3 MB) in `%LOCALAPPDATA%\Programs\moex` and on your PATH, so it works in any terminal (open a new
-one after installing). Run it again to update. Or download
-[`moex-windows-x64.zip`](https://github.com/neerajdad123-byte/moe/releases/latest) and unzip it anywhere.
+  ```powershell
+  irm https://raw.githubusercontent.com/neerajdad123-byte/moe/main/install.ps1 | iex
+  ```
+
+  It puts `moex` (1.3 MB) in `%LOCALAPPDATA%\Programs\moex` and on your PATH, no admin rights needed. Open a **new**
+  terminal afterwards. Run the same line again to update.
+
+- **Zip:** download [`moex-windows-x64.zip`](https://github.com/neerajdad123-byte/moe/releases/latest), unzip it
+  anywhere, and open a terminal in that folder. There, PowerShell needs `.\` in front: `.\moex download`,
+  `.\moex chat`. To use plain `moex` from anywhere later, run `.\moex install` once.
 
 **2. Download the model.** In any terminal:
 
@@ -35,8 +40,8 @@ one after installing). Run it again to update. Or download
 moex download
 ```
 
-This fetches the model (22 GB) from Hugging Face into `models\` next to `moex.exe`. It resumes where it left off, so if
-your connection drops, just run it again.
+This fetches the model (22 GB, from Hugging Face) and the MTP head (0.5 GB, see `--mtp`) into `models\` next to
+`moex.exe`. It resumes where it left off: if your connection drops, run it again.
 
 **3. Chat.**
 
@@ -78,6 +83,20 @@ downloads to that folder instead.
 
 </details>
 
+## Commands
+
+| Command | What it does |
+|---|---|
+| `moex download` | download or resume the model |
+| `moex chat` | chat in the terminal |
+| `moex serve` | OpenAI-compatible API for other apps |
+| `moex install` | put moex on your PATH (for zip users) |
+| `moex help`, `-h`, `--help` | all commands and options |
+| `moex --version`, `-v` | the version |
+
+Uninstall: delete `%LOCALAPPDATA%\Programs\moex` (and your model folder), and remove that folder from your PATH
+(Windows search: "Edit environment variables for your account").
+
 ## Chat options
 
 Type a message and press Enter. `/reset` starts a new conversation, `/exit` quits. Speed is shown after every reply.
@@ -85,6 +104,7 @@ Type a message and press Enter. `/reset` starts a new conversation, `/exit` quit
 | Option | What it does |
 |---|---|
 | `--load` | preload your most-used experts into VRAM and all experts into RAM before the prompt |
+| `--mtp` | multi-token prediction: the model drafts the next token and checks it for free, often ~10% faster when your RAM holds every expert (moex tells you when it's worth trying) |
 | `--system "You are ..."` | system prompt |
 | `--think` | let the model reason step by step before it answers |
 | `--temp 0.7 --top-p 0.8 --top-k 20` | sampling (these are the defaults; `--temp 0` always picks the likeliest token) |
@@ -98,8 +118,24 @@ Type a message and press Enter. `/reset` starts a new conversation, `/exit` quit
 moex serve --load
 ```
 
-This starts an OpenAI-compatible API at `http://127.0.0.1:8765/v1`. Point any OpenAI-compatible app at it (Open WebUI,
-editor plugins, the `openai` Python package, ...): model `qwen3.6-35b-a3b`, any API key.
+This starts an OpenAI-compatible API at `http://127.0.0.1:8765/v1` and prints how to use it. Point any
+OpenAI-compatible app at it (Open WebUI, editor plugins, the `openai` Python package, ...): model `qwen3.6-35b-a3b`, any
+API key.
+
+| Endpoint | |
+|---|---|
+| `POST /v1/chat/completions` | chat, streaming with `"stream": true` |
+| `GET /v1/models` | the model id |
+| `GET /api` | what the server offers, with examples (open it in a browser) |
+| `GET /health` | `{"status":"ok"}` |
+
+From PowerShell:
+
+```powershell
+Invoke-RestMethod http://127.0.0.1:8765/v1/chat/completions -Method Post -ContentType application/json -Body '{"model":"qwen3.6-35b-a3b","messages":[{"role":"user","content":"Hello!"}]}'
+```
+
+From Python (`pip install openai`):
 
 ```python
 from openai import OpenAI
@@ -120,6 +156,7 @@ It listens on your machine only; `--host 0.0.0.0 --port N` changes that.
 | **moex** | **46.2 tokens/s** on average, 41-53 depending on the prompt |
 | llama.cpp, default settings | 20.3 tokens/s |
 
+- With `--mtp`: ~51 tokens/s on the same laptop.
 - First token after you press Enter: ~0.4-0.9 s. Long documents are read at ~110-140 tokens/s.
 - A 26,500-token conversation still decodes at ~30 tokens/s.
 
@@ -184,20 +221,17 @@ of Qwen3.6-35B-A3B made by others (see Credits), so it is not identical to the o
 | Model | **Qwen3.6-35B-A3B** (int4 gs64 weights from `moex download`). Text only. |
 | GPU | NVIDIA RTX 20 / 30 / 40 / 50 series and newer datacenter cards, 6 GB VRAM or more |
 | OS | Windows 10/11 |
+| RAM | 24 GB recommended. 16 GB works: experts that don't fit are read from the SSD, slower (~15-25 tokens/s); moex prints a tip to free RAM |
 | Use | one conversation at a time, one GPU |
-
-Tested on one laptop so far (RTX 4050 6 GB, 24 GB RAM). If you run it on something else, please
-[open an issue](https://github.com/neerajdad123-byte/moe/issues) with the `[load]` lines and the tok/s you see.
 
 ## Roadmap
 
 - **Linux** build.
-- **Aggressive mode:** more experts on the GPU (int4 for the dense layers that tolerate it, smaller buffers, context
-  sized to what you use) and less RAM needed, so 16 GB machines run well.
+- **Faster on 16 GB RAM:** moex's own RAM cache with direct SSD reads (~3x shorter wait per missing expert).
+- **Faster dense weights:** a finer 4-bit format for the parts every token reads (most of the time per token).
+- **MTP everywhere:** on by default on the machines where it's faster.
 - **More models:** other mixture-of-experts families (Qwen, DeepSeek, GLM, gpt-oss).
 - **GGUF support:** load the GGUF files people already have, natively, no conversion.
-- **MTP (multi-token prediction):** Qwen3.6 can draft extra tokens per step. The int4 files used today don't include
-  that part of the model, so it comes with the next model format.
 - Faster prompt reading, and several conversations at once in `moex serve`.
 
 More plans will be announced soon.
@@ -221,4 +255,6 @@ moex is MIT licensed ([LICENSE](LICENSE)). The model has its own license (Apache
 - Model: [Qwen3.6-35B-A3B](https://huggingface.co/Qwen/Qwen3.6-35B-A3B) by the Qwen team.
 - int4 gs64 weights: [Kreuzzelg/qwen36-35b-a3b-colibri-i4-gs64](https://huggingface.co/Kreuzzelg/qwen36-35b-a3b-colibri-i4-gs64),
   in the format of the [colibri](https://github.com/JustVugg/colibri) project.
+- MTP head: converted from the official Qwen weights by [`tools/fetch_mtp.py`](tools/fetch_mtp.py), hosted as the
+  [`weights-mtp-1`](https://github.com/neerajdad123-byte/moe/releases/tag/weights-mtp-1) release (Apache-2.0).
 - [llama.cpp](https://github.com/ggml-org/llama.cpp), the reference point for speed.

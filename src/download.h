@@ -47,6 +47,42 @@ static int http_get(const std::string& url, uint64_t from, const std::function<b
     return status;
 }
 
+// One file, resumable through a .part file. size 0 = unknown (no size check). false on failure (message printed).
+static bool fetch_file(const std::string& url, const std::filesystem::path& out, uint64_t size, const std::string& name,
+                       uint64_t& done_all, uint64_t all) {
+    std::filesystem::path part = out; part += ".part";
+    if (std::filesystem::exists(out) && (!size || std::filesystem::file_size(out) == size)) { done_all += size; return true; }
+    uint64_t have = std::filesystem::exists(part) ? std::filesystem::file_size(part) : 0;
+    FILE* f = _wfopen(part.wstring().c_str(), have ? L"ab" : L"wb");
+    if (!f) { fprintf(stderr, "download: cannot write %s\n", part.string().c_str()); return false; }
+    double t0 = now(), tp = 0; uint64_t got = have;
+    int code = http_get(url, have, [&](const char* p, size_t n) {
+        if (fwrite(p, 1, n, f) != n) return false;
+        got += n;
+        if (now() - tp > 1.0) {
+            tp = now();
+            fprintf(stderr, "\r  %-34s %6.0f / %6.0f MB  %5.1f MB/s  (total %.1f%%)   ", name.c_str(), got / 1e6, size / 1e6,
+                    (got - have) / 1e6 / std::max(tp - t0, 1e-3), 100.0 * (done_all + got) / std::max<uint64_t>(all, 1));
+        }
+        return true;
+    });
+    fclose(f);
+    if ((code != 200 && code != 206) || (size && std::filesystem::file_size(part) != size)) {
+        fprintf(stderr, "\ndownload: %s failed (HTTP %d, %llu of %llu bytes). Run `moex download` again to resume.\n", name.c_str(), code,
+                (unsigned long long)std::filesystem::file_size(part), (unsigned long long)size);
+        return false;
+    }
+    std::filesystem::rename(part, out);
+    done_all += size;
+    fprintf(stderr, "\r  %-34s done %*s\n", name.c_str(), 50, "");
+    return true;
+}
+
+// The MTP draft head (multi-token prediction) of Qwen3.6-35B-A3B, converted to the same int4 format by
+// tools/fetch_mtp.py from the official Apache-2.0 weights, hosted as a release asset of this project.
+static const char* MTP_URL = "https://github.com/neerajdad123-byte/moe/releases/download/weights-mtp-1/mtp.safetensors";
+static const uint64_t MTP_BYTES = 531715224;
+
 static int download_model(const std::string& dir, const std::string& only) {
     std::string api;
     int st = http_get(std::string("https://huggingface.co/api/models/") + MODEL_REPO + "?blobs=true", 0,
@@ -54,47 +90,25 @@ static int download_model(const std::string& dir, const std::string& only) {
     JsonParser jp(api); Json j = jp.parse();
     const Json* sib = j.get("siblings");
     if (st != 200 || !jp.ok || !sib) { fprintf(stderr, "download: cannot list %s (HTTP %d). Check the internet connection.\n", MODEL_REPO, st); return 1; }
+    auto wanted = [&](const std::string& n) { return only.empty() || ("," + only + ",").find("," + n + ",") != std::string::npos; };
     std::vector<std::pair<std::string, uint64_t>> files;
     uint64_t all = 0;
     for (auto& f : sib->a) {
         auto n = f.get("rfilename");
-        if (!n || n->t != Json::STR || n->s.rfind(".", 0) == 0) continue;  // skip dotfiles (.gitattributes)
-        if (!only.empty() && ("," + only + ",").find("," + n->s + ",") == std::string::npos) continue;
+        if (!n || n->t != Json::STR || n->s.rfind(".", 0) == 0 || !wanted(n->s)) continue;  // skip dotfiles (.gitattributes)
         files.push_back({n->s, (uint64_t)f.num("size", 0)});
         all += files.back().second;
     }
+    const bool mtp = wanted("mtp.safetensors");
+    if (mtp) all += MTP_BYTES;
     std::filesystem::create_directories(dir);
-    fprintf(stderr, "download: %s -> %s (%zu files, %.1f GB)\n", MODEL_REPO, dir.c_str(), files.size(), all / 1e9);
+    fprintf(stderr, "download: %s%s -> %s (%zu files, %.1f GB)\n", MODEL_REPO, mtp ? " + MTP head" : "", dir.c_str(), files.size() + mtp, all / 1e9);
     uint64_t done_all = 0;
-    for (auto& [name, size] : files) {
-        std::filesystem::path out = std::filesystem::path(dir) / name, part = out; part += ".part";
-        if (std::filesystem::exists(out) && (!size || std::filesystem::file_size(out) == size)) { done_all += size; continue; }
-        uint64_t have = std::filesystem::exists(part) ? std::filesystem::file_size(part) : 0;
-        FILE* f = _wfopen(part.wstring().c_str(), have ? L"ab" : L"wb");
-        if (!f) { fprintf(stderr, "download: cannot write %s\n", part.string().c_str()); return 1; }
-        double t0 = now(), tp = 0; uint64_t got = have;
-        std::string url = std::string("https://huggingface.co/") + MODEL_REPO + "/resolve/main/" + name;
-        int code = http_get(url, have, [&](const char* p, size_t n) {
-            if (fwrite(p, 1, n, f) != n) return false;
-            got += n;
-            if (now() - tp > 1.0) {
-                tp = now();
-                fprintf(stderr, "\r  %-34s %6.0f / %6.0f MB  %5.1f MB/s  (total %.1f%%)   ", name.c_str(), got / 1e6, size / 1e6,
-                        (got - have) / 1e6 / std::max(tp - t0, 1e-3), 100.0 * (done_all + got) / std::max<uint64_t>(all, 1));
-            }
-            return true;
-        });
-        fclose(f);
-        if ((code != 200 && code != 206) || (size && std::filesystem::file_size(part) != size)) {
-            fprintf(stderr, "\ndownload: %s failed (HTTP %d, %llu of %llu bytes). Run `moex download` again to resume.\n", name.c_str(), code,
-                    (unsigned long long)std::filesystem::file_size(part), (unsigned long long)size);
+    for (auto& [name, size] : files)
+        if (!fetch_file(std::string("https://huggingface.co/") + MODEL_REPO + "/resolve/main/" + name, std::filesystem::path(dir) / name, size, name, done_all, all))
             return 1;
-        }
-        std::filesystem::rename(part, out);
-        done_all += size;
-        fprintf(stderr, "\r  %-34s done %*s\n", name.c_str(), 50, "");
-    }
-    fprintf(stderr, "download: complete. Run: moex chat\n");
+    if (mtp && !fetch_file(MTP_URL, std::filesystem::path(dir) / "mtp.safetensors", MTP_BYTES, "mtp.safetensors", done_all, all)) return 1;
+    fprintf(stderr, "download: complete. Run: moex chat --load\n");
     return 0;
 }
 
@@ -120,4 +134,54 @@ static void mem_report(const char* when) {
     fprintf(stderr, "[%s] RAM %.1f GB free of %.1f GB | VRAM %.1f GB free of %.1f GB%s\n", when,
             ms.ullAvailPhys / 1e9, ms.ullTotalPhys / 1e9, fr / 1e9, tot / 1e9,
             strcmp(when, "after load") ? "" : "  (by design: free VRAM became expert slots, RAM holds the experts)");
+}
+
+// `moex install`: copy moex.exe (+ moex_hot.bin, README.md, LICENSE) to %LOCALAPPDATA%\Programs\moex and add that
+// folder to the user PATH, so `moex` works in any new terminal. A model already downloaded next to the copy being
+// installed stays where it is: MOEX_MODEL is set to it. No admin rights needed (per-user environment).
+#pragma comment(lib, "advapi32.lib")
+#pragma comment(lib, "user32.lib")
+static bool set_user_env(const wchar_t* name, const std::wstring& value) {
+    HKEY k;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, L"Environment", 0, KEY_SET_VALUE, &k) != ERROR_SUCCESS) return false;
+    bool ok = RegSetValueExW(k, name, 0, REG_EXPAND_SZ, (const BYTE*)value.c_str(), (DWORD)((value.size() + 1) * 2)) == ERROR_SUCCESS;
+    RegCloseKey(k);
+    return ok;
+}
+static std::wstring get_user_env(const wchar_t* name) {
+    wchar_t buf[32768]; DWORD sz = sizeof buf;
+    return RegGetValueW(HKEY_CURRENT_USER, L"Environment", name, RRF_RT_REG_SZ | RRF_RT_REG_EXPAND_SZ | RRF_NOEXPAND, nullptr, buf, &sz) == ERROR_SUCCESS ? buf : L"";
+}
+static int install_moex() {
+    namespace fs = std::filesystem;
+    wchar_t la[MAX_PATH];
+    if (!GetEnvironmentVariableW(L"LOCALAPPDATA", la, MAX_PATH)) { fprintf(stderr, "install: LOCALAPPDATA is not set\n"); return 1; }
+    const fs::path src = exe_dir(), dst = fs::path(la) / "Programs" / "moex";
+    std::error_code ec;
+    fs::create_directories(dst, ec);
+    if (!fs::equivalent(src, dst, ec)) {
+        for (const char* f : {"moex.exe", "moex_hot.bin", "README.md", "LICENSE"})
+            if (fs::exists(src / f) && !fs::copy_file(src / f, dst / f, fs::copy_options::overwrite_existing, ec)) {
+                fprintf(stderr, "install: cannot copy %s to %s (%s). Is moex running from there? Close it and retry.\n", f, dst.string().c_str(), ec.message().c_str());
+                return 1;
+            }
+        const fs::path model = src / "models" / "qwen36-35b-a3b-i4-gs64";
+        if (fs::exists(model / "config.json") && get_user_env(L"MOEX_MODEL").empty() && set_user_env(L"MOEX_MODEL", model.wstring()))
+            fprintf(stderr, "install: the model stays in %s (MOEX_MODEL)\n", model.string().c_str());
+    }
+    std::wstring path = get_user_env(L"Path"), d = dst.wstring();
+    bool present = false;
+    for (size_t a = 0; a <= path.size();) {
+        size_t b = path.find(L';', a); if (b == std::wstring::npos) b = path.size();
+        if (_wcsicmp(path.substr(a, b - a).c_str(), d.c_str()) == 0) present = true;
+        a = b + 1;
+    }
+    if (!present && !set_user_env(L"Path", path.empty() || path.back() == L';' ? path + d : path + L";" + d)) {
+        fprintf(stderr, "install: cannot update PATH\n"); return 1;
+    }
+    DWORD_PTR r;  // tell Explorer and new terminals that the environment changed
+    SendMessageTimeoutW(HWND_BROADCAST, WM_SETTINGCHANGE, 0, (LPARAM)L"Environment", SMTO_ABORTIFHUNG, 2000, &r);
+    fprintf(stderr, "install: moex is in %s and on your PATH.\nOpen a NEW terminal, then run from anywhere:\n  moex download\n  moex chat --load\n",
+            dst.string().c_str());
+    return 0;
 }

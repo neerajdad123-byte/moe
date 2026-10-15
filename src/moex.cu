@@ -39,6 +39,13 @@ constexpr float EPS = 1e-6f, THETA = 1e7f;
 static bool NORM_TOPK = !getenv("MOEX_NO_NORM_TOPK");
 static bool is_attn(int l) { return l % 4 == 3 || l == NL; }  // layer NL = the MTP head's layer
 constexpr int NKEY = (NL + 1) * E;  // expert keys: 40 layers + the MTP layer
+static const char* VERSION = "0.1.2";
+// Too little RAM to lock every expert (the OS and other programs need ~5 GB): experts come from the SSD as needed.
+static bool low_ram_machine() {
+    MEMORYSTATUSEX ms{sizeof ms};
+    GlobalMemoryStatusEx(&ms);
+    return ms.ullTotalPhys < (size_t)NL * E * EXPERT_BYTES + (5ull << 30) || getenv("MOEX_LOW_RAM");
+}
 
 struct LayerW {
     half *in_ln, *post_ln, *router, *sh_gate, *qn, *kn, *conv, *nw, *alog, *dtb;  // small: F16 always
@@ -61,7 +68,7 @@ struct Engine {
     int ctx;
     // MTP (multi-token prediction): the model's own draft head (mtp.safetensors from tools/fetch_mtp.py). Each decode
     // round runs [token, draft] through the model as one 2-token chunk; a right draft gives 2 tokens for ~1.3x the cost.
-    bool has_mtp = false;
+    bool has_mtp = false, want_mtp = false;
     Mat mtp_fc;
     half *mtp_ne = nullptr, *mtp_nh = nullptr, *mtp_norm = nullptr;
     float *mtp_cat = nullptr, *lg2 = nullptr, *snap = nullptr, *dlog = nullptr;
@@ -391,7 +398,10 @@ struct Engine {
         if (!f16) CK(cudaMalloc(&qtmp, (size_t)V * D * 2));  // largest matrix
         lm_head = wmat({{"lm_head.weight", V}}, D, "lm_head");
         norm = wup("model.norm.weight", D);
-        has_mtp = C.has("mtp.fc.weight") && getenv("MOEX_MTP");  // opt-in: 40 tok/s with vs 47 without, for now (PLAN.md)
+        // MTP (opt-in, --mtp): +7-10% on a 6 GB GPU with every expert in RAM (PLAN.md); on low-RAM machines the draft
+        // token's extra experts become extra SSD reads, so the tip to try it is only shown where it can pay off
+        has_mtp = C.has("mtp.fc.weight") && (want_mtp || getenv("MOEX_MTP"));
+        if (want_mtp && !has_mtp) fprintf(stderr, "[mtp] --mtp needs the MTP head (mtp.safetensors): run `moex download` once more\n");
         L.resize(NL + has_mtp);
         for (int i = 0; i < NL + has_mtp; i++) {
             std::string p = i < NL ? "model.layers." + std::to_string(i) + "." : "mtp.layers.0.", m = p + "mlp.";
@@ -452,11 +462,7 @@ struct Engine {
             eq[l * E + e] = C.map(ep + "merged_weight");
             es[l * E + e] = (const float*)C.map(ep + "qs");
         }
-        {
-            MEMORYSTATUSEX ms{sizeof ms};
-            GlobalMemoryStatusEx(&ms);
-            low_ram = ms.ullTotalPhys < (size_t)NL * E * EXPERT_BYTES + (5ull << 30) || getenv("MOEX_LOW_RAM");  // the OS and other programs need room too
-        }
+        low_ram = low_ram_machine();
         if (pin_async) pinner = std::thread([this] { pin_experts_in_ram(); });  // until done, misses may page-fault
         else pin_experts_in_ram();
         // every byte of VRAM left (minus headroom for the driver) becomes expert slots
@@ -1042,7 +1048,7 @@ int main(int argc, char** argv) {
     if (!has_avx2()) { fprintf(stderr, "moex needs a CPU with AVX2 and FMA (Intel Haswell / AMD Zen or newer).\n"); return 1; }
     std::string model = default_model_dir(), only;
     std::string mode, system_prompt;
-    bool think = false, samp_set = false, n_set = false, warm = false;
+    bool think = false, samp_set = false, n_set = false, warm = false, want_mtp = false;
     std::string host = "127.0.0.1";
     int port = 8765;
     if (argc > 1 && argv[1][0] != '-') { mode = argv[1]; argv++; argc--; }  // moex chat | moex serve
@@ -1062,6 +1068,8 @@ int main(int argc, char** argv) {
         else if (s == "--system") system_prompt = next();
         else if (s == "--think") think = true;
         else if (s == "--load") warm = true;
+        else if (s == "--mtp") want_mtp = true;
+        else if (s == "-v" || s == "--version") mode = "version";
         else if (s == "--host") host = next();
         else if (s == "--port") port = std::stoi(next());
         else if (s == "--ctx") ctx = std::stoi(next());
@@ -1079,7 +1087,7 @@ int main(int argc, char** argv) {
         else if (s == "--batch") batch = next();
         else if (s == "--trace") trace_path = next();
         else if (s == "-h" || s == "--help") mode = "help";
-        else { fprintf(stderr, "unknown arg %s\n", s.c_str()); return 2; }
+        else { fprintf(stderr, "unknown argument: %s\n\n", s.c_str()); mode = "badarg"; break; }
     }
     if (!check.empty()) {  // ids come from the golden run's meta.json
         FILE* f = fopen((check + "/meta.json").c_str(), "rb");
@@ -1088,14 +1096,32 @@ int main(int argc, char** argv) {
         size_t a = m.find('[', m.find("\"ids\"")) + 1, b = m.find(']', a);
         ids = parse_ids(m.substr(a, b - a));
     }
-    if (mode == "help" || (mode.empty() && ids.empty() && batch.empty())) {
-        fprintf(stderr, "usage: moex download                                 fetch the model (~22 GB, resumable)\n"
-                        "       moex chat [--load] [--system TEXT] [--think] [--temp T ...]\n"
-                        "       moex serve [--load] [--port 8765] [--host 127.0.0.1]     OpenAI-compatible API\n"
-                        "       moex --ids 1,2,3 [--n N] | --batch ids.txt | --check ref/golden\n"
-                        "       options: --model DIR (default %s) --ctx N\n", model.c_str());
+    if (mode == "version") { printf("moex %s\n", VERSION); return 0; }
+    const bool bad = !mode.empty() && mode != "help" && mode != "download" && mode != "chat" && mode != "serve" && mode != "install";
+    if (bad && mode != "badarg") fprintf(stderr, "unknown command: %s\n\n", mode.c_str());
+    if (bad || mode == "help" || (mode.empty() && ids.empty() && batch.empty())) {  // unknown input: the help page, exit 2
+        fprintf(mode == "help" ? stdout : stderr,
+                "moex %s - Qwen3.6-35B-A3B on a consumer NVIDIA GPU\n\n"
+                "Commands:\n"
+                "  moex download          download the model (~22 GB, resumable: run again if it stops)\n"
+                "  moex chat              chat in this terminal (/reset new conversation, /exit quit)\n"
+                "  moex serve             OpenAI-compatible API on http://127.0.0.1:8765/v1\n"
+                "  moex install           put moex on your PATH, so `moex` works in any terminal\n"
+                "  moex help | -h | --help, moex --version\n\n"
+                "Options:\n"
+                "  --load                 load everything before the prompt (~30 s), then every reply is full speed\n"
+                "  --system \"TEXT\"        system prompt (chat)\n"
+                "  --think                let the model reason before answering\n"
+                "  --temp T --top-p P --top-k K --repeat-penalty R --seed N   sampling (chat: 0.7 / 0.8 / 20)\n"
+                "  --ctx N                context length in tokens (chat/serve default 8192)\n"
+                "  --port N --host H      server address (serve; default 8765, 127.0.0.1 = this PC only)\n"
+                "  --model DIR            model folder (default %s; or set MOEX_MODEL)\n"
+                "  --mtp                  multi-token prediction: often ~10%% faster when RAM holds every expert (try it)\n\n"
+                "Developer: --ids 1,2,3 [--n N] | --batch ids.txt | --check ref/eval1 | --f16 | --profile\n",
+                VERSION, model.c_str());
         return mode == "help" ? 0 : 2;
     }
+    if (mode == "install") return install_moex();
     if (mode == "chat" && !samp_set) { samp.temp = 0.7f; samp.top_p = 0.8f; samp.top_k = 20; }  // Qwen non-thinking defaults
     if (mode == "chat" && think && !samp_set) { samp.temp = 1.0f; samp.top_p = 0.95f; samp.top_k = 20; }  // thinking defaults
     if ((mode == "chat" || mode == "serve") && ctx == 2048) ctx = 8192;
@@ -1118,7 +1144,7 @@ int main(int argc, char** argv) {
     const bool interactive = mode == "chat" || mode == "serve";
     if (interactive) mem_report("before load");
     Engine eng(model.c_str(), ctx);
-    eng.f16 = f16; eng.q4groups = q4groups; eng.samp = samp;
+    eng.f16 = f16; eng.q4groups = q4groups; eng.samp = samp; eng.want_mtp = want_mtp;
     eng.warm = warm || interactive;
     eng.quiet = interactive;
     eng.pin_async = interactive && !warm;  // --load waits for every expert to be in RAM before the prompt
@@ -1126,6 +1152,9 @@ int main(int argc, char** argv) {
     eng.load_hot({eng.hot_file, exe_dir() + "/moex_hot.bin"});  // counts accumulate across sessions
     eng.load();
     if (interactive) mem_report("after load");
+    if (interactive && !eng.has_mtp && !eng.low_ram)  // every expert fits in RAM: the case where MTP was measured faster
+        fprintf(stderr, "[tip] this PC can try multi-token prediction: `moex %s --mtp` is often ~10%% faster%s\n", mode.c_str(),
+                std::filesystem::exists(std::filesystem::path(model) / "mtp.safetensors") ? "" : " (run `moex download` first to get the MTP head)");
 
     if (mode == "serve") {
         Tokenizer tk(model + "/tokenizer.json");
