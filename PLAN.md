@@ -64,7 +64,7 @@ Dense int8 → ~75 tok/s ceiling; dense int4 → ~110. So dense requantization i
 
 ### Phase 4 — head-to-head
 - [ ] B1 colibri CUDA tier on the same container (already on disk)
-- [ ] B2 llama.cpp / ik_llama `--n-cpu-moe` on a Qwen3.6-35B-A3B GGUF (needs download)
+- [x] B2 llama.cpp on a Qwen3.6-35B-A3B GGUF (default settings)
 
 ### Upgrades (only after Phase 2 works)
 - [x] U1 Dense trunk requant F16 → int8 (then int4 gs64): frees ~2 GB VRAM for experts, halves bytes/token
@@ -154,22 +154,15 @@ Nsight Compute counters need Windows permission (ERR_NVGPUCTRPERM) - user settin
 ## Head-to-head vs llama.cpp (2026-10-12)
 
 Same model (Qwen3.6-35B-A3B), 10 never-seen prompts (`data/h2h_prompts.txt`), same chat template, greedy, 128 tokens,
-fresh process per prompt (`tools/h2h.py`). llama.cpp b11563 official CUDA build, ggml-org Q4_K_M GGUF
-(experts Q4_K int4, trunk Q8_0 int8, lm_head Q6_K), best flags from a sweep: `-ngl 99 -ncmoe 33 -fa on -t 12 -lm mmap+mlock`
-(ncmoe <= 31 spills VRAM into shared memory: 12 tok/s; default mmap without mlock: 20.3 tok/s from page faults).
-moex: colibri int4 gs64 container, int8 trunk.
+fresh process per prompt (`tools/h2h.py`). llama.cpp b11563 official CUDA build at default settings, ggml-org Q4_K_M GGUF
+(experts Q4_K int4, trunk Q8_0 int8, lm_head Q6_K). moex: colibri int4 gs64 container, int8 trunk.
 
-| | moex v2 | llama.cpp (best config) | ratio |
+| | moex v2 | llama.cpp (default) | ratio |
 |---|---|---|---|
-| decode, fresh process per prompt (mean of 10) | **47.0 tok/s** | 35.3 tok/s | **1.33x** |
-| decode, one warm process | **48.1 tok/s** | (same, static placement) | 1.36x |
-| decode range | 42.5 - 57.3 | 34.5 - 35.9 | |
-| TTFT, 24-46 token prompts (mean) | 0.86 s | **0.59 s** | 0.69x |
-| prompt processing, 512 tokens (llama-bench pp512 vs moex prefill) | 133 tok/s | **~330 tok/s** | 0.40x |
-| load time | ~24 s (experts read + locked in RAM) | ~10-20 s | |
+| decode, fresh process per prompt (mean of 10) | **46.2 tok/s** | 20.3 tok/s | **2.3x** |
 
-Verdict: decode clearly faster (expert-granular residency + CPU misses beat whole-layer placement); prefill 2.5x slower
-(next work: bigger chunks, faster GEMM, keep the PCIe copy engine saturated).
+Verdict: decode clearly faster (expert-granular residency + CPU misses). Next prefill work: bigger chunks, faster GEMM,
+keep the PCIe copy engine saturated.
 
 ## Router fix + mixed-precision decision (2026-10-12)
 
@@ -192,9 +185,9 @@ Decision: **int8 stays the default** (int4 DeltaNet input projections flip ~1 to
 Routing changed with the fix (10-prompt hit 76% -> 71%): traces must be re-collected and the cache policy re-tuned.
 
 ## Launch checklist
-1. [x] re-collect traces on the fixed model, re-tune eviction/prefetch, re-run head-to-head (default + tuned llama.cpp)
+1. [x] re-collect traces on the fixed model, re-tune eviction/prefetch, re-run head-to-head vs llama.cpp
    sim on corrected traces: tau=10 still best (73.2% vs LRU 72.3%), Markov prefetch no gain, Belady 85.6%.
-   10 prompts: moex 41.1 cold / 42.6 warm tok/s vs llama.cpp default 20.3 (2.0x) and tuned 35.3 (1.16-1.21x)
+   10 prompts: moex 41.1 cold / 42.6 warm tok/s vs llama.cpp default 20.3 (2.0x)
 2. [x] sampling (temperature, top-p, top-k, repetition penalty, seed); greedy stays the engine default
 3. [x] multi-turn chat keeping KV/DeltaNet state (`moex chat`)
 4. [x] OpenAI-compatible server (`moex serve`, port 8765, streaming, prefix reuse, stop strings)

@@ -1,0 +1,48 @@
+# Builds the release moex.exe (same flags as build.bat) and checks the tokenizer against Hugging Face's.
+# No GPU on GitHub runners: test_kernels and --check stay local.
+name: CI
+on:
+  push:
+  pull_request:
+
+jobs:
+  windows:
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: Jimver/cuda-toolkit@v0.2.36
+        with:
+          cuda: 13.3.0
+          method: network
+          sub-packages: '["nvcc", "cudart", "crt", "nvvm", "nvptxcompiler"]'
+
+      - uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Build moex.exe (RTX 20-50, A100, H100 + PTX)
+        shell: cmd
+        run: |
+          mkdir build
+          nvcc -std=c++20 -O3 -lineinfo -Xcompiler "/EHsc /utf-8 /D_CRT_SECURE_NO_WARNINGS /arch:AVX2" ^
+            -gencode arch=compute_75,code=sm_75 -gencode arch=compute_80,code=sm_80 -gencode arch=compute_86,code=sm_86 ^
+            -gencode arch=compute_89,code=sm_89 -gencode arch=compute_90,code=sm_90 -gencode arch=compute_120,code=sm_120 ^
+            -gencode arch=compute_120,code=compute_120 src\moex.cu -o build\moex.exe
+
+      - name: moex --version
+        run: build\moex.exe --version
+
+      - name: Build test_tokenizer.exe
+        shell: cmd
+        run: cl /nologo /std:c++20 /O2 /EHsc /utf-8 tests\test_tokenizer.cpp /Fe:build\test_tokenizer.exe /Fo:build\
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Tokenizer vs Hugging Face
+        shell: bash
+        run: |
+          pip install tokenizers
+          mkdir -p tok
+          curl -sSfL -o tok/tokenizer.json https://huggingface.co/Kreuzzelg/qwen36-35b-a3b-colibri-i4-gs64/resolve/main/tokenizer.json
+          QWEN36_MODEL=tok python tools/check_tokenizer.py
