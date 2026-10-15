@@ -161,6 +161,8 @@ fresh process per prompt (`tools/h2h.py`). llama.cpp b11563 official CUDA build 
 |---|---|---|---|
 | decode, fresh process per prompt (mean of 10) | **46.2 tok/s** | 20.3 tok/s | **2.3x** |
 
+Re-run 2026-10-15 with `tools/h2h.py` (no llama.cpp flags at all): 17.0 tok/s mean (8.2-20.9), so 2.3x is conservative.
+
 Verdict: decode clearly faster (expert-granular residency + CPU misses). Next prefill work: bigger chunks, faster GEMM,
 keep the PCIe copy engine saturated.
 
