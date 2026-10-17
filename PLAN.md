@@ -283,3 +283,129 @@ recency + lag-2/4 co-occurrence prefetch 16.2 / 20.0 / 24.6 (only ~1/3 of prefet
 expert uses = 4,891 experts (8.7 GB), 95% = 6,026 (10.7 GB). SSD waits/token ~ 136 e^(-0.24 GB); tok/s ~ 1000 /
 (21.6 + t_read x waits). The lever left: the engine reads missing experts through the file map (~2.4 ms, K14); a
 private RAM cache with direct reads (~0.8 ms) would be ~+30% at 8 GB. Startup tip printed in low-RAM mode.
+
+## Bandwidth and Windows audit (2026-10-15, RTX 4050 Laptop 6 GB, i7-13650HX, DDR5-4800 x2)
+
+Peaks (read-only probes): VRAM 190 GB/s (spec 192); RAM 55-58 GB/s all threads, one P-core 20.4, one E-core 8.5.
+Decode, one prompt, 256 tokens, 47.3 tok/s = 21.1 ms/token (nsys, kernels inside graphs):
+
+| per token | ms | note |
+|---|---|---|
+| dense int8 GEMV (gemv_i8_k, ~1.9 GB) | 10.9 | ~175 GB/s = 91% of measured VRAM peak |
+| GPU experts (gate_up + down) | 2.6 | |
+| other kernels (DeltaNet, norms, router, attention) | 1.9 | |
+| GPU idle, waiting for the CPU misses | 6.2 | 29% of the token |
+
+CPU misses: 86/token x 1.77 MB = 152 MB in 6.0 ms = 25 GB/s, under half the RAM peak (~2 experts per layer split over
+8 threads, two phases with a barrier between: latency-bound, not bandwidth-bound). Windows: GPU never throttled
+(2730 MHz, memory 8201 MHz, 55 W, 68 C, PCIe 4.0 x8, no clock-event reasons); P-cores ~4.2 GHz under load.
+Thread placement (MOEX_CPU_THREADS x process affinity, 2 runs each): all cores 8 threads 47.4, 12 threads 47.8, 6 threads
+46.2; P-cores only 8 threads 45.5, 6: 45.8, 10: 45.3, 12: 33.6; one thread per P-core (6): 29.5. The E-cores carry the
+loader/copier/main threads, so the default (8 threads, no affinity) is right. `--profile` crashes at moex.cu:532
+(cudaEventRecordExternal is only valid inside graph capture; --profile runs the layers uncaptured); nsys works.
+
+## 16 GB machines: router-ahead prefetch + exclusive VRAM/RAM (2026-10-15, simulated on a new trace)
+
+Trace: `moex --batch build/batch_ids.txt --n 128 --trace build/routes_v3.bin --trace-ahead build/ahead_v3.bin`
+(80 prompts, 12,864 tokens; per layer l the top-16 of layer l+k's router on layer l's residual, normed with l+k's
+post norm). Share of layer l+k's 8 experts in that top-N, decode tokens of prompts 40-79 (k=0 = 100%, self-check):
+
+| k | top-8 | top-12 | top-16 |
+|---|---|---|---|
+| 1 | 79.7% | 90.6% | 94.3% |
+| 2 | 73.0% | 84.3% | 89.2% |
+| 3 | 68.8% | 80.1% | 85.5% |
+| 4 | 65.4% | 76.6% | 82.2% |
+
+`tools/prefetch_sim.py` (FIFO SSD: direct read 0.8 ms, 0.46 ms/expert in flight, <= 8 prefetches in flight, demand
+reads queue behind them; token without SSD waits 21.6 ms), tok/s by RAM for experts:
+
+| policy | 6 GB | 8 GB | 10 GB |
+|---|---|---|---|
+| today (Windows file cache, demand reads) | 16.0 | 20.0 | 25.0 |
+| own RAM cache + direct reads | 24.1 | 28.5 | 33.0 |
+| + exclusive VRAM/RAM (admitted leaves RAM, VRAM victims copied back) | 30.5 | 34.9 | 39.3 |
+| + router-ahead prefetch k=2 top-8 | **34.8** | **38.7** | **41.9** |
+| same, slow SSD (1.2 ms read, 2 GB/s) | 27.0 | 33.2 | 38.8 (today 12.0 / 15.7 / 20.6) |
+
+Without exclusivity: prefetch k=2 top-8 27.6 / 32.9 / 37.2; k=3 slightly worse (fewer late, fewer hits); top-12
+worse (56 reads/token at 6 GB, the extra reads evict useful experts). Cycle-aware eviction (evict the layers just
+processed first, among the 64 or 512 least recent) changes nothing (+-0.1 tok/s): recency already does it. Exclusivity
+is the biggest single lever: today RAM keeps copies of the ~2.9 GB in VRAM (8 GB: SSD waits 21.6 -> 10.3 per token).
+At 8 GB the best policy reads 10 prefetches + 5.6 demand reads per token (~28 MB). Not modelled: the VRAM->RAM copy-back
+(~58 evictions/token, ~100 MB/token D2H, background), I/O submission cost, the chunked prefill.
+No predictor, far ahead (`+far D N`: at layer l, prefetch the N most-used experts of layer (l+D) mod L that are in
+neither VRAM nor RAM): 8 GB, on top of own cache + victim (34.9): D=15 N=2 26.4, D=15 N=4 20.9, D=5 N=4 21.1, D=30 N=4
+20.6 tok/s. The popular experts are already cached, so it reads 70-90 rarely-used experts per token (~1 in 3 used) and
+the demand reads queue behind them. Restricted to each layer's top 8-16 it reads nothing (all resident): no change.
+Adding it to the router-ahead prefetch: 38.7 -> 27.0. Streaming every expert of each layer: 18.1 GB per token = 0.21 tok/s.
+
+### Real runs (2026-10-15): own RAM cache (MOEX_RAM_GB), victim copy-back (MOEX_VICTIM), router-ahead (MOEX_AHEAD=2)
+
+This laptop with `build\ram_balloon.exe` locking RAM so X + 2 GB is free at start (a 16 GB machine's situation),
+MOEX_LOW_RAM=1, `--batch build/ram3_ids.txt --n 128 --load` (3 everyday prompts, 381 decode tokens), tok/s:
+
+| X = RAM for experts | 6 GB | 8 GB | 10 GB | sim (6/8/10) |
+|---|---|---|---|---|
+| today (Windows file cache) | 24.3 | 27.9 | 29.3 | 16.0 / 20.0 / 25.0 |
+| own cache, direct reads | 16.9 | 24.4 | 30.9 | 24.1 / 28.5 / 33.0 |
+| + victim (VRAM/RAM exclusive) | 26.5 | 30.8 | 34.8 | 30.5 / 34.9 / 39.3 |
+| + ahead k=2, no victim | 21.1 | 26.8 | 33.0 | 27.6 / 32.9 / 37.2 |
+| + victim + ahead k=2 | **27.9** | **32.5** | **36.2** | 34.8 / 38.7 / 41.9 |
+
+Output identical to the full-RAM run (8 GB, all on: 128/128, 123/128, 128/128 tokens; the split is a known near-tie).
+Per token at 8 GB, all on: 4.1 demand reads, 8.4 prefetched (4.9 used), 70.5 copied back, 5.5 ms waiting for reads.
+Why below the simulation: (1) a demand read costs ~1.1-1.3 ms here, not 0.8 (two I/Os per expert, Q and S apart in
+the file); (2) the file cache gets more than X (Windows lets it grow into the 2 GB margin) and is faster than the
+simulated 1.68 ms per read, so "today" is the stronger baseline; (3) overheads outside the read wait: token time minus
+wait is 21.2 ms with the own cache alone (= full-RAM speed), 23.1 with victim (~2.3 ms: 3 CUDA calls per copy-back on
+the main thread, ~70/token), 25.1 with ahead (~4 ms: the predictor's 4 kernels run before the routing event, on the
+critical path). Fixes: enqueue copy-backs on the loader thread; run the predictor after ev_route (the GPU idles
+while the CPU does the misses) and read it a layer later with k=3.
+
+Both fixes (copy-backs enqueued by the loader thread; predictor after the layer's GPU work, k=3, read a layer later),
+same matrix, new session (today's baseline moved by -1.8..+1.3 between sessions):
+
+| X | 6 GB | 8 GB | 10 GB |
+|---|---|---|---|
+| today | 23.8 | 26.1 | 30.6 |
+| own cache | 19.3 | 25.0 | 30.8 |
+| + victim | 25.4 | 30.3 | 32.3 |
+| + ahead k=3, no victim | 20.2 | 25.6 | 32.3 |
+| + victim + ahead k=3 | **26.4** | **30.7** | **34.6** |
+| + victim + ahead k=2 (read a layer later) | 25.8 | 30.6 | 32.9 |
+
+No net gain over the first version (27.9 / 32.5 / 36.2): the time outside the read wait fell (8 GB, all on, no balloon:
+25.3 -> 22.1 ms/token) but the wait grew by as much. Wait breakdown (8 GB, all on, no balloon, per token): demand reads
+4.98 ms (4.8 x ~1.0 ms: a real direct read costs ~0.9-1.0 ms, near the simulated 0.8), copy-backs not done yet 2.18
+(the CPU needs an expert evicted from VRAM whose copy-back still queues behind the loader's admissions), late
+prefetches 0.34; issuing ReadFile 1.35 ms (~0.09 ms per read, not the bottleneck). Next: copy-backs on their own
+stream, enqueued at eviction by a small thread, with the admission's H2D waiting on that event.
+
+## v0.1.3: copy-backs on their own stream; 16 GB mode and MTP on by default (2026-10-17)
+
+Copy-backs (VRAM victim -> own RAM cache) now go out on their own stream (cb) from a small thread at eviction, with
+no wait (the slot holds a finished expert); the admission's H2D waits on that copy (back_done) before overwriting the
+slot. Measured with the matrix below: the copy-back wait didn't shrink (6/8/10 GB: 2.33 / 1.91 / 2.94 ms/token vs 2.18
+before). The bottleneck is the queue, not who enqueues it: ~56-65 copy-backs per token (~100-115 MB D2H) run in order
+on one stream, so an expert the CPU needs right after its eviction waits behind the earlier ones. Next: copy back only
+experts likely to be used again (score above a threshold), or let the CPU read a still-intact victim slot directly.
+
+16 GB mode on by default: on a low-RAM machine the own RAM cache takes the RAM free at load minus 2 GB (MOEX_RAM_GB=N
+overrides, 0 = Windows' file cache as before), exclusive VRAM/RAM (MOEX_VICTIM=0 off), router-ahead prefetch k=3
+(MOEX_AHEAD=0 off). Same balloon setup as above (X + 2 GB free at start, MOEX_LOW_RAM=1, ram3_ids, --n 128 --load):
+
+| X = RAM for experts | 6 GB | 8 GB | 10 GB |
+|---|---|---|---|
+| before (MOEX_RAM_GB=0: file cache) | 21.0 | 26.0 | 28.4 |
+| v0.1.3 default (cache size picked: 6.1 / 8.5 / 10.4 GB) | **25.2 (+20%)** | **30.8 (+19%)** | **34.2 (+20%)** |
+
+Output: prompts 1-2 match the full-RAM run (128/128, 123/128: the known near-tie); prompt 3 splits at token 5, a
+near-tie that also splits between two runs of the old mode. A shutdown hang (the backer thread quitting while the
+loader waited on one of its copies) was found and fixed: the backer drains its queue before it exits.
+
+MTP on by default for chat / serve / bench when every expert fits in RAM and the head is downloaded (`--no-mtp` off,
+`--mtp` forces it). Low-RAM machines keep it off: the draft token's extra experts become SSD reads, and the own cache
+needs it off.
+`moex bench` (10 questions, temp 0.7, same laptop, alternating): MTP on 50.2 / 49.3, off 48.1 / 46.9 tok/s: +4-5%
+(sampling accepts fewer drafts than the greedy +7-10%). Docs and help now say ~5%.

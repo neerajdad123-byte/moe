@@ -8,9 +8,7 @@
 #include <string>
 #include <unordered_map>
 #include <vector>
-#define WIN32_LEAN_AND_MEAN
-#define NOMINMAX
-#include <windows.h>
+#include "plat.h"
 
 struct StTensor {
     std::string file, dtype;
@@ -55,9 +53,16 @@ struct Container {
         const StTensor& s = at(name);
         auto it = maps.find(s.file);
         if (it == maps.end()) {
+#ifdef _WIN32
             HANDLE f = CreateFileA(s.file.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_FLAG_RANDOM_ACCESS, nullptr);
             HANDLE m = f == INVALID_HANDLE_VALUE ? nullptr : CreateFileMappingA(f, nullptr, PAGE_READONLY, 0, 0, nullptr);
             const void* p = m ? MapViewOfFile(m, FILE_MAP_READ, 0, 0, 0) : nullptr;
+#else
+            const int fd = open(s.file.c_str(), O_RDONLY);
+            void* p = fd < 0 ? MAP_FAILED : mmap(nullptr, std::filesystem::file_size(s.file), PROT_READ, MAP_SHARED, fd, 0);
+            if (p == MAP_FAILED) p = nullptr;
+            else madvise(p, std::filesystem::file_size(s.file), MADV_RANDOM);  // like FILE_FLAG_RANDOM_ACCESS: no readahead
+#endif
             if (!p) { fprintf(stderr, "mmap failed: %s\n", s.file.c_str()); exit(1); }
             it = maps.emplace(s.file, (const uint8_t*)p).first;  // mapped for the process lifetime
         }

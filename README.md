@@ -12,12 +12,16 @@ A 35-billion-parameter model, 2.3x faster than llama.cpp, with nothing to instal
 
 <img src="docs/speed.svg" alt="Decode speed: moex 46.2 tokens/s on average (up to 53) vs llama.cpp 20.3 tokens/s at default settings, 2.3x faster" width="760">
 
+<img src="docs/demo.gif" alt="moex chat in PowerShell writing an HTML page at 47.4 tokens/s on an RTX 4050 Laptop 6 GB, real time" width="760"><br>
+<sub>Real time, RTX 4050 Laptop 6 GB: <code>moex chat --load</code> at 47 tokens/s.</sub>
+
 </div>
 
 ## Get started in 3 steps
 
-You need: Windows 10/11, an NVIDIA RTX 20 series or newer GPU with 6 GB+ VRAM, a recent NVIDIA driver, 22 GB of free
-disk and ideally 24 GB of RAM (16 GB works, more slowly). No CUDA toolkit, no Python.
+You need: Windows 10/11, an NVIDIA RTX 20 series or newer GPU with 6 GB+ VRAM, NVIDIA driver 580 or newer (older
+driver? use the CUDA 12 build, see below), 22 GB of free disk and ideally 24 GB of RAM (16 GB works, more slowly).
+No CUDA toolkit, no Python.
 
 **1. Install moex.** Pick one:
 
@@ -32,7 +36,8 @@ disk and ideally 24 GB of RAM (16 GB works, more slowly). No CUDA toolkit, no Py
 
 - **Zip:** download [`moex-windows-x64.zip`](https://github.com/neerajdad123-byte/moe/releases/latest), unzip it
   anywhere, and open a terminal in that folder. There, PowerShell needs `.\` in front: `.\moex download`,
-  `.\moex chat`. To use plain `moex` from anywhere later, run `.\moex install` once.
+  `.\moex chat`. To use plain `moex` from anywhere later, run `.\moex install` once. On a driver older than 580
+  (check with `nvidia-smi`), take `moex-windows-x64-cuda12.zip` instead (the installer does this by itself).
 
 **2. Download the model.** In any terminal:
 
@@ -40,7 +45,7 @@ disk and ideally 24 GB of RAM (16 GB works, more slowly). No CUDA toolkit, no Py
 moex download
 ```
 
-This fetches the model (22 GB, from Hugging Face) and the MTP head (0.5 GB, see `--mtp`) into `models\` next to
+This fetches the model (22 GB, from Hugging Face) and the MTP head (0.5 GB, see `--no-mtp`) into `models\` next to
 `moex.exe`. It resumes where it left off: if your connection drops, run it again.
 
 **3. Chat.**
@@ -105,7 +110,7 @@ Type a message and press Enter. `/reset` starts a new conversation, `/exit` quit
 | Option | What it does |
 |---|---|
 | `--load` | preload your most-used experts into VRAM and all experts into RAM before the prompt |
-| `--mtp` | multi-token prediction: the model drafts the next token and checks it for free, often ~10% faster when your RAM holds every expert (moex tells you when it's worth trying) |
+| `--no-mtp` | turn off multi-token prediction (the model drafts the next token and checks it for free: ~5% faster in `moex bench`, on by default when your RAM holds every expert) |
 | `--system "You are ..."` | system prompt |
 | `--think` | let the model reason step by step before it answers |
 | `--temp 0.7 --top-p 0.8 --top-k 20` | sampling (these are the defaults; `--temp 0` always picks the likeliest token) |
@@ -157,7 +162,7 @@ It listens on your machine only; `--host 0.0.0.0 --port N` changes that.
 | **moex** | **46.2 tokens/s** on average, 41-53 depending on the prompt |
 | llama.cpp, default settings | 20.3 tokens/s |
 
-- With `--mtp`: ~51 tokens/s on the same laptop.
+- With multi-token prediction (on by default since v0.1.3): ~51 tokens/s on the same laptop.
 - First token after you press Enter: ~0.4-0.9 s. Long documents are read at ~110-140 tokens/s.
 - A 26,500-token conversation still decodes at ~30 tokens/s.
 
@@ -221,16 +226,14 @@ of Qwen3.6-35B-A3B made by others (see Credits), so it is not identical to the o
 |---|---|
 | Model | **Qwen3.6-35B-A3B** (int4 gs64 weights from `moex download`). Text only. |
 | GPU | NVIDIA RTX 20 / 30 / 40 / 50 series and newer datacenter cards, 6 GB VRAM or more |
-| OS | Windows 10/11 |
-| RAM | 24 GB recommended. 16 GB works: experts that don't fit are read from the SSD, slower (~15-25 tokens/s); moex prints a tip to free RAM |
+| OS | Windows 10/11; Linux (build from source with `./build.sh`; builds on Ubuntu 24.04 under WSL2, speed test pending) |
+| RAM | 24 GB recommended. 16 GB works: moex keeps its own RAM cache of experts and reads the rest straight from the SSD (~25-34 tokens/s on the test laptop, +20% since v0.1.3); moex prints a tip to free RAM |
 | Use | one conversation at a time, one GPU |
 
 ## Roadmap
 
-- **Linux** build.
-- **Faster on 16 GB RAM:** moex's own RAM cache with direct SSD reads (~3x shorter wait per missing expert).
+- **Linux** release binary (today: build from source).
 - **Faster dense weights:** a finer 4-bit format for the parts every token reads (most of the time per token).
-- **MTP everywhere:** on by default on the machines where it's faster.
 - **More models:** other mixture-of-experts families (Qwen, DeepSeek, GLM, gpt-oss).
 - **GGUF support:** load the GGUF files people already have, natively, no conversion.
 - Faster prompt reading, and several conversations at once in `moex serve`.
@@ -240,7 +243,11 @@ More plans will be announced soon.
 ## Building from source
 
 Visual Studio 2026 (C++) and CUDA 13.x. `build.bat` builds `build\moex.exe` for RTX 20-50 series plus the test programs
-(`build.bat dev` builds for your GPU only, faster); `package.bat` makes the release zip.
+(`build.bat dev` builds for your GPU only, faster; `build.bat cuda12` builds the older-driver version with CUDA 12.8);
+`package.bat` makes the release zips.
+
+Linux: the CUDA toolkit (12.8 or newer) and g++, then `./build.sh` (or `./build.sh dev`) builds `build/moex`. Get the
+model with `build/moex download`, then `build/moex chat --load`.
 
 | Check | Command |
 |---|---|

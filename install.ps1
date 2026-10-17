@@ -7,9 +7,13 @@ $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'  # Invoke-WebRequest is many times slower with the progress bar
 
 if (Get-Process moex -ErrorAction SilentlyContinue) { throw "moex is running: close it first, then run the installer again." }
-$zip = Join-Path $env:TEMP 'moex-windows-x64.zip'
+# The main build uses CUDA 13 (driver 580+); older drivers get the CUDA 12 build
+$name = 'moex-windows-x64'
+$drv = try { [double](& nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>$null | Select-Object -First 1) } catch { 0 }
+if ($drv -gt 0 -and $drv -lt 580) { $name = 'moex-windows-x64-cuda12'; Write-Host "NVIDIA driver $drv (older than 580): using the CUDA 12 build" }
+$zip = Join-Path $env:TEMP "$name.zip"
 Write-Host "Downloading moex..."
-Invoke-WebRequest 'https://github.com/neerajdad123-byte/moe/releases/latest/download/moex-windows-x64.zip' -OutFile $zip -UseBasicParsing
+Invoke-WebRequest "https://github.com/neerajdad123-byte/moe/releases/latest/download/$name.zip" -OutFile $zip -UseBasicParsing
 New-Item -ItemType Directory -Force $Dir | Out-Null
 Expand-Archive $zip $Dir -Force
 Remove-Item $zip

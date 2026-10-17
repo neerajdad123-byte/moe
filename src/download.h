@@ -1,11 +1,13 @@
-// `moex download`: fetches the model container from Hugging Face with WinHTTP (part of Windows, no dependencies).
-// Resumes interrupted files (Range on a .part file), skips complete ones, checks sizes. Included after serve.h.
+// `moex download`: fetches the model container from Hugging Face with WinHTTP (part of Windows, no dependencies;
+// Linux: curl). Resumes interrupted files (Range on a .part file), skips complete ones, checks sizes. Included after serve.h.
 #pragma once
-#include <winhttp.h>
 #include <filesystem>
-#pragma comment(lib, "winhttp.lib")
 
 static const char* MODEL_REPO = "Kreuzzelg/qwen36-35b-a3b-colibri-i4-gs64";  // int4 gs64 container of Qwen3.6-35B-A3B (Apache-2.0)
+
+#ifdef _WIN32
+#include <winhttp.h>
+#pragma comment(lib, "winhttp.lib")
 
 static std::wstring widen(const std::string& s) {
     int n = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), nullptr, 0);
@@ -46,6 +48,19 @@ static int http_get(const std::string& url, uint64_t from, const std::function<b
     if (s) WinHttpCloseHandle(s);
     return status;
 }
+#else
+// shortcut: curl's exit code stands in for the HTTP status (22 = HTTP error); `total` stays unset (no caller uses it)
+static int http_get(const std::string& url, uint64_t from, const std::function<bool(const char*, size_t)>& sink, uint64_t* = nullptr) {
+    std::string cmd = "curl -sSLf" + (from ? " -r " + std::to_string(from) + "-" : std::string()) + " '" + url + "'";
+    FILE* p = popen(cmd.c_str(), "r");
+    if (!p) return 0;
+    std::vector<char> buf(1 << 20);
+    bool ok = true;
+    for (size_t got; ok && (got = fread(buf.data(), 1, buf.size(), p)) > 0;) ok = sink(buf.data(), got);
+    const int rc = pclose(p);
+    return ok && rc == 0 ? (from ? 206 : 200) : 0;
+}
+#endif
 
 // One file, resumable through a .part file. size 0 = unknown (no size check). false on failure (message printed).
 static bool fetch_file(const std::string& url, const std::filesystem::path& out, uint64_t size, const std::string& name,
@@ -53,7 +68,11 @@ static bool fetch_file(const std::string& url, const std::filesystem::path& out,
     std::filesystem::path part = out; part += ".part";
     if (std::filesystem::exists(out) && (!size || std::filesystem::file_size(out) == size)) { done_all += size; return true; }
     uint64_t have = std::filesystem::exists(part) ? std::filesystem::file_size(part) : 0;
+#ifdef _WIN32
     FILE* f = _wfopen(part.wstring().c_str(), have ? L"ab" : L"wb");
+#else
+    FILE* f = fopen(part.c_str(), have ? "ab" : "wb");
+#endif
     if (!f) { fprintf(stderr, "download: cannot write %s\n", part.string().c_str()); return false; }
     double t0 = now(), tp = 0; uint64_t got = have;
     int code = http_get(url, have, [&](const char* p, size_t n) {
@@ -114,8 +133,12 @@ static int download_model(const std::string& dir, const std::string& only) {
 
 // Where the model lives: --model, else MOEX_MODEL, else models\ next to moex.exe (falling back to the dev path).
 static std::string exe_dir() {
+#ifdef _WIN32
     wchar_t exe[MAX_PATH]; GetModuleFileNameW(nullptr, exe, MAX_PATH);
     return std::filesystem::path(exe).parent_path().string();
+#else
+    return std::filesystem::read_symlink("/proc/self/exe").parent_path().string();
+#endif
 }
 static std::string default_model_dir() {
     if (const char* e = getenv("MOEX_MODEL")) return e;
@@ -139,6 +162,22 @@ static void mem_report(const char* when) {
 // `moex install`: copy moex.exe (+ moex_hot.bin, README.md, LICENSE) to %LOCALAPPDATA%\Programs\moex and add that
 // folder to the user PATH, so `moex` works in any new terminal. A model already downloaded next to the copy being
 // installed stays where it is: MOEX_MODEL is set to it. No admin rights needed (per-user environment).
+#ifndef _WIN32
+// Linux: a link in ~/.local/bin (on PATH in most distributions); the model stays next to the real binary.
+static int install_moex() {
+    namespace fs = std::filesystem;
+    const char* home = getenv("HOME");
+    if (!home) { fprintf(stderr, "install: HOME is not set\n"); return 1; }
+    const fs::path dst = fs::path(home) / ".local" / "bin" / "moex";
+    std::error_code ec;
+    fs::create_directories(dst.parent_path(), ec);
+    fs::remove(dst, ec);
+    fs::create_symlink(fs::read_symlink("/proc/self/exe"), dst, ec);
+    if (ec) { fprintf(stderr, "install: cannot create %s (%s)\n", dst.c_str(), ec.message().c_str()); return 1; }
+    fprintf(stderr, "install: %s -> this moex. If `moex` is not found in a new terminal, add ~/.local/bin to PATH.\n", dst.c_str());
+    return 0;
+}
+#else
 #pragma comment(lib, "advapi32.lib")
 #pragma comment(lib, "user32.lib")
 static bool set_user_env(const wchar_t* name, const std::wstring& value) {
@@ -185,3 +224,4 @@ static int install_moex() {
             dst.string().c_str());
     return 0;
 }
+#endif

@@ -2,8 +2,18 @@
 // (streaming SSE or a single JSON response). One request at a time; listens on 127.0.0.1 unless told otherwise.
 // Included by moex.cu after Session.
 #pragma once
+#ifdef _WIN32
 #include <winsock2.h>
 #include <ws2tcpip.h>
+#else
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <csignal>
+typedef int SOCKET;
+#define INVALID_SOCKET (-1)
+#define closesocket close
+#endif
 #include <ctime>
 #include <map>
 #include <memory>
@@ -102,11 +112,15 @@ static void respond(SOCKET c, int code, const std::string& type, const std::stri
 }
 
 static void serve(Session& ss, Tokenizer& tk, const std::string& host, int port, const std::string& model_id) {
+#ifdef _WIN32
     WSADATA wsa; WSAStartup(MAKEWORD(2, 2), &wsa);
+#else
+    signal(SIGPIPE, SIG_IGN);  // a client that hangs up mid-stream must not end the server
+#endif
     SOCKET ls = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-    sockaddr_in a{}; a.sin_family = AF_INET; a.sin_port = htons((u_short)port);
+    sockaddr_in a{}; a.sin_family = AF_INET; a.sin_port = htons((uint16_t)port);
     inet_pton(AF_INET, host.c_str(), &a.sin_addr);
-    BOOL yes = TRUE; setsockopt(ls, SOL_SOCKET, SO_REUSEADDR, (const char*)&yes, sizeof yes);
+    int yes = 1; setsockopt(ls, SOL_SOCKET, SO_REUSEADDR, (const char*)&yes, sizeof yes);
     if (bind(ls, (sockaddr*)&a, sizeof a) || listen(ls, 16)) { fprintf(stderr, "[serve] cannot listen on %s:%d (port in use? choose another with --port)\n", host.c_str(), port); return; }
     const std::string base = "http://" + std::string(host == "0.0.0.0" ? "127.0.0.1" : host) + ":" + std::to_string(port);
     const std::string ps_example = "Invoke-RestMethod " + base + "/v1/chat/completions -Method Post -ContentType application/json "

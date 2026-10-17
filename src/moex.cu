@@ -6,15 +6,23 @@
 //   --temp T --top-k K --top-p P --repeat-penalty R --seed S   sampling (default: greedy)
 //   moex.exe --batch ids.txt [--trace routes.bin]   one prompt (comma ids) per line; expert cache stays warm
 //     trace record: int16[12] = prompt, pos, layer, phase (0 prompt / 1 decode), 8 routed expert ids
+//   --trace-ahead ahead.bin   per trace record: int16[5][16] = top-16 experts of layer l+k's router on layer l's
+//     hidden state, k = 0..4 (-1 past the last layer); k = 0 reproduces the routing (a self-check)
 // Generated token ids go to stdout one per line; stats go to stderr. Tokenizing is moex.py's job.
 #include <cuda_runtime.h>
 #include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <iostream>
+#ifdef _WIN32
 #include <intrin.h>
+#else
+#include <cpuid.h>
+#endif
 #include <cstdio>
 #include <deque>
+#include <list>
+#include <memory>
 #include <random>
 #include <mutex>
 #include <string>
@@ -23,9 +31,15 @@
 #include "st.h"
 #include "kernels.cuh"
 #include "cpu_expert.h"
+#ifdef _WIN32
 #include <psapi.h>
 #pragma comment(lib, "psapi.lib")
 static unsigned long page_faults() { PROCESS_MEMORY_COUNTERS c{}; GetProcessMemoryInfo(GetCurrentProcess(), &c, sizeof c); return c.PageFaultCount; }
+#else
+static unsigned long page_faults() { rusage u{}; getrusage(RUSAGE_SELF, &u); return u.ru_minflt + u.ru_majflt; }
+#endif
+
+__global__ void copy_ids_k(const int* __restrict__ s, int* __restrict__ d) { d[threadIdx.x] = s[threadIdx.x]; }
 
 static double now() { return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
 
@@ -39,7 +53,7 @@ constexpr float EPS = 1e-6f, THETA = 1e7f;
 static bool NORM_TOPK = !getenv("MOEX_NO_NORM_TOPK");
 static bool is_attn(int l) { return l % 4 == 3 || l == NL; }  // layer NL = the MTP head's layer
 constexpr int NKEY = (NL + 1) * E;  // expert keys: 40 layers + the MTP layer
-static const char* VERSION = "0.1.2";
+static const char* VERSION = "0.1.3";
 // Too little RAM to lock every expert (the OS and other programs need ~5 GB): experts come from the SSD as needed.
 static bool low_ram_machine() {
     MEMORYSTATUSEX ms{sizeof ms};
@@ -118,14 +132,20 @@ struct Engine {
     }
     // admission: loader thread copies mmap -> pinned stage -> slot on the copy stream
     static constexpr int NSTAGE = 32;
-    struct Stage { uint8_t* buf; cudaEvent_t after_compute, done; int slot = -1, key = -1; };
+    struct Stage {
+        uint8_t* buf; cudaEvent_t after_compute, done, back_done; int slot = -1, key = -1; int back_io = -1; uint8_t *back_q, *back_s;
+        std::atomic<int> back_ready{0};  // the backer thread has enqueued this victim's copy-back (back_done recorded)
+    };
     Stage stage[NSTAGE];
     std::vector<int> free_st;                 // main thread only
-    std::deque<int> todo, flying;             // guarded by mu
+    std::deque<int> todo, flying, backs;      // guarded by mu
     std::mutex mu;
-    std::thread loader;
+    std::thread loader, backer;
+    cudaStream_t cb = nullptr;  // VRAM victim -> RAM copy-backs (own RAM cache, exclusive)
     bool stop_loader = false;
     FILE* trace = nullptr;
+    FILE* trace_ahead = nullptr;
+    float *ahead_h = nullptr, *ahead_d = nullptr;  // [D] normed hidden state, then [5][E] router scores
     int trace_prompt = 0, trace_phase = 0;
     // profile (synchronizing, so it perturbs the speed it measures)
     bool prof = false;
@@ -134,27 +154,59 @@ struct Engine {
     explicit Engine(const char* root, int ctx_) : C(root), ctx(ctx_) {}
     ~Engine() {
         if (pinner.joinable()) pinner.join();
-        if (loader.joinable()) { { std::lock_guard<std::mutex> g(mu); stop_loader = true; } loader.join(); }
+        { std::lock_guard<std::mutex> g(mu); stop_loader = true; }
+        if (loader.joinable()) loader.join();
+        if (backer.joinable()) backer.join();
     }
 
     void loader_main() {
+        const uint8_t* lq = nullptr; const float* ls = nullptr;
         while (true) {
             int i = -1;
             {
                 std::lock_guard<std::mutex> g(mu);
                 if (stop_loader) return;
                 if (!todo.empty()) { i = todo.front(); todo.pop_front(); }
+                if (i >= 0) { rc_loader_key = stage[i].key; lq = eq[stage[i].key]; ls = es[stage[i].key]; }
             }
             if (i < 0) { std::this_thread::sleep_for(std::chrono::microseconds(50)); continue; }
             Stage& st = stage[i];
             prefetch_experts(&st.key, 1);
-            memcpy(st.buf, eq[st.key], EXPERT_Q_BYTES);  // may page-fault from SSD: this thread absorbs it
-            memcpy(st.buf + EXPERT_Q_BYTES, es[st.key], EXPERT_BYTES - EXPERT_Q_BYTES);
+            memcpy(st.buf, lq, EXPERT_Q_BYTES);  // may page-fault from SSD: this thread absorbs it
+            memcpy(st.buf + EXPERT_Q_BYTES, ls, EXPERT_BYTES - EXPERT_Q_BYTES);
+            { std::lock_guard<std::mutex> g(mu); rc_loader_key = -1; }
+            if (st.back_io >= 0) {  // the victim's copy-back (backer thread, on cb) must finish before the overwrite
+                while (!st.back_ready.load(std::memory_order_acquire)) std::this_thread::yield();
+                CK(cudaStreamWaitEvent(cp, st.back_done));
+            }
             CK(cudaStreamWaitEvent(cp, st.after_compute));  // nothing still reads the victim slot
             CK(cudaMemcpyAsync(arena + (size_t)st.slot * EXPERT_BYTES, st.buf, EXPERT_BYTES, cudaMemcpyHostToDevice, cp));
             CK(cudaEventRecord(st.done, cp));
             std::lock_guard<std::mutex> g(mu);
             flying.push_back(i);
+        }
+    }
+
+    // Copy-backs get their own thread and stream: enqueued by the loader they queued behind its admissions (each may
+    // wait on an SSD page fault), and the CPU often needs the evicted expert right away (PLAN.md, 2.18 ms/token).
+    // The slot holds a finished expert (ready), so the copy needs no wait; the admission's H2D waits for back_done.
+    void backer_main() {
+        while (true) {
+            int i = -1;
+            {
+                std::lock_guard<std::mutex> g(mu);
+                if (!backs.empty()) { i = backs.front(); backs.pop_front(); }
+                else if (stop_loader) return;  // drained first: the loader may be waiting on one of these
+            }
+            if (i < 0) { std::this_thread::sleep_for(std::chrono::microseconds(20)); continue; }
+            Stage& st = stage[i];
+            const uint8_t* src = arena + (size_t)st.slot * EXPERT_BYTES;
+            CK(cudaMemcpyAsync(st.back_q, src, EXPERT_Q_BYTES, cudaMemcpyDeviceToHost, cb));
+            CK(cudaMemcpyAsync(st.back_s, src + EXPERT_Q_BYTES, EXPERT_BYTES - EXPERT_Q_BYTES, cudaMemcpyDeviceToHost, cb));
+            CK(cudaEventRecord(rc_io[st.back_io].ev, cb));
+            CK(cudaEventRecord(st.back_done, cb));
+            rc_issued[st.back_io].store(1, std::memory_order_release);
+            st.back_ready.store(1, std::memory_order_release);
         }
     }
 
@@ -174,6 +226,236 @@ struct Engine {
         }
         PrefetchVirtualMemory(GetCurrentProcess(), r.size(), r.data(), 0);  // a hint: failure only costs speed
     }
+    // ---- Own RAM expert cache (low-RAM mode, on by default; PLAN.md "16 GB machines: router-ahead prefetch") ----
+    // Pinned slots filled by direct (unbuffered, overlapped) SSD reads instead of Windows' file cache, LRU. Size: the
+    // RAM free at load minus 2 GB, or MOEX_RAM_GB=N (0 = off: Windows' file cache). VRAM and RAM hold different experts
+    // (an expert admitted to VRAM leaves RAM, one evicted from VRAM is copied back over PCIe; MOEX_VICTIM=0 = off).
+    // Layer l's graph predicts layer l+k's top-8 experts by its router on layer l's hidden state; the host prefetches
+    // them at layer l+1 (MOEX_AHEAD=k, default 3: two layers before they're needed; 0 = off).
+    // An expert not in the cache is still read through the file map (slow, correct).
+    // The file offsets aren't 4 KB aligned: each part is read as its aligned superset, so a slot is [Q+4K][S+4K].
+    static constexpr size_t RQ = EXPERT_Q_BYTES + 4096, RS = EXPERT_BYTES - EXPERT_Q_BYTES + 4096, RSLOT = RQ + RS;
+    int rc_n = 0, ahead_k = 0;
+    bool rc_victim = false;
+    uint8_t* rc_base = nullptr;
+    std::vector<const uint8_t*> mapq; std::vector<const float*> maps;  // file-map pointers: the fallback
+    std::vector<int> rc_slot, rc_key, rc_io_of;  // key -> slot; slot -> key; slot -> io record in flight (-1)
+    std::vector<char> rc_pf;                     // slot filled by a prefetch, not used yet
+    std::list<int> rc_lru; std::vector<std::list<int>::iterator> rc_pos;  // slots in use, front = least recent
+    std::vector<int> rc_free, rc_drops;
+    std::vector<HANDLE> rc_files; std::vector<int> rc_fi; std::vector<uint64_t> rc_oq, rc_os;
+    struct RcIo { OVERLAPPED ov[2]; cudaEvent_t ev; int slot = -1; bool pf = false, d2h = false; };
+    std::vector<RcIo> rc_io; std::vector<int> rc_io_free, rc_flying;
+    std::unique_ptr<std::atomic<int>[]> rc_issued{new std::atomic<int>[64]};  // copy-back enqueued by the loader
+    int rc_loader_key = -1, rc_pf_flying = 0;
+    long long rc_demand = 0, rc_pf_n = 0, rc_pf_used = 0, rc_backs = 0;
+    double rc_wait = 0, rc_submit = 0;  // waiting for reads; main-thread time inside ReadFile
+    double rc_wk[3] = {};               // of the wait: for a copy-back, a prefetch still in flight, a demand read
+    int* pidx_h = nullptr; int *pidx_hd = nullptr, *pa_idx = nullptr; float *pa_h = nullptr, *pa_s = nullptr, *pa_w = nullptr;
+
+    uint8_t* rcq(int s) { return rc_base + (size_t)s * RSLOT; }
+    uint8_t* rcs(int s) { return rc_base + (size_t)s * RSLOT + RQ; }
+    void rc_setup() {
+        const char* gb = getenv("MOEX_RAM_GB");
+        if (!low_ram) return;
+        if (has_mtp) { if (gb) fprintf(stderr, "[ram] MOEX_RAM_GB is not supported with MTP: ignored\n"); return; }
+        // the dense weights went to VRAM through the file map: hand their pages back first, so they count as free
+        SetProcessWorkingSetSize(GetCurrentProcess(), (SIZE_T)-1, (SIZE_T)-1);
+        MEMORYSTATUSEX ms{sizeof ms};
+        GlobalMemoryStatusEx(&ms);
+        const double want = gb ? atof(gb) : ms.ullAvailPhys / 1e9 - 2.0;  // 2 GB: the OS and other programs
+        if (want < 1.0) return;  // too little to beat the file cache
+        rc_n = std::min((int)(want * 1e9 / RSLOT), NL * E);
+        rc_base = (uint8_t*)VirtualAlloc(nullptr, (size_t)rc_n * RSLOT, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+        if (!rc_base) { fprintf(stderr, "[ram] cannot allocate %.1f GB\n", want); exit(1); }
+        for (size_t o = 0, step = (size_t)512 * RSLOT; o < (size_t)rc_n * RSLOT; o += step)  // pinned: async copy-back
+            CK(cudaHostRegister(rc_base + o, std::min(step, (size_t)rc_n * RSLOT - o), cudaHostRegisterDefault));
+        rc_victim = !getenv("MOEX_VICTIM") || atoi(getenv("MOEX_VICTIM"));
+        ahead_k = getenv("MOEX_AHEAD") ? atoi(getenv("MOEX_AHEAD")) : 3;
+        mapq = eq; maps = es;
+        rc_slot.assign(NKEY, -1); rc_key.assign(rc_n, -1); rc_io_of.assign(rc_n, -1); rc_pf.assign(rc_n, 0); rc_pos.resize(rc_n);
+        for (int i = rc_n; i--;) rc_free.push_back(i);
+        std::unordered_map<std::string, int> fidx;
+        rc_fi.assign(NKEY, -1); rc_oq.assign(NKEY, 0); rc_os.assign(NKEY, 0);
+        for (int k = 0; k < NL * E; k++) {
+            std::string ep = "model.layers." + std::to_string(k / E) + ".mlp.experts." + std::to_string(k % E) + ".";
+            const StTensor &tq = C.at(ep + "merged_weight"), &ts = C.at(ep + "qs");
+            if (tq.file != ts.file) { fprintf(stderr, "[ram] expert %d spans two files\n", k); exit(1); }
+            auto it = fidx.find(tq.file);
+            if (it == fidx.end()) {
+                HANDLE f = CreateFileA(tq.file.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+                                       FILE_FLAG_NO_BUFFERING | FILE_FLAG_OVERLAPPED, nullptr);
+                if (f == INVALID_HANDLE_VALUE) { fprintf(stderr, "[ram] cannot open %s\n", tq.file.c_str()); exit(1); }
+                it = fidx.emplace(tq.file, (int)rc_files.size()).first; rc_files.push_back(f);
+            }
+            rc_fi[k] = it->second; rc_oq[k] = tq.off; rc_os[k] = ts.off;
+        }
+        rc_io.resize(64);
+        for (int i = 0; i < 64; i++) {
+            for (auto& o : rc_io[i].ov) o.hEvent = CreateEventA(nullptr, TRUE, FALSE, nullptr);
+            CK(cudaEventCreateWithFlags(&rc_io[i].ev, cudaEventDisableTiming));
+            rc_io_free.push_back(i);
+        }
+        if (ahead_k) {
+            CK(cudaHostAlloc((void**)&pidx_h, 2 * TOPK * 4, cudaHostAllocMapped)); CK(cudaHostGetDevicePointer((void**)&pidx_hd, pidx_h, 0));
+            pa_h = falloc(D); pa_s = falloc(E); pa_w = falloc(TOPK); CK(cudaMalloc(&pa_idx, TOPK * 4));
+        }
+        fprintf(stderr, "[ram] own expert cache: %d slots (%.1f GB), direct SSD reads%s%s\n", rc_n, (double)rc_n * RSLOT / 1e9,
+                rc_victim ? ", VRAM/RAM exclusive (victim copy-back)" : "", ahead_k ? (", prefetch " + std::to_string(ahead_k) + " layers ahead").c_str() : "");
+    }
+    // A slot for a new expert: a free one, else the least recently used one that is complete and not being copied.
+    int rc_take() {
+        if (!rc_free.empty()) { int s = rc_free.back(); rc_free.pop_back(); return s; }
+        std::lock_guard<std::mutex> g(mu);  // vs the loader reading eq/es
+        for (auto it = rc_lru.begin(); it != rc_lru.end(); ++it) {
+            const int s = *it, k = rc_key[s];
+            if (rc_io_of[s] >= 0 || k == rc_loader_key) continue;
+            eq[k] = mapq[k]; es[k] = maps[k]; rc_slot[k] = -1; rc_key[s] = -1; rc_pf[s] = 0;
+            rc_lru.erase(it);
+            return s;
+        }
+        return -1;
+    }
+    void rc_use(int s) { rc_lru.erase(rc_pos[s]); rc_lru.push_back(s); rc_pos[s] = std::prev(rc_lru.end()); }
+    int rc_start(int key, int& s) {  // io record + slot for key; -1 if none is free
+        if (rc_io_free.empty() || (s = rc_take()) < 0) return -1;
+        int i = rc_io_free.back(); rc_io_free.pop_back();
+        rc_key[s] = key; rc_slot[key] = s; rc_io_of[s] = i;
+        rc_lru.push_back(s); rc_pos[s] = std::prev(rc_lru.end());
+        rc_io[i].slot = s; rc_flying.push_back(i);
+        return i;
+    }
+    bool rc_read(int key, bool pf) {
+        int s, i = rc_start(key, s);
+        if (i < 0) return false;
+        RcIo& io = rc_io[i]; io.pf = pf; io.d2h = false;
+        const uint64_t off[2] = {rc_oq[key], rc_os[key]}, len[2] = {EXPERT_Q_BYTES, EXPERT_BYTES - EXPERT_Q_BYTES};
+        uint8_t* dst[2] = {rcq(s), rcs(s)};
+        const double t0 = now();
+        for (int p = 0; p < 2; p++) {
+            const uint64_t a0 = off[p] & ~4095ull, n = ((off[p] + len[p] + 4095) & ~4095ull) - a0;
+            OVERLAPPED& o = io.ov[p];
+            ResetEvent(o.hEvent); o.Internal = o.InternalHigh = 0; o.Offset = (DWORD)a0; o.OffsetHigh = (DWORD)(a0 >> 32);
+            if (!ReadFile(rc_files[rc_fi[key]], dst[p], (DWORD)n, nullptr, &o) && GetLastError() != ERROR_IO_PENDING) {
+                fprintf(stderr, "[ram] direct read failed (%lu)\n", GetLastError()); exit(1);
+            }
+        }
+        rc_submit += now() - t0;
+        if (pf) { rc_pf_flying++; rc_pf_n++; }
+        return true;
+    }
+    // VRAM victim -> RAM, on cp ahead of the admission that overwrites it: enqueued by the loader thread with that
+    // admission (st), or right here (st = null: the prefill slot claim, which then waits for cp)
+    void rc_copy_back(int key, int vslot, Stage* st) {
+        if (rc_slot[key] >= 0) return;
+        int s, i = rc_start(key, s);
+        if (i < 0) return;
+        RcIo& io = rc_io[i]; io.pf = false; io.d2h = true;
+        uint8_t *dq = rcq(s) + (rc_oq[key] & 4095), *ds = rcs(s) + (rc_os[key] & 4095);
+        if (st) { rc_issued[i].store(0); st->back_ready.store(0); st->back_io = i; st->back_q = dq; st->back_s = ds; }
+        else {
+            const uint8_t* src = arena + (size_t)vslot * EXPERT_BYTES;
+            CK(cudaMemcpyAsync(dq, src, EXPERT_Q_BYTES, cudaMemcpyDeviceToHost, cp));
+            CK(cudaMemcpyAsync(ds, src + EXPERT_Q_BYTES, EXPERT_BYTES - EXPERT_Q_BYTES, cudaMemcpyDeviceToHost, cp));
+            CK(cudaEventRecord(io.ev, cp));
+            rc_issued[i].store(1);
+        }
+        rc_backs++;
+    }
+    bool rc_done(int i, bool wait) {
+        RcIo& io = rc_io[i];
+        if (io.d2h) {
+            if (!rc_issued[i].load(std::memory_order_acquire)) {  // the loader hasn't enqueued it yet
+                if (!wait) return false;
+                while (!rc_issued[i].load(std::memory_order_acquire)) std::this_thread::yield();
+            }
+            if (wait) CK(cudaEventSynchronize(io.ev));
+            else if (cudaEventQuery(io.ev) != cudaSuccess) return false;
+        } else {
+            for (int p = 0; p < 2; p++) {
+                if (!wait && !HasOverlappedIoCompleted(&io.ov[p])) return false;
+                DWORD n;
+                if (!GetOverlappedResult(rc_files[rc_fi[rc_key[io.slot]]], &io.ov[p], &n, TRUE)) {
+                    fprintf(stderr, "[ram] direct read failed (%lu)\n", GetLastError()); exit(1);
+                }
+            }
+        }
+        const int s = io.slot, k = rc_key[s];
+        {
+            std::lock_guard<std::mutex> g(mu);
+            eq[k] = rcq(s) + (rc_oq[k] & 4095); es[k] = (const float*)(rcs(s) + (rc_os[k] & 4095));
+        }
+        rc_io_of[s] = -1; rc_pf[s] = io.pf;
+        if (io.pf) rc_pf_flying--;
+        rc_io_free.push_back(i);
+        rc_flying.erase(std::find(rc_flying.begin(), rc_flying.end(), i));
+        return true;
+    }
+    void rc_poll() {
+        for (size_t j = rc_flying.size(); j--;) if (j < rc_flying.size()) rc_done(rc_flying[j], false);
+        for (int k : rc_drops) {  // exclusive: admitted to VRAM, so the RAM copy goes
+            const int s = rc_slot[k];
+            if (s < 0 || rc_io_of[s] >= 0 || slot_of[k] < 0 || !ready[slot_of[k]]) continue;
+            std::lock_guard<std::mutex> g(mu);
+            if (k == rc_loader_key) continue;
+            eq[k] = mapq[k]; es[k] = maps[k]; rc_slot[k] = -1; rc_key[s] = -1; rc_pf[s] = 0;
+            rc_lru.erase(rc_pos[s]); rc_free.push_back(s);
+        }
+        rc_drops.clear();
+    }
+    // A layer's CPU misses: read the ones not in RAM (all together), wait for those still in flight.
+    void rc_need(const int* keys, int n) {
+        double t0 = now();
+        for (int j = 0; j < n; j++) {
+            const int k = keys[j], s = rc_slot[k];
+            if (s >= 0) { if (rc_pf[s]) { rc_pf_used++; rc_pf[s] = 0; } rc_use(s); continue; }
+            while (!rc_read(k, false)) rc_done(rc_flying.front(), true);  // no free io record: finish the oldest
+            rc_demand++;
+        }
+        for (int j = 0; j < n; j++) {
+            const int s = rc_slot[keys[j]];
+            if (s < 0 || rc_io_of[s] < 0) continue;
+            const int i = rc_io_of[s], kind = rc_io[i].d2h ? 0 : rc_io[i].pf ? 1 : 2;  // copy-back, prefetch, demand
+            const double w0 = now();
+            rc_done(i, true);
+            rc_wk[kind] += now() - w0;
+        }
+        rc_wait += now() - t0;
+    }
+    void rc_prefetch(int l) {  // the previous layer's prediction, for layer l - 1 + ahead_k
+        const int src = l - 1, lt = src + ahead_k;
+        if (!ahead_k || src < 0 || lt >= NL) return;
+        for (int j = 0; j < TOPK && rc_pf_flying < 8; j++) {
+            const int k = lt * E + pidx_h[(src & 1) * TOPK + j];
+            if (slot_of[k] >= 0 || rc_slot[k] >= 0) continue;
+            if (!rc_read(k, true)) break;
+        }
+    }
+    void rc_fill() {  // load: the most-used experts (not in VRAM, when exclusive) fill the cache
+        if (!rc_n) return;
+        double t0 = now();
+        std::vector<int> keys;
+        for (int k = 0; k < NL * E; k++) if (uses[k] && !(rc_victim && slot_of[k] >= 0)) keys.push_back(k);
+        std::stable_sort(keys.begin(), keys.end(), [&](int a, int b) { return uses[a] > uses[b]; });
+        int n = 0;
+        for (int k : keys) {
+            if (n >= rc_n) break;
+            while (!rc_read(k, false)) rc_done(rc_flying.front(), true);
+            n++;
+        }
+        while (!rc_flying.empty()) rc_done(rc_flying.front(), true);
+        rc_submit = 0;
+        fprintf(stderr, "[ram] own cache filled with the %d most-used experts%s, %.1f s\n", n, rc_victim ? " not in VRAM" : "", now() - t0);
+    }
+    void rc_report(long long toks) {
+        if (!rc_n) return;
+        const double t = (double)std::max(toks, 1LL);
+        fprintf(stderr, "[ram] per token: %.1f demand reads, %.1f prefetched (%.1f used), %.1f copied back from VRAM | waiting for reads %.2f ms (copy-backs %.2f, late prefetches %.2f, "
+                        "demand %.2f), issuing reads %.2f ms\n",
+                rc_demand / t, rc_pf_n / t, rc_pf_used / t, rc_backs / t, 1e3 * rc_wait / t, 1e3 * rc_wk[0] / t, 1e3 * rc_wk[1] / t,
+                1e3 * rc_wk[2] / t, 1e3 * rc_submit / t);
+    }
+
     // Fills Windows' file cache with the most-used experts that fit in free RAM (not locked: the cache then
     // follows what is actually used).
     void prewarm_file_cache() {
@@ -217,7 +499,7 @@ struct Engine {
             // the dense weights (~4 GB) were read through the map and already live in VRAM: hand their pages back.
             // (A working-set minimum to stop re-faults was measured: 21 -> 17 tok/s under memory pressure.)
             SetProcessWorkingSetSize(GetCurrentProcess(), (SIZE_T)-1, (SIZE_T)-1);
-            prewarm_file_cache();
+            if (!rc_n) prewarm_file_cache();  // else the own RAM cache is filled after load
             return;
         }
         // ask for the largest minimum working set Windows will grant, in 1 GB steps
@@ -262,7 +544,10 @@ struct Engine {
             int i = flying.front(); flying.pop_front();
             if (cudaEventQuery(stage[i].done) == cudaSuccess) {
                 Stage& st = stage[i];
-                if (owner[st.slot] == st.key) { ready[st.slot] = 1; table_set(st.key, arena + (size_t)st.slot * EXPERT_BYTES); }
+                if (owner[st.slot] == st.key) {
+                    ready[st.slot] = 1; table_set(st.key, arena + (size_t)st.slot * EXPERT_BYTES);
+                    if (rc_victim) rc_drops.push_back(st.key);
+                }
                 inflight[st.slot] = 0;
                 free_st.push_back(i);
             } else flying.push_back(i);
@@ -332,9 +617,12 @@ struct Engine {
             if (!inflight[i] && last[i] != clock && sc < best) { best = sc; s = i; }
         }
         if (s < 0) return;
+        const int i = free_st.back();
+        stage[i].back_io = -1;
+        if (owner[s] >= 0 && ready[s] && rc_victim) rc_copy_back(owner[s], s, &stage[i]);
         if (owner[s] >= 0) { slot_of[owner[s]] = -1; if (ready[s]) table_set(owner[s], nullptr); }
         owner[s] = key; slot_of[key] = s; ready[s] = 0; inflight[s] = 1; last[s] = clock;
-        int i = free_st.back(); free_st.pop_back();
+        free_st.pop_back();
         stage[i].slot = s; stage[i].key = key;
         admits++;
         new_jobs.push_back(i);
@@ -346,7 +634,7 @@ struct Engine {
         flush_table();
         for (int i : new_jobs) CK(cudaEventRecord(stage[i].after_compute, cs));
         std::lock_guard<std::mutex> g(mu);
-        for (int i : new_jobs) todo.push_back(i);
+        for (int i : new_jobs) { todo.push_back(i); if (stage[i].back_io >= 0) backs.push_back(i); }
         new_jobs.clear();
     }
 
@@ -398,8 +686,8 @@ struct Engine {
         if (!f16) CK(cudaMalloc(&qtmp, (size_t)V * D * 2));  // largest matrix
         lm_head = wmat({{"lm_head.weight", V}}, D, "lm_head");
         norm = wup("model.norm.weight", D);
-        // MTP (opt-in, --mtp): +7-10% on a 6 GB GPU with every expert in RAM (PLAN.md); on low-RAM machines the draft
-        // token's extra experts become extra SSD reads, so the tip to try it is only shown where it can pay off
+        // MTP: +7-10% on a 6 GB GPU with every expert in RAM (PLAN.md), so main() turns it on there by default; on
+        // low-RAM machines the draft token's extra experts become extra SSD reads (and the own RAM cache needs it off)
         has_mtp = C.has("mtp.fc.weight") && (want_mtp || getenv("MOEX_MTP"));
         if (want_mtp && !has_mtp) fprintf(stderr, "[mtp] --mtp needs the MTP head (mtp.safetensors): run `moex download` once more\n");
         L.resize(NL + has_mtp);
@@ -463,6 +751,7 @@ struct Engine {
             es[l * E + e] = (const float*)C.map(ep + "qs");
         }
         low_ram = low_ram_machine();
+        rc_setup();
         if (pin_async) pinner = std::thread([this] { pin_experts_in_ram(); });  // until done, misses may page-fault
         else pin_experts_in_ram();
         // every byte of VRAM left (minus headroom for the driver) becomes expert slots
@@ -489,10 +778,13 @@ struct Engine {
             CK(cudaMallocHost(&stage[i].buf, EXPERT_BYTES));
             CK(cudaEventCreateWithFlags(&stage[i].after_compute, cudaEventDisableTiming));
             CK(cudaEventCreateWithFlags(&stage[i].done, cudaEventDisableTiming));
+            CK(cudaEventCreateWithFlags(&stage[i].back_done, cudaEventDisableTiming));
             free_st.push_back(i);
         }
         if (warm) warm_slots();
+        rc_fill();
         loader = std::thread([this] { loader_main(); });
+        if (rc_victim) { CK(cudaStreamCreateWithFlags(&cb, cudaStreamNonBlocking)); backer = std::thread([this] { backer_main(); }); }
         capture_graphs();
         fprintf(stderr, "[load] %.1f s, dense %s, %d expert slots (%.2f GB, %.1f%% of %d experts), ctx %d%s\n",
                 now() - t0, f16 ? "F16" : q4groups.empty() ? "int8" : ("int8, int4: " + q4groups).c_str(), nslots, nslots * (double)EXPERT_BYTES / 1e9, 100.0 * nslots / (NL * E), NL * E, ctx,
@@ -534,6 +826,15 @@ struct Engine {
         route_hits_k<<<1, 32, 0, cs>>>(ridx, rw, TOPK, l * E, table_d, slots_d, hw_d, nh_d);
         experts_forward(slots_d, hw_d, TOPK, h, act, moe, cs, nh_d);
         shared_expert_add(w.sh_gu, w.sh_d, w.sh_gate, h, moe, scr, D, SI, cs);
+        // Router-ahead prediction for the own RAM cache's prefetch: after this layer's GPU work, while the GPU waits for
+        // the CPU's misses (x is still this layer's pre-MoE residual). The host reads it after the next layer's routing
+        // event; double-buffered so the next layer's prediction can't overwrite it first.
+        if (ahead_k && l + ahead_k < NL) {
+            rmsnorm(x, nullptr, L[l + ahead_k].post_ln, pa_h, D, EPS, 1, cs);
+            gemv_f16(L[l + ahead_k].router, pa_h, pa_s, D, E, cs);
+            router_topk(pa_s, E, TOPK, NORM_TOPK, pa_idx, pa_w, cs);
+            copy_ids_k<<<1, TOPK, 0, cs>>>(pa_idx, pidx_hd + (l & 1) * TOPK);
+        }
     }
 
     std::vector<cudaGraphExec_t> graphs;
@@ -604,9 +905,11 @@ struct Engine {
         CK(cudaStreamSynchronize(cp));
         poll_admissions();
         for (int s = nslots - nres; s < nslots; s++) {
+            if (owner[s] >= 0 && ready[s] && rc_victim) rc_copy_back(owner[s], s, nullptr);
             if (owner[s] >= 0) { slot_of[owner[s]] = -1; if (ready[s]) table_set(owner[s], nullptr); owner[s] = -1; }
             ready[s] = 0; inflight[s] = 1;  // admit() skips them until released
         }
+        if (rc_victim) { CK(cudaStreamSynchronize(cp)); rc_poll(); }
         flush_table();
     }
     void release_prefill_slots() {
@@ -941,6 +1244,27 @@ struct Engine {
         return c[keep - 1].id;
     }
 
+    // Router-ahead prediction study: layer l+k's router on layer l's residual stream (normed with l+k's post norm),
+    // the cheap predictor a layer-ahead SSD prefetch would use. x is still layer l's pre-MoE residual here.
+    void write_ahead(int l) {
+        constexpr int KA = 5, TOP = 16;
+        if (!ahead_d) { CK(cudaMalloc(&ahead_d, (D + KA * E) * 4)); CK(cudaMallocHost(&ahead_h, KA * E * 4)); }
+        for (int k = 0; k < KA && l + k < NL; k++) {
+            rmsnorm(x, nullptr, L[l + k].post_ln, ahead_d, D, EPS, 1, cs);
+            gemv_f16(L[l + k].router, ahead_d, ahead_d + D + k * E, D, E, cs);
+        }
+        CK(cudaMemcpyAsync(ahead_h, ahead_d + D, KA * E * 4, cudaMemcpyDeviceToHost, cs));
+        CK(cudaStreamSynchronize(cs));
+        int16_t rec[KA][TOP];
+        for (int k = 0; k < KA; k++) {
+            int idx[E]; for (int e = 0; e < E; e++) idx[e] = e;
+            const float* sc = ahead_h + k * E;
+            std::partial_sort(idx, idx + TOP, idx + E, [&](int a, int b) { return sc[a] > sc[b]; });
+            for (int j = 0; j < TOP; j++) rec[k][j] = l + k < NL ? (int16_t)idx[j] : -1;
+        }
+        fwrite(rec, sizeof rec, 1, trace_ahead);
+    }
+
     int step(int tok, int pos, bool want_logits) {
         tokens++;
         note(tok);
@@ -963,6 +1287,7 @@ struct Engine {
                 for (int j = 0; j < TOPK; j++) rec[4 + j] = (int16_t)ids_h[j];
                 fwrite(rec, sizeof rec, 1, trace);
             }
+            if (trace_ahead) write_ahead(l);
             clock++;
             int nm = 0, mkey[TOPK], mall[TOPK];
             const uint8_t* mq[TOPK]; const float* msc[TOPK]; float mw[TOPK];
@@ -971,9 +1296,11 @@ struct Engine {
                 touch(key);
                 if (sl >= 0) last[sl] = clock;  // protects this step's experts (incl. in-flight) from eviction
                 if (sl >= 0 && ready[sl]) hits++;
-                else { mq[nm] = eq[key]; msc[nm] = es[key]; mw[nm] = w_h[j]; mall[nm] = key; mkey[nm++] = sl < 0 ? key : -1; misses++; }
+                else { mw[nm] = w_h[j]; mall[nm] = key; mkey[nm++] = sl < 0 ? key : -1; misses++; }
             }
-            prefetch_experts(mall, nm);
+            if (rc_n) { rc_poll(); rc_prefetch(l); rc_need(mall, nm); }
+            else prefetch_experts(mall, nm);
+            for (int j = 0; j < nm; j++) { mq[j] = eq[mall[j]]; msc[j] = es[mall[j]]; }
             // CPU: misses, overlapped with the GPU's experts + shared expert
             if (nm) {
                 double c0 = now();
@@ -1005,6 +1332,11 @@ struct Engine {
 
 // One line of user input as UTF-8 (the Windows console delivers non-ASCII input correctly only as UTF-16).
 static bool read_line(std::string& out) {
+#ifndef _WIN32
+    if (!std::getline(std::cin, out)) return false;
+    if (!out.empty() && out.back() == '\r') out.pop_back();
+    return true;
+#else
     HANDLE in = GetStdHandle(STD_INPUT_HANDLE);
     DWORD mode;
     if (!GetConsoleMode(in, &mode)) { if (!std::getline(std::cin, out)) return false; if (!out.empty() && out.back() == '\r') out.pop_back(); return true; }
@@ -1019,6 +1351,7 @@ static bool read_line(std::string& out) {
     out.assign(n, '\0');
     WideCharToMultiByte(CP_UTF8, 0, w.c_str(), (int)w.size(), out.data(), n, nullptr, nullptr);
     return true;
+#endif
 }
 
 static std::vector<int> parse_ids(const std::string& s) {
@@ -1037,25 +1370,30 @@ static std::vector<float> read_f32(const std::string& p) {
 
 // The CPU expert kernels are AVX2 (every x86 CPU since ~2013); say so instead of crashing on an illegal instruction.
 static bool has_avx2() {
+#ifndef _WIN32
+    return __builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma");
+#else
     int r[4];
     __cpuid(r, 1);
     bool osxsave = (r[2] >> 27) & 1, avx = (r[2] >> 28) & 1, fma = (r[2] >> 12) & 1;
     if (!osxsave || !avx || !fma || (_xgetbv(0) & 6) != 6) return false;
     __cpuidex(r, 7, 0);
     return (r[1] >> 5) & 1;
+#endif
 }
 
 int main(int argc, char** argv) {
     if (!has_avx2()) { fprintf(stderr, "moex needs a CPU with AVX2 and FMA (Intel Haswell / AMD Zen or newer).\n"); return 1; }
     std::string model = default_model_dir(), only;
     std::string mode, system_prompt;
-    bool think = false, samp_set = false, n_set = false, warm = false, want_mtp = false;
+    bool think = false, samp_set = false, n_set = false, warm = false;
+    int mtp = -1;  // --mtp 1, --no-mtp 0, else on where it was measured faster
     std::string host = "127.0.0.1";
     int port = 8765;
     if (argc > 1 && argv[1][0] != '-') { mode = argv[1]; argv++; argc--; }  // moex chat | moex serve
     std::vector<int> ids, stop;
     int n = 32, ctx = 2048;
-    std::string check, batch, trace_path;
+    std::string check, batch, trace_path, ahead_path;
     bool prof = false, f16 = false, use_prefill = true;
     std::string q4groups;
     Engine::Sampling samp;  // default greedy
@@ -1069,7 +1407,8 @@ int main(int argc, char** argv) {
         else if (s == "--system") system_prompt = next();
         else if (s == "--think") think = true;
         else if (s == "--load") warm = true;
-        else if (s == "--mtp") want_mtp = true;
+        else if (s == "--mtp") mtp = 1;
+        else if (s == "--no-mtp") mtp = 0;
         else if (s == "-v" || s == "--version") mode = "version";
         else if (s == "--host") host = next();
         else if (s == "--port") port = std::stoi(next());
@@ -1087,6 +1426,7 @@ int main(int argc, char** argv) {
         else if (s == "--seed") samp.seed = std::stoull(next());
         else if (s == "--batch") batch = next();
         else if (s == "--trace") trace_path = next();
+        else if (s == "--trace-ahead") ahead_path = next();
         else if (s == "-h" || s == "--help") mode = "help";
         else { fprintf(stderr, "unknown argument: %s\n\n", s.c_str()); mode = "badarg"; break; }
     }
@@ -1118,7 +1458,7 @@ int main(int argc, char** argv) {
                 "  --ctx N                context length in tokens (chat/serve default 8192)\n"
                 "  --port N --host H      server address (serve; default 8765, 127.0.0.1 = this PC only)\n"
                 "  --model DIR            model folder (default %s; or set MOEX_MODEL)\n"
-                "  --mtp                  multi-token prediction: often ~10%% faster when RAM holds every expert (try it)\n\n"
+                "  --no-mtp               no multi-token prediction (on by default when RAM holds every expert: ~5%% faster)\n\n"
                 "Developer: --ids 1,2,3 [--n N] | --batch ids.txt | --check ref/eval1 | --f16 | --profile\n",
                 VERSION, model.c_str());
         return mode == "help" ? 0 : 2;
@@ -1139,7 +1479,12 @@ int main(int argc, char** argv) {
         cudaError_t e = cudaGetDeviceCount(&ndev);
         if (e == cudaErrorInsufficientDriver || e == cudaErrorNoDevice || ndev == 0) {
             fprintf(stderr, e == cudaErrorInsufficientDriver
-                ? "Your NVIDIA driver is too old for moex. Install the latest one (free, ~700 MB):\n  https://www.nvidia.com/Download/index.aspx\n"
+                ? (CUDART_VERSION >= 13000
+                    ? "Your NVIDIA driver is too old for this moex (it needs driver 580 or newer). Either install the latest driver\n"
+                      "(free, ~700 MB): https://www.nvidia.com/Download/index.aspx\n"
+                      "or use the CUDA 12 build, which runs on older drivers: moex-windows-x64-cuda12.zip from\n"
+                      "  https://github.com/neerajdad123-byte/moe/releases/latest\n"
+                    : "Your NVIDIA driver is too old for moex. Install the latest one (free, ~700 MB):\n  https://www.nvidia.com/Download/index.aspx\n")
                 : "moex needs an NVIDIA GPU (RTX 20 series or newer, 6 GB+ VRAM) with its driver installed:\n  https://www.nvidia.com/Download/index.aspx\n");
             return 1;
         }
@@ -1147,7 +1492,9 @@ int main(int argc, char** argv) {
     const bool interactive = mode == "chat" || mode == "serve" || mode == "bench";
     if (interactive) mem_report("before load");
     Engine eng(model.c_str(), ctx);
-    eng.f16 = f16; eng.q4groups = q4groups; eng.samp = samp; eng.want_mtp = want_mtp;
+    const bool mtp_head = std::filesystem::exists(std::filesystem::path(model) / "mtp.safetensors");
+    eng.f16 = f16; eng.q4groups = q4groups; eng.samp = samp;
+    eng.want_mtp = mtp == 1 || (mtp < 0 && interactive && mtp_head && !low_ram_machine());
     eng.warm = warm || interactive;
     eng.quiet = interactive;
     eng.pin_async = interactive && !warm;  // --load waits for every expert to be in RAM before the prompt
@@ -1155,9 +1502,8 @@ int main(int argc, char** argv) {
     eng.load_hot({eng.hot_file, exe_dir() + "/moex_hot.bin"});  // counts accumulate across sessions
     eng.load();
     if (interactive) mem_report("after load");
-    if (interactive && mode != "bench" && !eng.has_mtp && !eng.low_ram)  // every expert fits in RAM: the case where MTP was measured faster
-        fprintf(stderr, "[tip] this PC can try multi-token prediction: `moex %s --mtp` is often ~10%% faster%s\n", mode.c_str(),
-                std::filesystem::exists(std::filesystem::path(model) / "mtp.safetensors") ? "" : " (run `moex download` first to get the MTP head)");
+    if (interactive && mtp < 0 && !mtp_head && !eng.low_ram)  // every expert fits in RAM: the case where MTP was measured faster
+        fprintf(stderr, "[tip] run `moex download` once more to get the MTP head: multi-token prediction is ~5%% faster on this PC\n");
 
     if (mode == "bench") {
         Tokenizer tk(model + "/tokenizer.json");
@@ -1170,7 +1516,9 @@ int main(int argc, char** argv) {
         return 0;
     }
     if (mode == "chat") {
+#ifdef _WIN32
         SetConsoleOutputCP(CP_UTF8);
+#endif
         Tokenizer tk(model + "/tokenizer.json");
         Session ss(eng, tk);
         ss.think = think;
@@ -1309,6 +1657,9 @@ int main(int argc, char** argv) {
                 1e3 * st.ht[0] / dec, 1e3 * st.ht[1] / dec, 1e3 * st.ht[2] / dec, 1e3 * st.ht[3] / dec, st.ttft);
     };
     if (!trace_path.empty() && !(eng.trace = fopen(trace_path.c_str(), "wb"))) { fprintf(stderr, "cannot write %s\n", trace_path.c_str()); return 1; }
+    if (!ahead_path.empty() && (trace_path.empty() || !(eng.trace_ahead = fopen(ahead_path.c_str(), "wb")))) {
+        fprintf(stderr, "--trace-ahead needs --trace and a writable %s\n", ahead_path.c_str()); return 1;
+    }
 
     if (!batch.empty()) {
         FILE* f = fopen(batch.c_str(), "rb");
@@ -1331,6 +1682,7 @@ int main(int argc, char** argv) {
             for (int k = 0; k < 4; k++) tot.ht[k] += st.ht[k];
         }
         report("batch total", tot);
+        eng.rc_report(tot.dec);
         if (eng.mtp_rounds) {
             const double r = (double)eng.mtp_rounds;
             fprintf(stderr, "[mtp] %lld rounds, draft accepted %.1f%% | ms/round: snapshot %.2f  40 layers %.2f  lm_head+pick %.2f  mtp layer %.2f  redo %.2f | layers: gpu-wait %.2f  cpu-experts %.2f\n",
@@ -1343,6 +1695,7 @@ int main(int argc, char** argv) {
         }
         if (getenv("MOEX_SAVE_HOT")) { eng.hot_file = getenv("MOEX_SAVE_HOT"); eng.save_hot(); }  // makes the shipped moex_hot.bin
         if (eng.trace) fclose(eng.trace);
+        if (eng.trace_ahead) fclose(eng.trace_ahead);
         return 0;
     }
 

@@ -20,7 +20,11 @@ constexpr int BENCH_TOKENS = 256;  // reply cap: a few paragraphs, like a typica
 
 static std::string cpu_name() {
     int r[4]; char s[49] = {};
+#ifdef _WIN32
     for (int i = 0; i < 3; i++) { __cpuid(r, 0x80000002 + i); memcpy(s + 16 * i, r, 16); }
+#else
+    for (int i = 0; i < 3; i++) { __cpuid(0x80000002 + i, r[0], r[1], r[2], r[3]); memcpy(s + 16 * i, r, 16); }
+#endif
     std::string n = s;
     n.erase(0, n.find_first_not_of(' '));
     return n;
@@ -54,9 +58,11 @@ static int run_bench(Engine& eng, Tokenizer& tk, const std::string& model) {
     fflush(stdout);
 
     fprintf(stderr, "\nTips to go faster:\n");
+#ifdef _WIN32  // shortcut: no battery check on Linux
     SYSTEM_POWER_STATUS ps{};
     if (GetSystemPowerStatus(&ps) && ps.ACLineStatus == 0)
         fprintf(stderr, "  - You are on battery: plug the laptop in. GPUs and CPUs run much slower on battery.\n");
+#endif
     fprintf(stderr, "  - Windows power mode \"Best performance\" (Settings > System > Power), and the laptop's own performance mode\n"
                     "    if it has one (e.g. Armoury Crate, Legion Space, Omen Gaming Hub).\n");
     fprintf(stderr, "  - Close browser tabs and apps you don't need (games, video, Discord) before starting moex: they eat RAM and\n"

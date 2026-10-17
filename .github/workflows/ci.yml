@@ -8,12 +8,17 @@ on:
 jobs:
   windows:
     runs-on: windows-2025
+    strategy:
+      matrix:
+        include:  # CUDA 13 needs driver 580+; the CUDA 12 build runs on older drivers
+          - { cuda: 13.3.0, zip: moex-windows-x64, nvflags: '' }
+          - { cuda: 12.8.1, zip: moex-windows-x64-cuda12, nvflags: '-allow-unsupported-compiler' }
     steps:
       - uses: actions/checkout@v4
 
       - uses: Jimver/cuda-toolkit@v0.2.36
         with:
-          cuda: 13.3.0
+          cuda: ${{ matrix.cuda }}
           method: network
           sub-packages: '["nvcc", "cudart", "crt", "nvvm", "nvptxcompiler"]'
 
@@ -23,13 +28,25 @@ jobs:
         shell: cmd
         run: |
           mkdir build
-          nvcc -std=c++20 -O3 -lineinfo -Xcompiler "/EHsc /utf-8 /D_CRT_SECURE_NO_WARNINGS /arch:AVX2" ^
+          nvcc -std=c++20 -O3 -lineinfo ${{ matrix.nvflags }} -Xcompiler "/EHsc /utf-8 /D_CRT_SECURE_NO_WARNINGS /arch:AVX2" ^
             -gencode arch=compute_75,code=sm_75 -gencode arch=compute_80,code=sm_80 -gencode arch=compute_86,code=sm_86 ^
             -gencode arch=compute_89,code=sm_89 -gencode arch=compute_90,code=sm_90 -gencode arch=compute_120,code=sm_120 ^
             -gencode arch=compute_120,code=compute_120 src\moex.cu -o build\moex.exe
 
       - name: moex --version
         run: build\moex.exe --version
+
+      - name: Zip (same contents as package.bat)
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory dist\moex | Out-Null
+          Copy-Item build\moex.exe, README.md, LICENSE, data\moex_hot.bin dist\moex\
+          Compress-Archive dist\moex\* dist\${{ matrix.zip }}.zip
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.zip }}
+          path: dist/${{ matrix.zip }}.zip
 
       - name: Build test_tokenizer.exe
         shell: cmd
