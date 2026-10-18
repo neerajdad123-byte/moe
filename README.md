@@ -218,9 +218,11 @@ in each of its 40 layers, about 3B parameters per token. The trick is keeping th
 
 ## Accuracy
 
-moex runs the published int4 model as it is. With full-precision dense weights (`--f16`) it matches a PyTorch
-reference implementation to 1e-12 (KL divergence). The default int8 dense weights and int8 KV cache add a mean KL of
-0.003, and the top-1 token agrees with the reference 98.6% of the time. The model file itself is an int4 quantization
+moex runs the published int4 model as it is, and every release is checked against a PyTorch reference implementation
+(`moex --check ref/eval1`, 72-107 positions). With the default int8 dense weights and int8 KV cache the mean KL
+divergence is 0.0015 and the top-1 token agrees with the reference 98.6% of the time. With full-precision dense
+weights (`--f16`) the int8 KV cache is the only difference left: mean KL 0.0005-0.0006, top-1 98.6-100% (it was
+exact, KL 1e-12, before the KV cache became int8). The model file itself is an int4 quantization
 of Qwen3.6-35B-A3B made by others (see Credits), so it is not identical to the original BF16 weights.
 
 ## Supported today

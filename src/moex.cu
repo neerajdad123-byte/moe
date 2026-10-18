@@ -1608,14 +1608,13 @@ int main(int argc, char** argv) {
             fprintf(stderr, "  pos %2d tok %6d  logits rel %.3e  KL %.2e  argmax %6d ref %6d %s\n", pos, tok, err / mx, kl, id, rid, id == rid ? "" : "MISMATCH");
             tok = pos + 1 < (int)ids.size() ? ids[pos + 1] : id;
         }
-        // F16 must be numerically identical (prefill rounds activations to fp16 on tensor cores, so only the
-        // token-by-token F16 path is held to exactness). Quantized weights are judged statistically: mean KL and
-        // top-1 agreement (an int8 model legitimately flips a near-tie now and then).
+        // Judged statistically: mean KL and top-1 agreement (a quantized model legitimately flips a near-tie now and
+        // then). The KV cache is int8 in every mode, so F16 dense weights are no longer exact: measured mean KL ~5e-4
+        // from the KV cache alone (it was 7e-13 with an fp32 cache), held to a 5x tighter bar than int8 weights.
         const double mean_kl = scored ? sum_kl / scored : 1e9, agree = scored ? 1.0 - (double)bad / scored : 0;
-        bool ok = scored > 0 && (f16 && !use_prefill ? worst < 1e-4 && bad == 0 : f16 ? worst_kl < 1e-5 && bad == 0
-                                                                                   : mean_kl < 5e-3 && agree >= 0.97);
+        bool ok = scored > 0 && (f16 ? mean_kl < 1e-3 && agree >= 0.97 : mean_kl < 5e-3 && agree >= 0.97);
         fprintf(stderr, "[check] %s, %d positions, mean KL %.2e, worst KL %.2e, worst logits rel %.3e, top-1 agreement %.1f%% (%d mismatch) -> %s\n",
-                f16 ? "F16" : q4groups.empty() ? "int8" : ("int8 + int4 " + q4groups).c_str(), scored, mean_kl, worst_kl, worst,
+                f16 ? "F16 (int8 KV)" : q4groups.empty() ? "int8" : ("int8 + int4 " + q4groups).c_str(), scored, mean_kl, worst_kl, worst,
                 100 * agree, bad, ok ? "PASS" : "FAIL");
         return ok ? 0 : 1;
     }
