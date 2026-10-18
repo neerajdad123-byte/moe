@@ -14,7 +14,11 @@ struct Session {
     Tokenizer& tk;
     bool think = false;           // let the model think (<think> ... </think>) instead of an empty think block
     std::vector<int> ctx;         // tokens whose effect is in the engine state, at positions 0..ctx.size()-1
-    std::map<std::string, std::vector<int>> replies;  // our own replies, so a resent history reuses their exact ids
+    // Our own replies by their text (what a client sends back), so a resent history reuses their exact ids. head is
+    // what came after "assistant\n" in the prompt: the empty think block, or nothing when the model thought (its
+    // thinking is then in ids, so the history still matches the engine state and only the new turn is prefilled).
+    struct Reply { std::string head; std::vector<int> ids; };
+    std::map<std::string, Reply> replies;
     int im_start, im_end, eot;
 
     Session(Engine& e, Tokenizer& t) : eng(e), tk(t) {
@@ -29,18 +33,23 @@ struct Session {
         for (auto& m : msgs) {
             ids.push_back(im_start);
             if (m.role == "assistant") {
-                add("assistant\n<think>\n\n</think>\n\n");
                 auto it = replies.find(m.content);
-                if (it != replies.end()) ids.insert(ids.end(), it->second.begin(), it->second.end());
-                else add(m.content);
+                if (it != replies.end()) {  // tokenized exactly as the generation prompt was
+                    add("assistant\n" + it->second.head);
+                    ids.insert(ids.end(), it->second.ids.begin(), it->second.ids.end());
+                } else { add("assistant\n" + EMPTY_THINK); add(m.content); }
             } else add(m.role + "\n" + m.content);
             ids.push_back(im_end);
             add("\n");
         }
         ids.push_back(im_start);
-        add(think ? "assistant\n" : "assistant\n<think>\n\n</think>\n\n");
+        add("assistant\n" + gen_head());
         return ids;
     }
+    static inline const std::string EMPTY_THINK = "<think>\n\n</think>\n\n";
+    std::string gen_head() const { return think ? "" : EMPTY_THINK; }
+    // After generate(): `text` is the reply as the client will send it back in the history.
+    void remember(const std::string& text, const std::vector<int>& out) { replies[text] = {gen_head(), out}; }
 
     // Runs `prompt` and streams up to max_new generated tokens to on_tok (return false to stop early). Stops at
     // <|im_end|> / <|endoftext|> (not emitted, not fed). Returns the generated ids.
@@ -73,6 +82,55 @@ struct Session {
             } else q.push_back(eng.step(t, pos, true));
         }
         return out;
+    }
+};
+
+// Splits a thinking reply into reasoning and answer as it streams: an optional "<think>" at the start, the
+// reasoning, "</think>", then the answer (whitespace around both trimmed at their start). Holds back a tail that
+// could still become a tag. Without thinking everything is answer.
+struct ThinkSplit {
+    static inline const std::string OPEN = "<think>", CLOSE = "</think>";
+    bool in_think, opened = false, lead = true;
+    std::string buf;
+    explicit ThinkSplit(bool think) : in_think(think) {}
+    static size_t partial_tail(const std::string& s, const std::string& tag) {  // longest proper prefix of tag ending s
+        for (size_t n = std::min(s.size(), tag.size() - 1); n > 0; n--)
+            if (!s.compare(s.size() - n, n, tag, 0, n)) return n;
+        return 0;
+    }
+    bool trim_lead(bool last) {  // drops leading whitespace; false = nothing else yet, wait for more
+        if (!lead) return true;
+        size_t i = 0;
+        while (i < buf.size() && strchr(" \t\r\n", buf[i])) i++;
+        buf.erase(0, i);
+        if (buf.empty() && !last) return false;
+        lead = false;
+        return true;
+    }
+    void push(const std::string& s, std::string& reasoning, std::string& answer, bool last) {
+        buf += s;
+        if (in_think) {
+            if (!opened) {
+                if (!trim_lead(last)) return;
+                if (buf.size() < OPEN.size() && !last && !OPEN.compare(0, buf.size(), buf)) return;  // may still be "<think>"
+                if (!buf.compare(0, OPEN.size(), OPEN)) buf.erase(0, OPEN.size());
+                opened = true; lead = true;
+            }
+            if (!trim_lead(last)) return;
+            size_t k = buf.find(CLOSE);
+            if (k == std::string::npos) {
+                size_t keep = last ? 0 : partial_tail(buf, CLOSE);
+                reasoning += buf.substr(0, buf.size() - keep);
+                buf.erase(0, buf.size() - keep);
+                return;
+            }
+            reasoning += buf.substr(0, k);
+            buf.erase(0, k + CLOSE.size());
+            in_think = false; lead = true;
+        }
+        if (lead && opened && !trim_lead(last)) return;
+        answer += buf;
+        buf.clear();
     }
 };
 

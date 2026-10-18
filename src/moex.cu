@@ -1518,6 +1518,7 @@ int main(int argc, char** argv) {
     if (mode == "serve") {
         Tokenizer tk(model + "/tokenizer.json");
         Session ss(eng, tk);
+        ss.think = think;  // the default for requests that don't say (chat_template_kwargs.enable_thinking, reasoning_effort)
         serve(ss, tk, host, port, "qwen3.6-35b-a3b");
         return 0;
     }
@@ -1552,7 +1553,7 @@ int main(int argc, char** argv) {
                 return true;
             });
             reply += us.held;
-            ss.replies[reply] = out;
+            ss.remember(reply, out);
             eng.save_hot();
             msgs.push_back({"assistant", reply});
             double t2 = now();

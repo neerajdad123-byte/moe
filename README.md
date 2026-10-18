@@ -151,8 +151,11 @@ for chunk in client.chat.completions.create(model="qwen3.6-35b-a3b", stream=True
     print(chunk.choices[0].delta.content or "", end="")
 ```
 
-Supported: streaming, `temperature`, `top_p`, `top_k`, `seed`, `stop`, `max_tokens`,
-`chat_template_kwargs.enable_thinking`. Apps that resend the whole conversation each turn only pay for the new message.
+Supported: streaming, `temperature`, `top_p`, `top_k`, `seed`, `stop`, `max_tokens`. Thinking: `moex serve --think`
+turns it on for every request; a request can still choose with `chat_template_kwargs.enable_thinking` or
+`reasoning_effort` (`"none"` = off). The thinking arrives as `reasoning_content` and the answer as `content`, so Open WebUI
+and other apps show it as a separate thinking section. Apps that resend the whole conversation each turn only pay for
+the new message.
 It listens on your machine only; `--host 0.0.0.0 --port N` changes that.
 
 ## Speed

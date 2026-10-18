@@ -117,6 +117,7 @@ static void serve(Session& ss, Tokenizer& tk, const std::string& host, int port,
 #else
     signal(SIGPIPE, SIG_IGN);  // a client that hangs up mid-stream must not end the server
 #endif
+    const bool think_default = ss.think;  // `moex serve --think`
     SOCKET ls = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
     sockaddr_in a{}; a.sin_family = AF_INET; a.sin_port = htons((uint16_t)port);
     inet_pton(AF_INET, host.c_str(), &a.sin_addr);
@@ -130,7 +131,7 @@ static void serve(Session& ss, Tokenizer& tk, const std::string& host, int port,
     // GET /api (and /): what this server offers and how to call it
     const std::string api_help = "{\"server\":\"moex\",\"model\":\"" + jesc(model_id) + "\",\"base_url\":\"" + jesc(base) + "/v1\",\"api_key\":\"any\","
         "\"endpoints\":{\"POST /v1/chat/completions\":\"OpenAI chat completions; set \\\"stream\\\": true for streaming. Also: temperature, top_p, top_k, "
-        "seed, stop, max_tokens, chat_template_kwargs.enable_thinking\",\"GET /v1/models\":\"the model id\",\"GET /health\":\"{\\\"status\\\":\\\"ok\\\"}\","
+        "seed, stop, max_tokens; thinking: chat_template_kwargs.enable_thinking or reasoning_effort (default: serve --think), sent as reasoning_content, the answer as content\",\"GET /v1/models\":\"the model id\",\"GET /health\":\"{\\\"status\\\":\\\"ok\\\"}\","
         "\"GET /api\":\"this page\"},\"examples\":{\"powershell\":\"" + jesc(ps_example) + "\",\"python\":\"" + jesc(py_example) + "\"}}";
     fprintf(stderr,
             "\n[serve] moex is serving %s - OpenAI-compatible API\n"
@@ -185,8 +186,12 @@ static void serve(Session& ss, Tokenizer& tk, const std::string& host, int port,
             }
             const bool stream = r.boolean("stream", false);
             int max_new = (int)r.num("max_completion_tokens", r.num("max_tokens", 2048));
+            // thinking: chat_template_kwargs.enable_thinking, else reasoning_effort ("none" = off), else `serve --think`
             auto kw = r.get("chat_template_kwargs");
-            ss.think = kw ? kw->boolean("enable_thinking", false) : false;
+            auto re = r.get("reasoning_effort");
+            ss.think = kw && kw->get("enable_thinking") ? kw->boolean("enable_thinking", think_default)
+                     : re && re->t == Json::STR ? re->s != "none"
+                     : think_default;
             Engine::Sampling sp;
             sp.temp = (float)r.num("temperature", ss.think ? 1.0 : 0.7);
             sp.top_p = (float)r.num("top_p", ss.think ? 0.95 : 0.8);
@@ -202,38 +207,47 @@ static void serve(Session& ss, Tokenizer& tk, const std::string& host, int port,
             const long long created = (long long)time(nullptr);
             auto prompt = ss.render(m);
             if (stream) send_all(c, std::string("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\n") + CORS + "Connection: close\r\n\r\n");
-            auto chunk = [&](const std::string& delta, const char* finish) {
-                std::string d = finish ? "{}" : "{\"content\":\"" + jesc(delta) + "\"}";
+            auto chunk = [&](const std::string& delta, const char* finish, const char* field = "content") {
+                std::string d = finish ? "{}" : "{\"" + std::string(field) + "\":\"" + jesc(delta) + "\"}";
                 return "data: {\"id\":\"" + id + "\",\"object\":\"chat.completion.chunk\",\"created\":" + std::to_string(created) +
                        ",\"model\":\"" + jesc(model_id) + "\",\"choices\":[{\"index\":0,\"delta\":" + d + ",\"finish_reason\":" +
                        (finish ? "\"" + std::string(finish) + "\"" : "null") + "}]}\n\n";
             };
-            Utf8Stream us; std::string text; bool alive = true, hit_stop = false; size_t sent = 0;
-            const double t0 = now();
-            auto out = ss.generate(prompt, max_new, [&](int t) {
-                text += us.push(tk.piece(t));
+            // the thinking goes out as reasoning_content (as llama.cpp, vLLM and DeepSeek send it: Open WebUI and other
+            // clients show it as a thinking section), the answer as content; stop strings apply to the answer only
+            Utf8Stream us; ThinkSplit split(ss.think); std::string text, reasoning; bool alive = true, hit_stop = false; size_t sent = 0;
+            auto feed = [&](const std::string& piece, bool last) {
+                std::string rd, ad;
+                split.push(piece, rd, ad, last);
+                if (!rd.empty()) { reasoning += rd; if (stream && alive) alive = send_all(c, chunk(rd, nullptr, "reasoning_content")); }
+                text += ad;
                 for (auto& s : stops) { size_t k = text.find(s); if (k != std::string::npos) { text.resize(k); hit_stop = true; } }
                 // hold back a tail that could still become a stop string
                 size_t hold = 0; for (auto& s : stops) hold = std::max(hold, s.size() - 1);
-                size_t can = hit_stop ? text.size() : (text.size() > hold ? text.size() - hold : 0);
-                if (stream && can > sent) { alive = send_all(c, chunk(text.substr(sent, can - sent), nullptr)); sent = can; }
+                size_t can = hit_stop || last ? text.size() : (text.size() > hold ? text.size() - hold : 0);
+                if (stream && alive && can > sent) { alive = send_all(c, chunk(text.substr(sent, can - sent), nullptr)); sent = can; }
+            };
+            const double t0 = now();
+            auto out = ss.generate(prompt, max_new, [&](int t) {
+                feed(us.push(tk.piece(t)), false);
                 return alive && !hit_stop;
             });
-            if (!hit_stop) text += us.held;
-            ss.replies[text] = out;
+            if (!hit_stop) feed(us.held, true);
+            ss.remember(text, out);
             ss.eng.save_hot();
             fprintf(stderr, "[serve] %zu prompt tokens, %zu generated, %.1f s, %.1f tok/s overall\n", prompt.size(), out.size(), now() - t0,
                     out.size() / std::max(now() - t0, 1e-9));
             const char* finish = hit_stop || (int)out.size() < max_new ? "stop" : "length";
             if (stream) {
-                if (text.size() > sent) send_all(c, chunk(text.substr(sent), nullptr));
+                if (alive && text.size() > sent) send_all(c, chunk(text.substr(sent), nullptr));
                 send_all(c, chunk("", finish));
                 send_all(c, "data: [DONE]\n\n");
             } else {
                 respond(c, 200, "application/json",
                         "{\"id\":\"" + id + "\",\"object\":\"chat.completion\",\"created\":" + std::to_string(created) + ",\"model\":\"" +
-                        jesc(model_id) + "\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"" + jesc(text) +
-                        "\"},\"finish_reason\":\"" + finish + "\"}],\"usage\":{\"prompt_tokens\":" + std::to_string(prompt.size()) +
+                        jesc(model_id) + "\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"" + jesc(text) + "\"" +
+                        (reasoning.empty() ? "" : ",\"reasoning_content\":\"" + jesc(reasoning) + "\"") +
+                        "},\"finish_reason\":\"" + finish + "\"}],\"usage\":{\"prompt_tokens\":" + std::to_string(prompt.size()) +
                         ",\"completion_tokens\":" + std::to_string(out.size()) + ",\"total_tokens\":" + std::to_string(prompt.size() + out.size()) + "}}");
             }
         } else respond(c, 404, "application/json", "{\"error\":{\"message\":\"not found\"}}");
