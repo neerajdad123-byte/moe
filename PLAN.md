@@ -409,3 +409,14 @@ MTP on by default for chat / serve / bench when every expert fits in RAM and the
 needs it off.
 `moex bench` (10 questions, temp 0.7, same laptop, alternating): MTP on 50.2 / 49.3, off 48.1 / 46.9 tok/s: +4-5%
 (sampling accepts fewer drafts than the greedy +7-10%). Docs and help now say ~5%.
+
+## Idle CPU at the prompt (issue #1, 2026-10-18)
+
+`moex chat` at the `>` prompt and `moex serve` between requests kept ~7 cores busy (35% of 20 logical CPUs): the decode
+CpuPool's workers pause-spun, then `yield()`ed forever. Now a worker pause-spins ~1 ms, yields while a job came within
+the last 50 ms (HOT_MS, well above the gap between decode tokens), then blocks on `gen.wait` (WaitOnAddress); the
+dispatcher calls `notify_all` only when a worker sleeps, so hot decode adds no wake-up calls. A spin=false pool (the
+copy pool outside prefill) blocks right after the pause loop instead of polling every 200 us.
+Same laptop: idle at the prompt (before and after a reply) and in serve after a request: 6.9 cores -> 0.00.
+`moex bench` alternating before/after: 51.3 / 49.5 vs 50.7 / 50.2 tok/s (noise), first token unchanged; `--check
+ref/eval1` PASS. The loader/backer threads still poll with 20-50 us sleeps; that measured as 0.00 cores, so left as is.

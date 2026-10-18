@@ -9,7 +9,9 @@
 #include <vector>
 
 // Persistent worker pool. Workers spin between jobs: a decode token dispatches ~80 jobs and
-// waking threads through the OS costs tens of microseconds each on Windows.
+// waking threads through the OS costs tens of microseconds each on Windows. Once no job has come for HOT_MS
+// (generation ended: the chat prompt, a server between requests) they block on gen (WaitOnAddress) and take
+// no CPU; the next job wakes them, paying the OS wake-up once.
 // Every worker joins every job and reports when it has left it, so the next job's counters are only
 // reset once no thread can still be grabbing items of the previous one.
 struct CpuPool {
@@ -17,16 +19,18 @@ struct CpuPool {
     std::atomic<uint64_t> gen{0};
     std::atomic<int> next{0}, finished{0};
     std::atomic<bool> quit{false};
+    std::atomic<int> sleepers{0};  // workers blocked in gen.wait: only then does a new job pay for a wake-up call
     const std::function<void(int)>* fn = nullptr;
     int n = 0;
 
-    // spin = false: idle workers sleep instead of spinning (for a pool used only now and then, so its idle
-    // threads don't take cores from the hot pool; costs up to ~200 us of wake-up latency)
+    // spin = false: idle workers block right after the short pause loop instead of yielding for HOT_MS (for a
+    // pool used only now and then, so its idle threads don't take cores from the hot pool)
     std::atomic<bool> spin;  // may be switched while running (a pool that is hot only now and then)
+    static constexpr int HOT_MS = 50;  // well above the gaps between decode tokens
     explicit CpuPool(int threads, bool spin_ = true) : spin(spin_) {
         for (int i = 0; i < threads - 1; i++) th.emplace_back([this] { worker(); });  // caller is the last worker
     }
-    ~CpuPool() { quit = true; gen++; for (auto& t : th) t.join(); }
+    ~CpuPool() { quit = true; gen++; gen.notify_all(); for (auto& t : th) t.join(); }
 
     void run_items() {
         for (int i; (i = next.fetch_add(1)) < n;) (*fn)(i);
@@ -34,22 +38,35 @@ struct CpuPool {
     void worker() {
         uint64_t seen = 0;
         while (true) {
-            int spins = 0;
-            while (gen.load(std::memory_order_acquire) == seen) {
-                if (++spins < 20000) _mm_pause();
-                else if (spin) std::this_thread::yield();
-                else std::this_thread::sleep_for(std::chrono::microseconds(200));
-            }
+            wait_job(seen);
             seen++;  // main never starts job g+1 before every worker finished job g
             if (quit) return;
             run_items();
             finished.fetch_add(1, std::memory_order_release);
         }
     }
+    // Returns once gen != seen: pause-spins (~1 ms), then yields while hot, then sleeps until notified.
+    void wait_job(uint64_t seen) {
+        for (int spins = 0; spins < 20000; spins++) {
+            if (gen.load(std::memory_order_acquire) != seen) return;
+            _mm_pause();
+        }
+        const auto t0 = std::chrono::steady_clock::now();
+        while (spin && std::chrono::steady_clock::now() - t0 < std::chrono::milliseconds(HOT_MS)) {
+            if (gen.load(std::memory_order_acquire) != seen) return;
+            std::this_thread::yield();
+        }
+        // seq_cst on both sides (sleepers here, gen in parallel_for): either this wait sees the new gen or
+        // parallel_for sees the sleeper and notifies, so no wake-up is lost
+        sleepers.fetch_add(1);
+        gen.wait(seen);
+        sleepers.fetch_sub(1);
+    }
     // Calls f(i) for i in [0, items), spread over the pool; returns when all are done.
     void parallel_for(int items, const std::function<void(int)>& f) {
         fn = &f; n = items; next = 0; finished = 0;
-        gen.fetch_add(1, std::memory_order_release);
+        gen.fetch_add(1);
+        if (sleepers.load()) gen.notify_all();
         run_items();
         while (finished.load(std::memory_order_acquire) < (int)th.size()) _mm_pause();
     }
