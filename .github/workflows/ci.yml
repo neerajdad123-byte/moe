@@ -9,10 +9,12 @@ jobs:
   windows:
     runs-on: windows-2025
     strategy:
+      fail-fast: false  # one zip failing must not cancel the other
       matrix:
         include:  # CUDA 13 needs driver 580+; the CUDA 12 build runs on older drivers
-          - { cuda: 13.3.0, zip: moex-windows-x64, nvflags: '' }
-          - { cuda: 12.8.1, zip: moex-windows-x64-cuda12, nvflags: '-allow-unsupported-compiler' }
+          # crt, nvvm and nvptxcompiler are separate installer packages only from CUDA 13 (inside nvcc in 12.x)
+          - { cuda: 13.3.0, zip: moex-windows-x64, nvflags: '', pkgs: '["nvcc", "cudart", "crt", "nvvm", "nvptxcompiler"]' }
+          - { cuda: 12.8.1, zip: moex-windows-x64-cuda12, nvflags: '-allow-unsupported-compiler', pkgs: '["nvcc", "cudart"]' }
     steps:
       - uses: actions/checkout@v4
 
@@ -20,7 +22,7 @@ jobs:
         with:
           cuda: ${{ matrix.cuda }}
           method: network
-          sub-packages: '["nvcc", "cudart", "crt", "nvvm", "nvptxcompiler"]'
+          sub-packages: ${{ matrix.pkgs }}
 
       - uses: ilammy/msvc-dev-cmd@v1
 
