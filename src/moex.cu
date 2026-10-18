@@ -1545,6 +1545,7 @@ int main(int argc, char** argv) {
             auto prompt = ss.render(msgs);
             Utf8Stream us; std::string reply;
             double t0 = now(), t1 = 0; int ntok = 0;
+            if (ss.think) { fputs("<think>\n", stdout); fflush(stdout); }  // the prompt ends with it (Qwen3.6 template)
             auto out = ss.generate(prompt, max_new, [&](int t) {
                 if (!ntok++) t1 = now();
                 std::string txt = us.push(tk.piece(t));

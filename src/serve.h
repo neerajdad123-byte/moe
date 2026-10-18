@@ -1,5 +1,7 @@
-// OpenAI-compatible HTTP server (Winsock, no dependencies): GET /v1/models, GET /health, GET /api (help), POST /v1/chat/completions
-// (streaming SSE or a single JSON response). One request at a time; listens on 127.0.0.1 unless told otherwise.
+// HTTP server (Winsock / POSIX sockets, no dependencies) with two APIs over the same engine:
+//   OpenAI-compatible:    POST /v1/chat/completions (tools, streaming), GET /v1/models
+//   Anthropic-compatible: POST /v1/messages (tools, thinking, streaming), POST /v1/messages/count_tokens
+// plus GET /health and GET /api (help). One request at a time; listens on 127.0.0.1 unless told otherwise.
 // Included by moex.cu after Session.
 #pragma once
 #ifdef _WIN32
@@ -14,90 +16,13 @@ typedef int SOCKET;
 #define INVALID_SOCKET (-1)
 #define closesocket close
 #endif
+#include <algorithm>
 #include <ctime>
-#include <map>
-#include <memory>
+#include <functional>
 #include <string>
 #include <vector>
+#include "json.h"
 #pragma comment(lib, "ws2_32.lib")
-
-// ---- minimal JSON (parse + escape) ----
-struct Json {
-    enum T { NUL, BOOL, NUM, STR, ARR, OBJ } t = NUL;
-    bool b = false; double n = 0; std::string s;
-    std::vector<Json> a; std::map<std::string, Json> o;
-    const Json* get(const std::string& k) const { auto it = o.find(k); return t == OBJ && it != o.end() ? &it->second : nullptr; }
-    double num(const std::string& k, double def) const { auto v = get(k); return v && v->t == NUM ? v->n : def; }
-    bool boolean(const std::string& k, bool def) const { auto v = get(k); return v && v->t == BOOL ? v->b : def; }
-};
-struct JsonParser {
-    const std::string& j; size_t p = 0; bool ok = true;
-    explicit JsonParser(const std::string& s) : j(s) {}
-    void ws() { while (p < j.size() && strchr(" \t\r\n", j[p])) p++; }
-    Json parse() {
-        ws(); Json v;
-        if (p >= j.size()) { ok = false; return v; }
-        char c = j[p];
-        if (c == '{') {
-            v.t = Json::OBJ; p++; ws();
-            if (p < j.size() && j[p] == '}') { p++; return v; }
-            while (ok) {
-                ws(); if (p >= j.size() || j[p] != '"') { ok = false; break; }
-                std::string k = str(); ws();
-                if (p >= j.size() || j[p] != ':') { ok = false; break; }
-                p++; v.o[k] = parse(); ws();
-                if (p < j.size() && j[p] == ',') { p++; continue; }
-                if (p < j.size() && j[p] == '}') { p++; break; }
-                ok = false;
-            }
-        } else if (c == '[') {
-            v.t = Json::ARR; p++; ws();
-            if (p < j.size() && j[p] == ']') { p++; return v; }
-            while (ok) {
-                v.a.push_back(parse()); ws();
-                if (p < j.size() && j[p] == ',') { p++; continue; }
-                if (p < j.size() && j[p] == ']') { p++; break; }
-                ok = false;
-            }
-        } else if (c == '"') { v.t = Json::STR; v.s = str(); }
-        else if (!j.compare(p, 4, "true")) { v.t = Json::BOOL; v.b = true; p += 4; }
-        else if (!j.compare(p, 5, "false")) { v.t = Json::BOOL; p += 5; }
-        else if (!j.compare(p, 4, "null")) { p += 4; }
-        else { char* e; v.t = Json::NUM; v.n = strtod(j.c_str() + p, &e); if (e == j.c_str() + p) ok = false; p = e - j.c_str(); }
-        return v;
-    }
-    std::string str() {
-        std::string o; p++;
-        while (p < j.size() && j[p] != '"') {
-            char c = j[p++];
-            if (c != '\\') { o += c; continue; }
-            if (p >= j.size()) break;
-            char e = j[p++];
-            if (e == 'n') o += '\n'; else if (e == 't') o += '\t'; else if (e == 'r') o += '\r';
-            else if (e == 'b') o += '\b'; else if (e == 'f') o += '\f';
-            else if (e == 'u' && p + 4 <= j.size()) {
-                uint32_t cp = (uint32_t)strtoul(j.substr(p, 4).c_str(), nullptr, 16); p += 4;
-                if (cp >= 0xD800 && cp < 0xDC00 && p + 6 <= j.size() && j[p] == '\\' && j[p + 1] == 'u') {
-                    cp = 0x10000 + ((cp - 0xD800) << 10) + ((uint32_t)strtoul(j.substr(p + 2, 4).c_str(), nullptr, 16) - 0xDC00); p += 6;
-                }
-                if (cp < 0x80) o += (char)cp;
-                else if (cp < 0x800) { o += (char)(0xC0 | cp >> 6); o += (char)(0x80 | (cp & 63)); }
-                else if (cp < 0x10000) { o += (char)(0xE0 | cp >> 12); o += (char)(0x80 | (cp >> 6 & 63)); o += (char)(0x80 | (cp & 63)); }
-                else { o += (char)(0xF0 | cp >> 18); o += (char)(0x80 | (cp >> 12 & 63)); o += (char)(0x80 | (cp >> 6 & 63)); o += (char)(0x80 | (cp & 63)); }
-            } else o += e;
-        }
-        p++;
-        return o;
-    }
-};
-static std::string jesc(const std::string& s) {
-    std::string o;
-    for (unsigned char c : s) {
-        if (c == '"') o += "\\\""; else if (c == '\\') o += "\\\\"; else if (c == '\n') o += "\\n"; else if (c == '\r') o += "\\r";
-        else if (c == '\t') o += "\\t"; else if (c < 0x20) { char b[8]; snprintf(b, sizeof b, "\\u%04x", c); o += b; } else o += (char)c;
-    }
-    return o;
-}
 
 // ---- HTTP ----
 static bool send_all(SOCKET c, const std::string& s) {
@@ -109,6 +34,327 @@ static void respond(SOCKET c, int code, const std::string& type, const std::stri
     const char* msg = code == 200 ? "OK" : code == 400 ? "Bad Request" : code == 404 ? "Not Found" : "Error";
     send_all(c, "HTTP/1.1 " + std::to_string(code) + " " + msg + "\r\nContent-Type: " + type + "\r\nContent-Length: " +
                 std::to_string(body.size()) + "\r\n" + CORS + "Connection: close\r\n\r\n" + body);
+}
+static void start_sse(SOCKET c) {
+    send_all(c, std::string("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\n") + CORS + "Connection: close\r\n\r\n");
+}
+
+// MOEX_DUMP_PROMPT=file: write each rendered prompt's ids there (tools/check_template.py compares them with the template)
+static void dump_prompt(const std::vector<int>& ids) {
+    const char* f = getenv("MOEX_DUMP_PROMPT");
+    if (!f) return;
+    if (FILE* o = fopen(f, "wb")) { for (size_t i = 0; i < ids.size(); i++) fprintf(o, i ? ",%d" : "%d", ids[i]); fclose(o); }
+}
+
+// ---- one generation, whichever API asked ----
+struct GenReq {
+    std::vector<ChatMsg> msgs;
+    std::vector<Json> tools;  // OpenAI form: {"type":"function","function":{"name","description","parameters"}}
+    std::vector<std::string> stops;
+    int max_new = 2048;
+    bool think = false;
+    Engine::Sampling sp;
+    const char* id_prefix = "call_";
+};
+struct GenOut {
+    std::string reasoning, content, stop_seq, error;
+    std::vector<ToolCall> calls;
+    size_t prompt_n = 0, gen_n = 0;
+    bool hit_stop = false, length = false;
+};
+
+// Thinking goes to on_reason, the answer to on_content (both return false once the client is gone). Tool calls are
+// parsed at the end; the answer text before them streams, minus trailing whitespace. Stop strings apply to the answer.
+static GenOut run_request(Session& ss, Tokenizer& tk, const GenReq& q, const std::function<void(size_t)>& on_start,
+                          const std::function<bool(const std::string&)>& on_reason, const std::function<bool(const std::string&)>& on_content) {
+    GenOut g;
+    ss.think = q.think;
+    ss.eng.samp = q.sp;
+    if (q.sp.seed) ss.eng.rng.seed(q.sp.seed);
+    auto prompt = ss.render(q.msgs, q.tools);
+    dump_prompt(prompt);
+    g.prompt_n = prompt.size();
+    if ((int)prompt.size() + 1 >= ss.eng.ctx) {
+        g.error = "the prompt is " + std::to_string(prompt.size()) + " tokens, more than the context (" + std::to_string(ss.eng.ctx) +
+                  "): restart moex serve with a larger --ctx, e.g. --ctx 32768";
+        fprintf(stderr, "[serve] %s\n", g.error.c_str());
+        return g;
+    }
+    on_start(prompt.size());
+    const bool tools = !q.tools.empty();
+    Utf8Stream us; ThinkSplit split(q.think); CallSplit cs;
+    bool alive = true; size_t sent = 0;
+    size_t hold = 0; for (auto& s : q.stops) hold = std::max(hold, s.size() - 1);
+    auto feed = [&](const std::string& piece, bool last) {
+        std::string rd, ad;
+        split.push(piece, rd, ad, last);
+        if (!rd.empty()) { g.reasoning += rd; if (alive) alive = on_reason(rd); }
+        if (tools) cs.push(ad, g.content, last); else g.content += ad;
+        if (!g.hit_stop)
+            for (auto& s : q.stops) {
+                size_t k = g.content.find(s);
+                if (k != std::string::npos) { g.content.resize(k); g.hit_stop = true; g.stop_seq = s; break; }
+            }
+        size_t can;
+        if (cs.in_calls) {  // the text before a tool call ends here: drop its trailing whitespace
+            while (g.content.size() > sent && strchr(" \t\r\n", g.content.back())) g.content.pop_back();
+            can = g.content.size();
+        } else if (g.hit_stop || last) can = g.content.size();
+        else {
+            can = g.content.size() > hold ? g.content.size() - hold : 0;  // a tail that could still become a stop string
+            if (tools) while (can > sent && strchr(" \t\r\n", g.content[can - 1])) can--;  // whitespace that may precede a tool call
+        }
+        if (alive && can > sent) { alive = on_content(g.content.substr(sent, can - sent)); sent = can; }
+    };
+    const double t0 = now();
+    auto out = ss.generate(prompt, q.max_new, [&](int t) {
+        feed(us.push(tk.piece(t)), false);
+        return alive && !g.hit_stop;
+    });
+    if (!g.hit_stop) feed(us.held, true);
+    if (cs.in_calls) g.calls = parse_tool_calls(cs.calls, q.tools, q.id_prefix);
+    g.gen_n = out.size();
+    g.length = !g.hit_stop && (int)out.size() >= q.max_new;
+    ss.remember(Session::key_of(g.content, g.calls), out);
+    ss.eng.save_hot();
+    fprintf(stderr, "[serve] %zu prompt tokens, %zu generated%s, %.1f s, %.1f tok/s overall\n", prompt.size(), out.size(),
+            g.calls.empty() ? "" : (", " + std::to_string(g.calls.size()) + " tool call(s)").c_str(), now() - t0,
+            out.size() / std::max(now() - t0, 1e-9));
+    return g;
+}
+
+// Sampling defaults: Qwen's recommendations for thinking / not thinking, unless the request says.
+static Engine::Sampling sampling_of(const Json& r, bool think) {
+    Engine::Sampling sp;
+    sp.temp = (float)r.num("temperature", think ? 1.0 : 0.7);
+    sp.top_p = (float)r.num("top_p", think ? 0.95 : 0.8);
+    sp.top_k = (int)r.num("top_k", 20);
+    sp.rep = (float)r.num("repetition_penalty", 1.0);
+    sp.seed = (uint64_t)r.num("seed", 0);
+    return sp;
+}
+static std::string text_of(const Json* co) {  // a string, or the text parts of a content array
+    std::string s;
+    if (co && co->t == Json::STR) s = co->s;
+    else if (co && co->t == Json::ARR)
+        for (auto& part : co->a) {
+            if (part.t == Json::STR) s += part.s;
+            else if (auto tx = part.get("text")) if (tx->t == Json::STR) s += tx->s;
+        }
+    return s;
+}
+static std::vector<std::string> strings_of(const Json* st) {
+    std::vector<std::string> v;
+    if (st && st->t == Json::STR) v.push_back(st->s);
+    else if (st && st->t == Json::ARR) for (auto& x : st->a) if (x.t == Json::STR) v.push_back(x.s);
+    v.erase(std::remove(v.begin(), v.end(), std::string()), v.end());
+    return v;
+}
+static std::string rand_id(const char* prefix) { return new_call_id(prefix); }
+
+// ---- OpenAI: POST /v1/chat/completions ----
+static bool openai_request(const Json& r, bool think_default, GenReq& q, std::string& err) {
+    const Json* msgs = r.get("messages");
+    if (!msgs || msgs->t != Json::ARR || msgs->a.empty()) { err = "messages missing or invalid JSON"; return false; }
+    for (auto& x : msgs->a) {
+        ChatMsg cm;
+        cm.role = x.str("role", "user");
+        if (cm.role == "developer") cm.role = "system";
+        cm.content = text_of(x.get("content"));
+        for (const char* k : {"reasoning_content", "reasoning"})
+            if (auto rc = x.get(k)) if (rc->t == Json::STR) { cm.reasoning = rc->s; cm.has_reasoning = true; break; }
+        if (auto tcs = x.get("tool_calls")) if (tcs->t == Json::ARR)
+            for (auto& t : tcs->a) {
+                ToolCall tc; tc.id = t.str("id"); tc.args = Json::object();
+                const Json* f = t.get("function"); if (!f) continue;
+                tc.name = f->str("name");
+                if (auto a = f->get("arguments")) {
+                    if (a->t == Json::OBJ) tc.args = *a;
+                    else if (a->t == Json::STR) { JsonParser jp(a->s); Json v = jp.parse(); if (jp.done() && v.t == Json::OBJ) tc.args = v; }
+                }
+                cm.tool_calls.push_back(tc);
+            }
+        q.msgs.push_back(cm);
+    }
+    if (auto t = r.get("tools")) if (t->t == Json::ARR) for (auto& x : t->a) if (x.get("function")) q.tools.push_back(x);
+    if (auto tc = r.get("tool_choice")) if (tc->t == Json::STR && tc->s == "none") q.tools.clear();
+    // thinking: chat_template_kwargs.enable_thinking, else reasoning_effort ("none" = off), else `serve --think`
+    auto kw = r.get("chat_template_kwargs");
+    auto re = r.get("reasoning_effort");
+    q.think = kw && kw->get("enable_thinking") ? kw->boolean("enable_thinking", think_default)
+            : re && re->t == Json::STR ? re->s != "none"
+            : think_default;
+    q.max_new = (int)r.num("max_completion_tokens", r.num("max_tokens", 2048));
+    q.stops = strings_of(r.get("stop"));
+    q.sp = sampling_of(r, q.think);
+    q.id_prefix = "call_";
+    return true;
+}
+static Json openai_tool_call(const ToolCall& tc, int index) {
+    Json f = Json::object(); f.set("name", Json::string(tc.name)).set("arguments", Json::string(tc.args.dump()));
+    Json j = Json::object();
+    if (index >= 0) { Json ix; ix.t = Json::NUM; ix.s = std::to_string(index); j.set("index", ix); }
+    j.set("id", Json::string(tc.id)).set("type", Json::string("function")).set("function", f);
+    return j;
+}
+static void openai_serve(SOCKET c, Session& ss, Tokenizer& tk, const Json& r, bool think_default, const std::string& model_id) {
+    GenReq q; std::string err;
+    if (!openai_request(r, think_default, q, err)) { respond(c, 400, "application/json", "{\"error\":{\"message\":\"" + jesc(err) + "\"}}"); return; }
+    const bool stream = r.boolean("stream", false);
+    const std::string id = rand_id("chatcmpl-");
+    const std::string created = std::to_string((long long)time(nullptr));
+    auto chunk = [&](const std::string& delta, const std::string& finish) {
+        return "data: {\"id\":\"" + id + "\",\"object\":\"chat.completion.chunk\",\"created\":" + created + ",\"model\":\"" +
+               jesc(model_id) + "\",\"choices\":[{\"index\":0,\"delta\":" + delta + ",\"finish_reason\":" +
+               (finish.empty() ? "null" : "\"" + finish + "\"") + "}]}\n\n";
+    };
+    auto field = [&](const char* k, const std::string& v) { return "{\"" + std::string(k) + "\":\"" + jesc(v) + "\"}"; };
+    GenOut g = run_request(ss, tk, q,
+        [&](size_t) { if (stream) { start_sse(c); send_all(c, chunk("{\"role\":\"assistant\",\"content\":\"\"}", "")); } },
+        [&](const std::string& d) { return !stream || send_all(c, chunk(field("reasoning_content", d), "")); },
+        [&](const std::string& d) { return !stream || send_all(c, chunk(field("content", d), "")); });
+    if (!g.error.empty()) { respond(c, 400, "application/json", "{\"error\":{\"message\":\"" + jesc(g.error) + "\"}}"); return; }
+    const std::string finish = !g.calls.empty() ? "tool_calls" : g.length ? "length" : "stop";
+    if (stream) {
+        for (size_t i = 0; i < g.calls.size(); i++)
+            send_all(c, chunk("{\"tool_calls\":[" + openai_tool_call(g.calls[i], (int)i).dump() + "]}", ""));
+        send_all(c, chunk("{}", finish));
+        send_all(c, "data: [DONE]\n\n");
+        return;
+    }
+    std::string msg = "{\"role\":\"assistant\",\"content\":" + (g.content.empty() && !g.calls.empty() ? std::string("null") : "\"" + jesc(g.content) + "\"");
+    if (!g.reasoning.empty()) msg += ",\"reasoning_content\":\"" + jesc(g.reasoning) + "\"";
+    if (!g.calls.empty()) {
+        msg += ",\"tool_calls\":[";
+        for (size_t i = 0; i < g.calls.size(); i++) msg += (i ? "," : "") + openai_tool_call(g.calls[i], -1).dump();
+        msg += "]";
+    }
+    msg += "}";
+    respond(c, 200, "application/json",
+            "{\"id\":\"" + id + "\",\"object\":\"chat.completion\",\"created\":" + created + ",\"model\":\"" + jesc(model_id) +
+            "\",\"choices\":[{\"index\":0,\"message\":" + msg + ",\"finish_reason\":\"" + finish + "\"}],\"usage\":{\"prompt_tokens\":" +
+            std::to_string(g.prompt_n) + ",\"completion_tokens\":" + std::to_string(g.gen_n) + ",\"total_tokens\":" +
+            std::to_string(g.prompt_n + g.gen_n) + "}}");
+}
+
+// ---- Anthropic: POST /v1/messages ----
+static bool anthropic_request(const Json& r, bool think_default, GenReq& q, std::string& err) {
+    const Json* msgs = r.get("messages");
+    if (!msgs || msgs->t != Json::ARR || msgs->a.empty()) { err = "messages missing or invalid JSON"; return false; }
+    if (auto s = r.get("system")) { std::string t = text_of(s); if (!t.empty()) q.msgs.push_back({"system", t}); }
+    for (auto& x : msgs->a) {
+        const std::string role = x.str("role", "user");
+        const Json* co = x.get("content");
+        if (!co || co->t != Json::ARR) { q.msgs.push_back({role, text_of(co)}); continue; }
+        if (role == "assistant") {
+            ChatMsg cm; cm.role = "assistant";
+            for (auto& b : co->a) {
+                const std::string ty = b.str("type");
+                if (ty == "text") cm.content += b.str("text");
+                else if (ty == "thinking") { cm.reasoning += b.str("thinking"); cm.has_reasoning = true; }
+                else if (ty == "tool_use") {
+                    ToolCall tc; tc.id = b.str("id"); tc.name = b.str("name"); tc.args = Json::object();
+                    if (auto in = b.get("input")) if (in->t == Json::OBJ) tc.args = *in;
+                    cm.tool_calls.push_back(tc);
+                }
+            }
+            q.msgs.push_back(cm);
+        } else {  // tool results become tool messages (in order), the rest of the text one user message after them
+            std::string text;
+            for (auto& b : co->a) {
+                const std::string ty = b.str("type");
+                if (ty == "tool_result") {
+                    std::string t = text_of(b.get("content"));
+                    if (b.boolean("is_error", false)) t = "Error: " + t;
+                    q.msgs.push_back({"tool", t});
+                } else if (ty == "text") text += b.str("text");
+            }
+            if (!trim(text).empty() || q.msgs.empty() || q.msgs.back().role != "tool") q.msgs.push_back({"user", text});
+        }
+    }
+    if (auto t = r.get("tools")) if (t->t == Json::ARR)
+        for (auto& x : t->a) {
+            if (x.str("name").empty() || !x.get("input_schema")) continue;  // server tools (web search, ...) can't run here
+            Json f = Json::object();
+            f.set("name", Json::string(x.str("name")));
+            if (auto d = x.get("description")) f.set("description", *d);
+            f.set("parameters", *x.get("input_schema"));
+            Json tool = Json::object(); tool.set("type", Json::string("function")).set("function", f);
+            q.tools.push_back(tool);
+        }
+    if (auto tc = r.get("tool_choice")) if (tc->str("type") == "none") q.tools.clear();
+    const Json* th = r.get("thinking");
+    q.think = th && th->get("type") ? th->str("type") != "disabled" : think_default;
+    q.max_new = (int)r.num("max_tokens", 4096);
+    q.stops = strings_of(r.get("stop_sequences"));
+    q.sp = sampling_of(r, q.think);
+    q.id_prefix = "toolu_";
+    return true;
+}
+static std::string anthropic_error(const std::string& m) {
+    return "{\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"" + jesc(m) + "\"}}";
+}
+static void anthropic_serve(SOCKET c, Session& ss, Tokenizer& tk, const Json& r, bool think_default, const std::string& model_id) {
+    GenReq q; std::string err;
+    if (!anthropic_request(r, think_default, q, err)) { respond(c, 400, "application/json", anthropic_error(err)); return; }
+    const bool stream = r.boolean("stream", false);
+    const std::string id = rand_id("msg_"), model = r.str("model", model_id);
+    auto ev = [&](const char* type, const std::string& data) { return send_all(c, std::string("event: ") + type + "\ndata: " + data + "\n\n"); };
+    int block = -1; std::string open;  // the content block being streamed: its index and type
+    auto close_block = [&] {
+        if (!open.empty()) ev("content_block_stop", "{\"type\":\"content_block_stop\",\"index\":" + std::to_string(block) + "}");
+        open.clear();
+    };
+    auto delta = [&](const std::string& type, const std::string& d) {  // type: thinking or text
+        if (open != type) {
+            close_block();
+            open = type; block++;
+            ev("content_block_start", "{\"type\":\"content_block_start\",\"index\":" + std::to_string(block) +
+                ",\"content_block\":{\"type\":\"" + type + "\",\"" + type + "\":\"\"}}");
+        }
+        return ev("content_block_delta", "{\"type\":\"content_block_delta\",\"index\":" + std::to_string(block) +
+                  ",\"delta\":{\"type\":\"" + type + "_delta\",\"" + type + "\":\"" + jesc(d) + "\"}}");
+    };
+    GenOut g = run_request(ss, tk, q,
+        [&](size_t n) {
+            if (!stream) return;
+            start_sse(c);
+            ev("message_start", "{\"type\":\"message_start\",\"message\":{\"id\":\"" + id + "\",\"type\":\"message\",\"role\":\"assistant\","
+               "\"content\":[],\"model\":\"" + jesc(model) + "\",\"stop_reason\":null,\"stop_sequence\":null,\"usage\":{\"input_tokens\":" +
+               std::to_string(n) + ",\"output_tokens\":0}}}");
+        },
+        [&](const std::string& d) { return !stream || delta("thinking", d); },
+        [&](const std::string& d) { return !stream || delta("text", d); });
+    if (!g.error.empty()) { respond(c, 400, "application/json", anthropic_error(g.error)); return; }
+    const std::string stop = !g.calls.empty() ? "tool_use" : g.hit_stop ? "stop_sequence" : g.length ? "max_tokens" : "end_turn";
+    const std::string stop_seq = g.hit_stop ? "\"" + jesc(g.stop_seq) + "\"" : "null";
+    auto tool_block = [&](const ToolCall& tc, bool with_input) {
+        return "{\"type\":\"tool_use\",\"id\":\"" + tc.id + "\",\"name\":\"" + jesc(tc.name) + "\",\"input\":" + (with_input ? tc.args.dump() : "{}") + "}";
+    };
+    if (stream) {
+        for (auto& tc : g.calls) {
+            close_block();
+            block++; open = "tool_use";
+            ev("content_block_start", "{\"type\":\"content_block_start\",\"index\":" + std::to_string(block) + ",\"content_block\":" + tool_block(tc, false) + "}");
+            ev("content_block_delta", "{\"type\":\"content_block_delta\",\"index\":" + std::to_string(block) +
+               ",\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"" + jesc(tc.args.dump()) + "\"}}");
+        }
+        close_block();
+        ev("message_delta", "{\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"" + stop + "\",\"stop_sequence\":" + stop_seq +
+           "},\"usage\":{\"output_tokens\":" + std::to_string(g.gen_n) + "}}");
+        ev("message_stop", "{\"type\":\"message_stop\"}");
+        return;
+    }
+    std::string content = "[";
+    auto add = [&](const std::string& b) { content += (content.size() > 1 ? "," : "") + b; };
+    if (!g.reasoning.empty()) add("{\"type\":\"thinking\",\"thinking\":\"" + jesc(g.reasoning) + "\",\"signature\":\"\"}");
+    if (!g.content.empty()) add("{\"type\":\"text\",\"text\":\"" + jesc(g.content) + "\"}");
+    for (auto& tc : g.calls) add(tool_block(tc, true));
+    content += "]";
+    respond(c, 200, "application/json",
+            "{\"id\":\"" + id + "\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"" + jesc(model) + "\",\"content\":" + content +
+            ",\"stop_reason\":\"" + stop + "\",\"stop_sequence\":" + stop_seq + ",\"usage\":{\"input_tokens\":" + std::to_string(g.prompt_n) +
+            ",\"output_tokens\":" + std::to_string(g.gen_n) + "}}");
 }
 
 static void serve(Session& ss, Tokenizer& tk, const std::string& host, int port, const std::string& model_id) {
@@ -130,19 +376,23 @@ static void serve(Session& ss, Tokenizer& tk, const std::string& host, int port,
                                    "print(c.chat.completions.create(model=\"" + model_id + "\", messages=[{\"role\": \"user\", \"content\": \"Hello!\"}]).choices[0].message.content)";
     // GET /api (and /): what this server offers and how to call it
     const std::string api_help = "{\"server\":\"moex\",\"model\":\"" + jesc(model_id) + "\",\"base_url\":\"" + jesc(base) + "/v1\",\"api_key\":\"any\","
-        "\"endpoints\":{\"POST /v1/chat/completions\":\"OpenAI chat completions; set \\\"stream\\\": true for streaming. Also: temperature, top_p, top_k, "
-        "seed, stop, max_tokens; thinking: chat_template_kwargs.enable_thinking or reasoning_effort (default: serve --think), sent as reasoning_content, the answer as content\",\"GET /v1/models\":\"the model id\",\"GET /health\":\"{\\\"status\\\":\\\"ok\\\"}\","
-        "\"GET /api\":\"this page\"},\"examples\":{\"powershell\":\"" + jesc(ps_example) + "\",\"python\":\"" + jesc(py_example) + "\"}}";
+        "\"endpoints\":{\"POST /v1/chat/completions\":\"OpenAI chat completions; \\\"stream\\\": true for streaming. Also: tools (tool_calls back), "
+        "temperature, top_p, top_k, seed, stop, max_tokens; thinking: chat_template_kwargs.enable_thinking or reasoning_effort (default: serve --think), "
+        "sent as reasoning_content, the answer as content\",\"POST /v1/messages\":\"Anthropic Messages API: system, tools (tool_use / tool_result), "
+        "thinking, stop_sequences, streaming\",\"POST /v1/messages/count_tokens\":\"prompt size in tokens\",\"GET /v1/models\":\"the model id\","
+        "\"GET /health\":\"{\\\"status\\\":\\\"ok\\\"}\",\"GET /api\":\"this page\"},\"examples\":{\"powershell\":\"" + jesc(ps_example) +
+        "\",\"python\":\"" + jesc(py_example) + "\"}}";
     fprintf(stderr,
-            "\n[serve] moex is serving %s - OpenAI-compatible API\n"
+            "\n[serve] moex is serving %s - OpenAI- and Anthropic-compatible API\n"
             "  Base URL:   %s/v1   (model \"%s\", any API key)\n"
-            "  Endpoints:  POST /v1/chat/completions   GET /v1/models   GET /health   GET /api (help)\n"
+            "  Endpoints:  POST /v1/chat/completions   POST /v1/messages   GET /v1/models   GET /health   GET /api (help)\n"
             "  Try it in PowerShell:\n    %s\n"
             "  Python (pip install openai):\n    %s\n"
             "  Open WebUI, editors and other apps: add an OpenAI-compatible connection with the base URL above.\n"
+            "  Apps for Anthropic's API: base URL %s. Coding agents need a long context: --ctx 32768 (now %d).\n"
             "  %s\n"
             "  Ctrl+C stops the server.\n\n",
-            model_id.c_str(), base.c_str(), model_id.c_str(), ps_example.c_str(), py_example.c_str(),
+            model_id.c_str(), base.c_str(), model_id.c_str(), ps_example.c_str(), py_example.c_str(), base.c_str(), ss.eng.ctx,
             host == "127.0.0.1" ? "Only this PC can connect (--host 0.0.0.0 opens it to your network)." : "Other devices on your network can connect too.");
     while (true) {
         SOCKET c = accept(ls, nullptr, nullptr);
@@ -165,90 +415,24 @@ static void serve(Session& ss, Tokenizer& tk, const std::string& host, int port,
         std::string method = req.substr(0, req.find(' '));
         size_t ps = req.find(' ') + 1;
         std::string path = req.substr(ps, req.find(' ', ps) - ps);
+        path = path.substr(0, path.find('?'));  // e.g. /v1/messages?beta=true
         std::string body = hdr_end == std::string::npos ? "" : req.substr(hdr_end + 4);
         if (method == "OPTIONS") { respond(c, 200, "text/plain", ""); }
         else if (method == "GET" && path == "/health") respond(c, 200, "application/json", "{\"status\":\"ok\"}");
         else if (method == "GET" && (path == "/api" || path == "/")) respond(c, 200, "application/json", api_help);
         else if (method == "GET" && path == "/v1/models")
-            respond(c, 200, "application/json", "{\"object\":\"list\",\"data\":[{\"id\":\"" + jesc(model_id) + "\",\"object\":\"model\",\"owned_by\":\"moex\"}]}");
-        else if (method == "POST" && path == "/v1/chat/completions") {
+            respond(c, 200, "application/json", "{\"object\":\"list\",\"data\":[{\"id\":\"" + jesc(model_id) + "\",\"object\":\"model\",\"owned_by\":\"moex\","
+                    "\"type\":\"model\",\"display_name\":\"" + jesc(model_id) + "\"}]}");
+        else if (method == "POST" && (path == "/v1/chat/completions" || path == "/v1/messages" || path == "/v1/messages/count_tokens")) {
             JsonParser jp(body); Json r = jp.parse();
-            const Json* msgs = r.get("messages");
-            if (!jp.ok || !msgs || msgs->t != Json::ARR || msgs->a.empty()) { respond(c, 400, "application/json", "{\"error\":{\"message\":\"messages missing or invalid JSON\"}}"); closesocket(c); continue; }
-            std::vector<ChatMsg> m;
-            for (auto& x : msgs->a) {
-                ChatMsg cm; auto ro = x.get("role"), co = x.get("content");
-                cm.role = ro && ro->t == Json::STR ? ro->s : "user";
-                if (co && co->t == Json::STR) cm.content = co->s;
-                else if (co && co->t == Json::ARR)  // content parts: keep the text ones
-                    for (auto& part : co->a) { auto tx = part.get("text"); if (tx && tx->t == Json::STR) cm.content += tx->s; }
-                m.push_back(cm);
-            }
-            const bool stream = r.boolean("stream", false);
-            int max_new = (int)r.num("max_completion_tokens", r.num("max_tokens", 2048));
-            // thinking: chat_template_kwargs.enable_thinking, else reasoning_effort ("none" = off), else `serve --think`
-            auto kw = r.get("chat_template_kwargs");
-            auto re = r.get("reasoning_effort");
-            ss.think = kw && kw->get("enable_thinking") ? kw->boolean("enable_thinking", think_default)
-                     : re && re->t == Json::STR ? re->s != "none"
-                     : think_default;
-            Engine::Sampling sp;
-            sp.temp = (float)r.num("temperature", ss.think ? 1.0 : 0.7);
-            sp.top_p = (float)r.num("top_p", ss.think ? 0.95 : 0.8);
-            sp.top_k = (int)r.num("top_k", 20);
-            sp.rep = (float)r.num("repetition_penalty", 1.0);
-            sp.seed = (uint64_t)r.num("seed", 0);
-            if (sp.seed) ss.eng.rng.seed(sp.seed);
-            ss.eng.samp = sp;
-            std::vector<std::string> stops;
-            if (auto st = r.get("stop")) { if (st->t == Json::STR) stops.push_back(st->s); else for (auto& x : st->a) if (x.t == Json::STR) stops.push_back(x.s); }
-            stops.erase(std::remove(stops.begin(), stops.end(), std::string()), stops.end());
-            const std::string id = "chatcmpl-" + std::to_string((long long)time(nullptr)) + std::to_string(rand());
-            const long long created = (long long)time(nullptr);
-            auto prompt = ss.render(m);
-            if (stream) send_all(c, std::string("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\n") + CORS + "Connection: close\r\n\r\n");
-            auto chunk = [&](const std::string& delta, const char* finish, const char* field = "content") {
-                std::string d = finish ? "{}" : "{\"" + std::string(field) + "\":\"" + jesc(delta) + "\"}";
-                return "data: {\"id\":\"" + id + "\",\"object\":\"chat.completion.chunk\",\"created\":" + std::to_string(created) +
-                       ",\"model\":\"" + jesc(model_id) + "\",\"choices\":[{\"index\":0,\"delta\":" + d + ",\"finish_reason\":" +
-                       (finish ? "\"" + std::string(finish) + "\"" : "null") + "}]}\n\n";
-            };
-            // the thinking goes out as reasoning_content (as llama.cpp, vLLM and DeepSeek send it: Open WebUI and other
-            // clients show it as a thinking section), the answer as content; stop strings apply to the answer only
-            Utf8Stream us; ThinkSplit split(ss.think); std::string text, reasoning; bool alive = true, hit_stop = false; size_t sent = 0;
-            auto feed = [&](const std::string& piece, bool last) {
-                std::string rd, ad;
-                split.push(piece, rd, ad, last);
-                if (!rd.empty()) { reasoning += rd; if (stream && alive) alive = send_all(c, chunk(rd, nullptr, "reasoning_content")); }
-                text += ad;
-                for (auto& s : stops) { size_t k = text.find(s); if (k != std::string::npos) { text.resize(k); hit_stop = true; } }
-                // hold back a tail that could still become a stop string
-                size_t hold = 0; for (auto& s : stops) hold = std::max(hold, s.size() - 1);
-                size_t can = hit_stop || last ? text.size() : (text.size() > hold ? text.size() - hold : 0);
-                if (stream && alive && can > sent) { alive = send_all(c, chunk(text.substr(sent, can - sent), nullptr)); sent = can; }
-            };
-            const double t0 = now();
-            auto out = ss.generate(prompt, max_new, [&](int t) {
-                feed(us.push(tk.piece(t)), false);
-                return alive && !hit_stop;
-            });
-            if (!hit_stop) feed(us.held, true);
-            ss.remember(text, out);
-            ss.eng.save_hot();
-            fprintf(stderr, "[serve] %zu prompt tokens, %zu generated, %.1f s, %.1f tok/s overall\n", prompt.size(), out.size(), now() - t0,
-                    out.size() / std::max(now() - t0, 1e-9));
-            const char* finish = hit_stop || (int)out.size() < max_new ? "stop" : "length";
-            if (stream) {
-                if (alive && text.size() > sent) send_all(c, chunk(text.substr(sent), nullptr));
-                send_all(c, chunk("", finish));
-                send_all(c, "data: [DONE]\n\n");
-            } else {
-                respond(c, 200, "application/json",
-                        "{\"id\":\"" + id + "\",\"object\":\"chat.completion\",\"created\":" + std::to_string(created) + ",\"model\":\"" +
-                        jesc(model_id) + "\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"" + jesc(text) + "\"" +
-                        (reasoning.empty() ? "" : ",\"reasoning_content\":\"" + jesc(reasoning) + "\"") +
-                        "},\"finish_reason\":\"" + finish + "\"}],\"usage\":{\"prompt_tokens\":" + std::to_string(prompt.size()) +
-                        ",\"completion_tokens\":" + std::to_string(out.size()) + ",\"total_tokens\":" + std::to_string(prompt.size() + out.size()) + "}}");
+            const bool anth = path != "/v1/chat/completions";
+            if (!jp.ok || r.t != Json::OBJ) respond(c, 400, "application/json", anth ? anthropic_error("invalid JSON") : "{\"error\":{\"message\":\"invalid JSON\"}}");
+            else if (path == "/v1/chat/completions") openai_serve(c, ss, tk, r, think_default, model_id);
+            else if (path == "/v1/messages") anthropic_serve(c, ss, tk, r, think_default, model_id);
+            else {  // count_tokens
+                GenReq q; std::string err;
+                if (!anthropic_request(r, think_default, q, err)) respond(c, 400, "application/json", anthropic_error(err));
+                else { ss.think = q.think; auto ids = ss.render(q.msgs, q.tools); dump_prompt(ids); respond(c, 200, "application/json", "{\"input_tokens\":" + std::to_string(ids.size()) + "}"); }
             }
         } else respond(c, 404, "application/json", "{\"error\":{\"message\":\"not found\"}}");
         closesocket(c);
