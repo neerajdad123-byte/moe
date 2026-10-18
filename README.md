@@ -124,16 +124,26 @@ Type a message and press Enter. `/reset` starts a new conversation, `/exit` quit
 moex serve --load
 ```
 
-This starts an OpenAI-compatible API at `http://127.0.0.1:8765/v1` and prints how to use it. Point any
-OpenAI-compatible app at it (Open WebUI, editor plugins, the `openai` Python package, ...): model `qwen3.6-35b-a3b`, any
-API key.
+This starts an API at `http://127.0.0.1:8765/v1` that speaks both OpenAI's and Anthropic's formats, and prints how to
+use it. Point any OpenAI-compatible app at it (Open WebUI, editor plugins, agents, the `openai` Python package, ...):
+model `qwen3.6-35b-a3b`, any API key. Apps built for Anthropic's API use the base URL `http://127.0.0.1:8765`.
 
 | Endpoint | |
 |---|---|
-| `POST /v1/chat/completions` | chat, streaming with `"stream": true` |
+| `POST /v1/chat/completions` | chat, streaming with `"stream": true`, tool calling (`tools` in, `tool_calls` out) |
+| `POST /v1/messages` | Anthropic Messages API: system, tools (`tool_use` / `tool_result`), thinking, streaming |
+| `POST /v1/messages/count_tokens` | prompt size in tokens (Anthropic format) |
+| `POST /v1/completions` | raw text completion without the chat template (editor autocomplete) |
 | `GET /v1/models` | the model id |
 | `GET /api` | what the server offers, with examples (open it in a browser) |
 | `GET /health` | `{"status":"ok"}` |
+
+**Coding agents and tools:** tool calls are parsed from the model's own format and returned in each API's standard
+form, with argument types taken from your tool's JSON schema. Prompts are built exactly as Qwen3.6's official chat
+template builds them (checked token for token by [`tools/check_template.py`](tools/check_template.py)), and the
+official `openai` and `anthropic` Python SDKs run a full call -> result -> answer loop
+([`tools/test_tools.py`](tools/test_tools.py)). Agents send long system prompts and tool lists, so give them room:
+`moex serve --load --ctx 32768` (each 1,000 tokens of context costs ~10 MB of VRAM).
 
 From PowerShell:
 
@@ -151,7 +161,9 @@ for chunk in client.chat.completions.create(model="qwen3.6-35b-a3b", stream=True
     print(chunk.choices[0].delta.content or "", end="")
 ```
 
-Supported: streaming, `temperature`, `top_p`, `top_k`, `seed`, `stop`, `max_tokens`. Thinking: `moex serve --think`
+Supported: streaming (with `stream_options.include_usage`), `temperature`, `top_p`, `top_k`, `seed`, `stop`,
+`max_tokens` (default: until the reply ends or the context is full), `tools`, `tool_choice: "none"`. Not supported:
+`n` > 1, `logprobs`, enforced JSON output (`response_format`). Thinking: `moex serve --think`
 turns it on for every request; a request can still choose with `chat_template_kwargs.enable_thinking` or
 `reasoning_effort` (`"none"` = off). The thinking arrives as `reasoning_content` and the answer as `content`, so Open WebUI
 and other apps show it as a separate thinking section. Apps that resend the whole conversation each turn only pay for
@@ -166,7 +178,8 @@ It listens on your machine only; `--host 0.0.0.0 --port N` changes that.
 | llama.cpp, default settings | 20.3 tokens/s |
 
 - With multi-token prediction (on by default since v0.1.3): ~51 tokens/s on the same laptop.
-- First token after you press Enter: ~0.4-0.9 s. Long documents are read at ~110-140 tokens/s.
+- First token after you press Enter: ~0.4-0.9 s. Long documents are read at ~230-300 tokens/s (4,000-16,000 tokens;
+  ~2x faster since v0.1.4).
 - A 26,500-token conversation still decodes at ~30 tokens/s.
 
 Measured on an RTX 4050 Laptop 6 GB, i7-13650HX, 24 GB RAM: the same model, 10 prompts neither engine had seen, the same
@@ -238,10 +251,12 @@ of Qwen3.6-35B-A3B made by others (see Credits), so it is not identical to the o
 ## Roadmap
 
 - **Linux** release binary (today: build from source).
+- **GGUF support** and **more models:** load the GGUF files people already have, and other mixture-of-experts
+  families (Qwen, DeepSeek, GLM, gpt-oss).
+- **A chat page** in the browser, served by `moex serve`.
 - **Faster dense weights:** a finer 4-bit format for the parts every token reads (most of the time per token).
-- **More models:** other mixture-of-experts families (Qwen, DeepSeek, GLM, gpt-oss).
-- **GGUF support:** load the GGUF files people already have, natively, no conversion.
-- Faster prompt reading, and several conversations at once in `moex serve`.
+- Even faster prompt reading, keeping agents' side requests from evicting the main conversation's cache, and several
+  conversations at once in `moex serve`.
 
 More plans will be announced soon.
 
@@ -260,6 +275,8 @@ model with `build/moex download`, then `build/moex chat --load`.
 | the whole model vs the reference | `build\moex.exe --check ref/eval1` |
 | the tokenizer vs Hugging Face's | `python tools/check_tokenizer.py` |
 | the API | `moex serve`, then `python tools/test_server.py` |
+| tool calling with the official SDKs | `moex serve`, then `python tools/test_tools.py` (`pip install openai anthropic`) |
+| prompts vs Qwen's chat template | `MOEX_DUMP_PROMPT=build\prompt_ids.txt moex serve`, then `python tools/check_template.py` |
 
 ## License and credits
 

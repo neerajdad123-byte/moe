@@ -502,3 +502,16 @@ limit): the int8 KV cache is on in F16 mode too, so the README's "matches to 1e-
 Next, from the 4K run at CH 1024: wall 13.7 s but gpu-wait 0.65 + streaming-wait 3.65 + cpu-experts 0.81 = 5.1 s; the
 other ~8.5 s is host time not yet attributed (per-expert lists, `prefetch_experts`, launches, the MTP-off tail?).
 Profile that first (it is now the largest part), then PF3 (streaming), then try CH 2048.
+
+## moex serve for agents (2026-10-19)
+
+Tool calling (OpenAI tools / tool_calls, Anthropic tool_use / tool_result), Anthropic /v1/messages + count_tokens,
+legacy /v1/completions, stream_options.include_usage, max_tokens default = rest of the context. Prompts are built as
+Qwen3.6's chat_template.jinja (tools/check_template.py: identical tokens on 6 cases). tools/test_tools.py with the
+official SDKs: 17/17. Fixed on the way: `serve --think` was ignored and thinking came back inside content (issue #2):
+now reasoning_content / thinking blocks.
+
+Open: agents send side requests (titles, small checks) with other prompts between main turns. A side generation
+replaces the engine state, so the next main turn re-prefills its whole prompt (20K tokens ~ 70 s at ~300 tok/s).
+Fix idea: snapshot the state (DeltaNet states ~63 MB + the KV rows) at the end of the longest recent prompt into
+pinned RAM, restore it when a request extends that prefix.
