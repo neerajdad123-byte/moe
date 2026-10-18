@@ -50,3 +50,17 @@ with post({"messages": q, "max_tokens": 1500, "seed": 5, "stream": True, "chat_t
         rs += d.get("reasoning_content", ""); ct += d.get("content", "")
 ok = "<think>" not in ct and "</think>" not in ct and len(rs) > 20 and ct.strip() != ""
 print(f"[thinking, stream, history resent, first chunk {first:.2f}s] reasoning {len(rs)} chars | content {ct!r} | {'PASS' if ok else 'FAIL'}")
+
+# stream_options.include_usage: a last chunk with the counts; GET /v1/models/{id}; no max_tokens: until done
+usage = None
+with post({"messages": [{"role": "user", "content": "Say hi."}], "stream": True, "stream_options": {"include_usage": True}, "seed": 3}) as resp:
+    for line in resp:
+        line = line.decode().strip()
+        if line.startswith("data: {"):
+            d = json.loads(line[6:])
+            if d.get("usage"): usage = d["usage"]
+print(f"[include_usage] {usage} | {'PASS' if usage and usage['completion_tokens'] > 0 and usage['prompt_tokens'] > 0 else 'FAIL'}")
+m = json.loads(urllib.request.urlopen(BASE + "/v1/models/qwen3.6-35b-a3b").read())
+print(f"[GET /v1/models/id] {m} | {'PASS' if m.get('context_length') else 'FAIL'}")
+r = json.loads(post({"messages": [{"role": "user", "content": "Write two sentences about rain."}], "seed": 3}).read())
+print(f"[no max_tokens] {r['usage']['completion_tokens']} tokens, finish {r['choices'][0]['finish_reason']} | {'PASS' if r['choices'][0]['finish_reason'] == 'stop' else 'FAIL'}")

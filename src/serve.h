@@ -51,7 +51,7 @@ struct GenReq {
     std::vector<ChatMsg> msgs;
     std::vector<Json> tools;  // OpenAI form: {"type":"function","function":{"name","description","parameters"}}
     std::vector<std::string> stops;
-    int max_new = 2048;
+    int max_new = 0;  // 0: up to the end of the context
     bool think = false;
     Engine::Sampling sp;
     const char* id_prefix = "call_";
@@ -106,15 +106,16 @@ static GenOut run_request(Session& ss, Tokenizer& tk, const GenReq& q, const std
         }
         if (alive && can > sent) { alive = on_content(g.content.substr(sent, can - sent)); sent = can; }
     };
+    const int max_new = q.max_new > 0 ? q.max_new : ss.eng.ctx - (int)prompt.size() - 1;
     const double t0 = now();
-    auto out = ss.generate(prompt, q.max_new, [&](int t) {
+    auto out = ss.generate(prompt, max_new, [&](int t) {
         feed(us.push(tk.piece(t)), false);
         return alive && !g.hit_stop;
     });
     if (!g.hit_stop) feed(us.held, true);
     if (cs.in_calls) g.calls = parse_tool_calls(cs.calls, q.tools, q.id_prefix);
     g.gen_n = out.size();
-    g.length = !g.hit_stop && (int)out.size() >= q.max_new;
+    g.length = !g.hit_stop && ((int)out.size() >= max_new || (int)(prompt.size() + out.size()) + 4 >= ss.eng.ctx);
     ss.remember(Session::key_of(g.content, g.calls), out);
     ss.eng.save_hot();
     fprintf(stderr, "[serve] %zu prompt tokens, %zu generated%s, %.1f s, %.1f tok/s overall\n", prompt.size(), out.size(),
@@ -153,6 +154,10 @@ static std::vector<std::string> strings_of(const Json* st) {
 static std::string rand_id(const char* prefix) { return new_call_id(prefix); }
 
 // ---- OpenAI: POST /v1/chat/completions ----
+static std::string usage_of(const GenOut& g) {
+    return "{\"prompt_tokens\":" + std::to_string(g.prompt_n) + ",\"completion_tokens\":" + std::to_string(g.gen_n) +
+           ",\"total_tokens\":" + std::to_string(g.prompt_n + g.gen_n) + "}";
+}
 static bool openai_request(const Json& r, bool think_default, GenReq& q, std::string& err) {
     const Json* msgs = r.get("messages");
     if (!msgs || msgs->t != Json::ARR || msgs->a.empty()) { err = "messages missing or invalid JSON"; return false; }
@@ -184,7 +189,7 @@ static bool openai_request(const Json& r, bool think_default, GenReq& q, std::st
     q.think = kw && kw->get("enable_thinking") ? kw->boolean("enable_thinking", think_default)
             : re && re->t == Json::STR ? re->s != "none"
             : think_default;
-    q.max_new = (int)r.num("max_completion_tokens", r.num("max_tokens", 2048));
+    q.max_new = (int)r.num("max_completion_tokens", r.num("max_tokens", 0));
     q.stops = strings_of(r.get("stop"));
     q.sp = sampling_of(r, q.think);
     q.id_prefix = "call_";
@@ -219,6 +224,9 @@ static void openai_serve(SOCKET c, Session& ss, Tokenizer& tk, const Json& r, bo
         for (size_t i = 0; i < g.calls.size(); i++)
             send_all(c, chunk("{\"tool_calls\":[" + openai_tool_call(g.calls[i], (int)i).dump() + "]}", ""));
         send_all(c, chunk("{}", finish));
+        if (const Json* so = r.get("stream_options")) if (so->boolean("include_usage", false))  // a last chunk with the counts
+            send_all(c, "data: {\"id\":\"" + id + "\",\"object\":\"chat.completion.chunk\",\"created\":" + created + ",\"model\":\"" +
+                        jesc(model_id) + "\",\"choices\":[],\"usage\":" + usage_of(g) + "}\n\n");
         send_all(c, "data: [DONE]\n\n");
         return;
     }
@@ -232,9 +240,7 @@ static void openai_serve(SOCKET c, Session& ss, Tokenizer& tk, const Json& r, bo
     msg += "}";
     respond(c, 200, "application/json",
             "{\"id\":\"" + id + "\",\"object\":\"chat.completion\",\"created\":" + created + ",\"model\":\"" + jesc(model_id) +
-            "\",\"choices\":[{\"index\":0,\"message\":" + msg + ",\"finish_reason\":\"" + finish + "\"}],\"usage\":{\"prompt_tokens\":" +
-            std::to_string(g.prompt_n) + ",\"completion_tokens\":" + std::to_string(g.gen_n) + ",\"total_tokens\":" +
-            std::to_string(g.prompt_n + g.gen_n) + "}}");
+            "\",\"choices\":[{\"index\":0,\"message\":" + msg + ",\"finish_reason\":\"" + finish + "\"}],\"usage\":" + usage_of(g) + "}");
 }
 
 // ---- Anthropic: POST /v1/messages ----
@@ -420,6 +426,9 @@ static void serve(Session& ss, Tokenizer& tk, const std::string& host, int port,
         if (method == "OPTIONS") { respond(c, 200, "text/plain", ""); }
         else if (method == "GET" && path == "/health") respond(c, 200, "application/json", "{\"status\":\"ok\"}");
         else if (method == "GET" && (path == "/api" || path == "/")) respond(c, 200, "application/json", api_help);
+        else if (method == "GET" && path.rfind("/v1/models/", 0) == 0)
+            respond(c, 200, "application/json", "{\"id\":\"" + jesc(model_id) + "\",\"object\":\"model\",\"owned_by\":\"moex\",\"type\":\"model\","
+                    "\"display_name\":\"" + jesc(model_id) + "\",\"context_length\":" + std::to_string(ss.eng.ctx) + "}");
         else if (method == "GET" && path == "/v1/models")
             respond(c, 200, "application/json", "{\"object\":\"list\",\"data\":[{\"id\":\"" + jesc(model_id) + "\",\"object\":\"model\",\"owned_by\":\"moex\","
                     "\"type\":\"model\",\"display_name\":\"" + jesc(model_id) + "\"}]}");
