@@ -64,3 +64,15 @@ m = json.loads(urllib.request.urlopen(BASE + "/v1/models/qwen3.6-35b-a3b").read(
 print(f"[GET /v1/models/id] {m} | {'PASS' if m.get('context_length') else 'FAIL'}")
 r = json.loads(post({"messages": [{"role": "user", "content": "Write two sentences about rain."}], "seed": 3}).read())
 print(f"[no max_tokens] {r['usage']['completion_tokens']} tokens, finish {r['choices'][0]['finish_reason']} | {'PASS' if r['choices'][0]['finish_reason'] == 'stop' else 'FAIL'}")
+
+# /v1/completions: raw text continuation, plain and streamed, with a stop string
+req = urllib.request.Request(BASE + "/v1/completions", data=json.dumps({"prompt": "def fibonacci(n):\n    ", "max_tokens": 40, "temperature": 0, "stop": ["\n\n"]}).encode(), headers={"Content-Type": "application/json"})
+r = json.loads(urllib.request.urlopen(req, timeout=600).read())
+txt = r["choices"][0]["text"]
+print(f"[completions] {txt!r} finish {r['choices'][0]['finish_reason']} | {'PASS' if r['object'] == 'text_completion' and txt.strip() else 'FAIL'}")
+req = urllib.request.Request(BASE + "/v1/completions", data=json.dumps({"prompt": "The capital of France is", "max_tokens": 8, "temperature": 0, "stream": True}).encode(), headers={"Content-Type": "application/json"})
+txt = ""
+for line in urllib.request.urlopen(req, timeout=600):
+    line = line.decode().strip()
+    if line.startswith("data: {"): txt += json.loads(line[6:])["choices"][0]["text"]
+print(f"[completions stream] {txt!r} | {'PASS' if 'Paris' in txt else 'FAIL'}")

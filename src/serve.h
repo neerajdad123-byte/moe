@@ -363,6 +363,59 @@ static void anthropic_serve(SOCKET c, Session& ss, Tokenizer& tk, const Json& r,
             ",\"output_tokens\":" + std::to_string(g.gen_n) + "}}");
 }
 
+// ---- OpenAI legacy: POST /v1/completions (raw text in, raw continuation out; editor autocomplete uses it) ----
+static void completions_serve(SOCKET c, Session& ss, Tokenizer& tk, const Json& r, const std::string& model_id) {
+    const Json* pj = r.get("prompt");
+    std::string prompt_text = pj && pj->t == Json::ARR && !pj->a.empty() ? pj->a[0].s : pj && pj->t == Json::STR ? pj->s : "";
+    if (prompt_text.empty()) { respond(c, 400, "application/json", "{\"error\":{\"message\":\"prompt missing\"}}"); return; }
+    std::vector<int> prompt = tk.encode(prompt_text);
+    if ((int)prompt.size() + 1 >= ss.eng.ctx) {
+        respond(c, 400, "application/json", "{\"error\":{\"message\":\"the prompt is " + std::to_string(prompt.size()) +
+                " tokens, more than the context (" + std::to_string(ss.eng.ctx) + "): restart moex serve with a larger --ctx\"}}");
+        return;
+    }
+    const bool stream = r.boolean("stream", false), echo = r.boolean("echo", false);
+    int max_new = (int)r.num("max_tokens", 16);  // the legacy API's default
+    if (max_new <= 0 || max_new > ss.eng.ctx - (int)prompt.size() - 1) max_new = ss.eng.ctx - (int)prompt.size() - 1;
+    const auto stops = strings_of(r.get("stop"));
+    ss.eng.samp = sampling_of(r, false);
+    if (ss.eng.samp.seed) ss.eng.rng.seed(ss.eng.samp.seed);
+    const std::string id = rand_id("cmpl-"), created = std::to_string((long long)time(nullptr));
+    auto chunk = [&](const std::string& text, const std::string& finish) {
+        return "data: {\"id\":\"" + id + "\",\"object\":\"text_completion\",\"created\":" + created + ",\"model\":\"" + jesc(model_id) +
+               "\",\"choices\":[{\"text\":\"" + jesc(text) + "\",\"index\":0,\"logprobs\":null,\"finish_reason\":" +
+               (finish.empty() ? "null" : "\"" + finish + "\"") + "}]}\n\n";
+    };
+    if (stream) { start_sse(c); if (echo) send_all(c, chunk(prompt_text, "")); }
+    Utf8Stream us; std::string text; bool alive = true, hit_stop = false; size_t sent = 0;
+    size_t hold = 0; for (auto& s : stops) hold = std::max(hold, s.size() - 1);
+    auto feed = [&](const std::string& piece, bool last) {
+        text += piece;
+        for (auto& s : stops) { size_t k = text.find(s); if (k != std::string::npos) { text.resize(k); hit_stop = true; break; } }
+        size_t can = hit_stop || last ? text.size() : (text.size() > hold ? text.size() - hold : 0);
+        if (stream && alive && can > sent) { alive = send_all(c, chunk(text.substr(sent, can - sent), "")); sent = can; }
+    };
+    auto out = ss.generate(prompt, max_new, [&](int t) { feed(us.push(tk.piece(t)), false); return alive && !hit_stop; });
+    if (!hit_stop) feed(us.held, true);
+    ss.eng.save_hot();
+    const std::string finish = !hit_stop && (int)out.size() >= max_new ? "length" : "stop";
+    const std::string usage = "{\"prompt_tokens\":" + std::to_string(prompt.size()) + ",\"completion_tokens\":" + std::to_string(out.size()) +
+                              ",\"total_tokens\":" + std::to_string(prompt.size() + out.size()) + "}";
+    fprintf(stderr, "[serve] completions: %zu prompt tokens, %zu generated\n", prompt.size(), out.size());
+    if (stream) {
+        send_all(c, chunk("", finish));
+        if (const Json* so = r.get("stream_options")) if (so->boolean("include_usage", false))
+            send_all(c, "data: {\"id\":\"" + id + "\",\"object\":\"text_completion\",\"created\":" + created + ",\"model\":\"" +
+                        jesc(model_id) + "\",\"choices\":[],\"usage\":" + usage + "}\n\n");
+        send_all(c, "data: [DONE]\n\n");
+        return;
+    }
+    respond(c, 200, "application/json",
+            "{\"id\":\"" + id + "\",\"object\":\"text_completion\",\"created\":" + created + ",\"model\":\"" + jesc(model_id) +
+            "\",\"choices\":[{\"text\":\"" + jesc((echo ? prompt_text : "") + text) + "\",\"index\":0,\"logprobs\":null,\"finish_reason\":\"" +
+            finish + "\"}],\"usage\":" + usage + "}");
+}
+
 static void serve(Session& ss, Tokenizer& tk, const std::string& host, int port, const std::string& model_id) {
 #ifdef _WIN32
     WSADATA wsa; WSAStartup(MAKEWORD(2, 2), &wsa);
@@ -384,14 +437,15 @@ static void serve(Session& ss, Tokenizer& tk, const std::string& host, int port,
     const std::string api_help = "{\"server\":\"moex\",\"model\":\"" + jesc(model_id) + "\",\"base_url\":\"" + jesc(base) + "/v1\",\"api_key\":\"any\","
         "\"endpoints\":{\"POST /v1/chat/completions\":\"OpenAI chat completions; \\\"stream\\\": true for streaming. Also: tools (tool_calls back), "
         "temperature, top_p, top_k, seed, stop, max_tokens; thinking: chat_template_kwargs.enable_thinking or reasoning_effort (default: serve --think), "
-        "sent as reasoning_content, the answer as content\",\"POST /v1/messages\":\"Anthropic Messages API: system, tools (tool_use / tool_result), "
+        "sent as reasoning_content, the answer as content\",\"POST /v1/completions\":\"OpenAI legacy completions: raw prompt, no chat template "
+        "(editor autocomplete); max_tokens (default 16), stop, echo, stream\",\"POST /v1/messages\":\"Anthropic Messages API: system, tools (tool_use / tool_result), "
         "thinking, stop_sequences, streaming\",\"POST /v1/messages/count_tokens\":\"prompt size in tokens\",\"GET /v1/models\":\"the model id\","
         "\"GET /health\":\"{\\\"status\\\":\\\"ok\\\"}\",\"GET /api\":\"this page\"},\"examples\":{\"powershell\":\"" + jesc(ps_example) +
         "\",\"python\":\"" + jesc(py_example) + "\"}}";
     fprintf(stderr,
             "\n[serve] moex is serving %s - OpenAI- and Anthropic-compatible API\n"
             "  Base URL:   %s/v1   (model \"%s\", any API key)\n"
-            "  Endpoints:  POST /v1/chat/completions   POST /v1/messages   GET /v1/models   GET /health   GET /api (help)\n"
+            "  Endpoints:  POST /v1/chat/completions   POST /v1/completions   POST /v1/messages   GET /v1/models   GET /health   GET /api (help)\n"
             "  Try it in PowerShell:\n    %s\n"
             "  Python (pip install openai):\n    %s\n"
             "  Open WebUI, editors and other apps: add an OpenAI-compatible connection with the base URL above.\n"
@@ -432,11 +486,13 @@ static void serve(Session& ss, Tokenizer& tk, const std::string& host, int port,
         else if (method == "GET" && path == "/v1/models")
             respond(c, 200, "application/json", "{\"object\":\"list\",\"data\":[{\"id\":\"" + jesc(model_id) + "\",\"object\":\"model\",\"owned_by\":\"moex\","
                     "\"type\":\"model\",\"display_name\":\"" + jesc(model_id) + "\"}]}");
-        else if (method == "POST" && (path == "/v1/chat/completions" || path == "/v1/messages" || path == "/v1/messages/count_tokens")) {
+        else if (method == "POST" && (path == "/v1/chat/completions" || path == "/v1/completions" || path == "/v1/messages" ||
+                                      path == "/v1/messages/count_tokens")) {
             JsonParser jp(body); Json r = jp.parse();
-            const bool anth = path != "/v1/chat/completions";
+            const bool anth = path.rfind("/v1/messages", 0) == 0;
             if (!jp.ok || r.t != Json::OBJ) respond(c, 400, "application/json", anth ? anthropic_error("invalid JSON") : "{\"error\":{\"message\":\"invalid JSON\"}}");
             else if (path == "/v1/chat/completions") openai_serve(c, ss, tk, r, think_default, model_id);
+            else if (path == "/v1/completions") completions_serve(c, ss, tk, r, model_id);
             else if (path == "/v1/messages") anthropic_serve(c, ss, tk, r, think_default, model_id);
             else {  // count_tokens
                 GenReq q; std::string err;
