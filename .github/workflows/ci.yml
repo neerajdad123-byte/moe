@@ -7,14 +7,15 @@ on:
 
 jobs:
   windows:
-    runs-on: windows-2025
+    runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false  # one zip failing must not cancel the other
       matrix:
         include:  # CUDA 13 needs driver 580+; the CUDA 12 build runs on older drivers
-          # crt, nvvm and nvptxcompiler are separate installer packages only from CUDA 13 (inside nvcc in 12.x)
-          - { cuda: 13.3.0, zip: moex-windows-x64, nvflags: '', pkgs: '["nvcc", "cudart", "crt", "nvvm", "nvptxcompiler"]' }
-          - { cuda: 12.8.1, zip: moex-windows-x64-cuda12, nvflags: '-allow-unsupported-compiler', pkgs: '["nvcc", "cudart"]' }
+          # crt, nvvm and nvptxcompiler are separate installer packages only from CUDA 13 (inside nvcc in 12.x).
+          # CUDA 12.8's cudafe++ crashes on the VS 2026 headers of windows-2025: it builds with VS 2022 (supported).
+          - { os: windows-2025, cuda: 13.3.0, zip: moex-windows-x64, nvflags: '', pkgs: '["nvcc", "cudart", "crt", "nvvm", "nvptxcompiler"]' }
+          - { os: windows-2022, cuda: 12.8.1, zip: moex-windows-x64-cuda12, nvflags: '', pkgs: '["nvcc", "cudart"]' }
     steps:
       - uses: actions/checkout@v4
 
