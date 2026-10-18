@@ -71,10 +71,10 @@ static int run_bench(Engine& eng, Tokenizer& tk, const std::string& model) {
         fprintf(stderr, "  - Your free RAM can't hold every expert, so some are read from the SSD: every extra GB of free RAM is\n"
                         "    about +2 tok/s here.\n");
     if (!eng.has_mtp && !eng.low_ram)
-        fprintf(stderr, "  - Try multi-token prediction: `moex bench --mtp` (then `moex chat --mtp`), often ~10%% faster on this PC%s.\n",
+        fprintf(stderr, "  - Try multi-token prediction: `moex bench --mtp` (then `moex chat --mtp`), often ~5%% faster on this PC%s.\n",
                 std::filesystem::exists(std::filesystem::path(model) / "mtp.safetensors") ? "" : " (run `moex download` first to get the MTP head)");
     else if (eng.has_mtp)
-        fprintf(stderr, "  - Compare without MTP: `moex bench`, and keep --mtp in chat only if it was faster here%s.\n",
+        fprintf(stderr, "  - Compare without MTP: `moex bench --no-mtp`, and use `moex chat --no-mtp` if that was faster here%s.\n",
                 eng.low_ram ? " (in low-RAM mode its extra experts are extra SSD reads, often slower)" : "");
     return 0;
 }
