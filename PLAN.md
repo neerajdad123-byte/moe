@@ -420,3 +420,85 @@ copy pool outside prefill) blocks right after the pause loop instead of polling 
 Same laptop: idle at the prompt (before and after a reply) and in serve after a request: 6.9 cores -> 0.00.
 `moex bench` alternating before/after: 51.3 / 49.5 vs 50.7 / 50.2 tok/s (noise), first token unchanged; `--check
 ref/eval1` PASS. The loader/backer threads still poll with 20-50 us sleeps; that measured as 0.00 cores, so left as is.
+
+## Prefill: profile and plan (2026-10-18)
+
+Goal: prompt reading from ~130-150 tok/s to 1,000+ on the RTX 4050 Laptop 6 GB (Strata reads 1,600-2,600 on a 12 GB
+RTX 5070; long prompts are where users feel moex is slow: 16K tokens take 2 minutes today).
+
+### Baseline (v0.1.3, `--batch build/pf_N.txt --n 4 --ctx 17000 --load --no-mtp`; prompts = this repo's text, chat template)
+
+| prompt | tok/s | gpu-wait | streaming-wait | cpu-experts | streamed experts | host memcpy |
+|---|---|---|---|---|---|---|
+| 4,096 | **147** | 11.4 s | 11.3 s | 2.6 s | 76,810 (120 per chunk-layer) | 9.1 s |
+| 16,384 | **128** | 59.9 s | 49.2 s | 9.6 s | 326,464 (128 per chunk-layer) | 36.5 s |
+
+(1,024 tokens: 57 tok/s on a cold start, 1.07 M page faults while --load was still filling RAM: not representative.)
+
+Nsight Systems, 4K prompt, GPU kernel time per chunk-layer (256 rows; the trace covered the first ~128 chunk-layers):
+
+| kernel | ms per chunk-layer | share | note |
+|---|---|---|---|
+| pairs_gate_up_k + pairs_down_k (experts) | ~24 | 74% | ~2.7 TFLOPS: per-pair GEMV-style, no tensor cores |
+| gemm_wmma_k int8 (dense + shared expert) | ~5.6 | 17% | ~3.6 TFLOPS on wmma |
+| gemv_f16_k (router, one GEMV per row) | 0.94 | 3% | 256 launches per layer |
+| export_route_k | 0.30 | 1% | a copy, should be ~0.02 |
+| attention / DeltaNet / norms / reduce | ~1 | 4% | at 4K; attention grows with context (gpu-wait 2.8 -> 3.7 ms/token from 4K to 16K) |
+
+=> ~32 ms GPU per chunk-layer = 1.3 s per 256-token chunk = **~200 tok/s GPU ceiling** before any streaming. PCIe:
+each 256-token chunk uses ~all 256 experts of a layer, ~120 of them not resident, so every chunk streams ~8.5 GB
+(~33 MB per prompt token); at ~12 GB/s (PCIe 4.0 x8) that alone caps prefill at ~360 tok/s, and the extra host
+memcpy (file map -> pinned ring, 4 threads, ~15 GB/s) sits in front of the DMA.
+
+### Plan (each step: `--check ref/eval1` with prefill still PASS, test_kernels vs the current kernel, then 4K/16K tok/s)
+
+- [x] PF1 **Grouped int4 expert GEMM on tensor cores** for prefill: the pairs are already grouped by expert (~8 rows
+  per expert at CH=256, ~32 at 1024); per expert, dequant int4 gs64 -> fp16 tiles in shared memory and run mma
+  (m16n8k16) over its rows, gate+up+SiLU fused, then down with the routing weight. Target: experts 24 -> <=4 ms per
+  chunk-layer. Biggest single lever at every prompt length.
+- [x] PF2 **Bigger chunks**: CH 256 -> 1024 (2048 where VRAM allows). Streamed bytes per prompt token fall ~2.5-4x
+  (an expert is streamed once per chunk, not once per 256 rows) and every GEMM gets fatter. Scratch is ~290 KB per row
+  (~290 MB at 1024 = ~165 expert slots, borrowed from the cache for the length of the prefill as today); alias the
+  buffers that are never live together (qkvc/bigc/convc/oc) to cut it. PCIe ceiling at 1024: ~870 tok/s; at 2048: ~1,700.
+- [ ] PF3 **Streaming without the extra copy**: measure after PF2 (it shrinks the problem). Options: a bigger pinned
+  ring with more copy threads, or reading experts from the own RAM cache straight into pinned memory. (Page-locking the
+  file map was ruled out: WDDM budget, see above.)
+- [ ] PF4 **Dense GEMM**: gemm_wmma_k at ~3.6 TFLOPS -> int8 activations + IMMA (or better fp16 tiling); target 2-3x.
+- [ ] PF5 **Small kernels**: router as one GEMM over the chunk (not T GEMVs), export_route_k as a plain copy,
+  pairs_reduce fused into the expert down kernel.
+- [ ] PF6 **Long-context attention in prefill**: profile at 16K; the chunk attends token by token with one split.
+  A flash-attention style kernel over the chunk (tensor cores, causal within the chunk) if it shows up after PF1-PF2.
+- [ ] PF7 **Ship it**: a `moex bench --prefill` line (4K and 16K tok/s), README numbers, release.
+
+Expected after PF1 + PF2 (estimate, to be replaced by measurements): ~500-800 tok/s on 4K-16K prompts; PF3-PF6 toward
+1,000+. Order: PF1 first (largest, independent of chunk size), then PF2, then re-profile before PF3-PF6.
+
+### PF1 + PF2 results (2026-10-18)
+
+PF1: `tc_gate_up_k` / `tc_down_k` (src/kernels.cuh): per block 128 weight rows x up to 32 of the expert's rows, each
+K step one scale group dequantized to fp16 in shared memory, wmma 16x16x16, the next step's loads in flight during the
+MMAs, 16-row tiles when an expert has <= 16 rows, Cs over As (23 KB: 4 blocks per SM). Prefill only; the 2-row MTP
+round keeps the GEMV kernels. `MOEX_PF_GEMV=1` switches prefill back for A/B tests.
+test_kernels PF1 (layer 0, 256 rows, top-8): vs pairs_forward rel 4e-4 (fp16 operands);
+256 experts (~8 rows each, a real chunk): 21.1 -> **4.76 ms** (4.4x); 32 experts (~64 rows each): 20.8 -> **1.14 ms** (18x).
+A first version without the register prefetch and with 39 KB of shared memory: 7.46 / 3.09 ms.
+
+PF2: CH 256 -> 1024. Expert slots unchanged (1515: the scratch is borrowed from the cache only during prefill).
+
+| prompt | v0.1.3 | + PF1 (CH 256) | + PF2 (CH 1024) |
+|---|---|---|---|
+| 4,096 tok/s | 147 | 170 | **300** |
+| 16,384 tok/s | 128 | 143 | **228** |
+| 4K streamed experts | 76,810 | 76,832 | 27,124 |
+
+PF1 alone gave only +16%: the GPU expert time fell 4x but the streaming (host memcpy into the pinned ring + DMA) was
+already as long, so the wait just moved there. PF2 cut the streamed bytes 2.8x.
+Checks: `--check ref/eval1` PASS (mean KL 1.48e-3, was 2.89e-3; top-1 98.6%, the same one mismatch); a 4,096-token
+prompt (4 chunks) then 48 greedy tokens: identical to `--no-prefill` (token by token), 48/48; test_kernels ALL PASS;
+`moex bench` decode 50.3 tok/s (49.0 at the v0.1.3 release: unchanged).
+Found on the way: `--check --f16` FAILs even with `--no-prefill` and the old kernels (worst KL 1e-2 vs the 1e-5
+limit): the int8 KV cache is on in F16 mode too, so the README's "matches to 1e-12" is stale. Not touched here.
+
+Next, from the 4K run at CH 1024: wall 13.7 s but gpu-wait 0.65 + streaming-wait 3.65 + cpu-experts 0.81 = 5.1 s; the
+other ~8.5 s is host time not yet attributed (per-expert lists, `prefetch_experts`, launches, the MTP-off tail?).
+Profile that first (it is now the largest part), then PF3 (streaming), then try CH 2048.

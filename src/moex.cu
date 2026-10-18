@@ -51,6 +51,7 @@ constexpr float EPS = 1e-6f, THETA = 1e7f;
 // Top-8 router weights renormalized to sum to 1: the HF config omits norm_topk_prob, the Qwen3.5-MoE default is
 // true, and llama.cpp normalizes for this architecture (colibri's converter wrote false into its meta).
 static bool NORM_TOPK = !getenv("MOEX_NO_NORM_TOPK");
+static bool PF_GEMV = getenv("MOEX_PF_GEMV") != nullptr;  // prefill experts on the old GEMV kernels (A/B tests)
 static bool is_attn(int l) { return l % 4 == 3 || l == NL; }  // layer NL = the MTP head's layer
 constexpr int NKEY = (NL + 1) * E;  // expert keys: 40 layers + the MTP layer
 static const char* VERSION = "0.1.3";
@@ -852,7 +853,7 @@ struct Engine {
 
     // One token at position `pos`. If want_logits, logits[] is filled and the greedy id returned.
     // ---- prefill: the prompt in chunks of CH tokens; every weight is read once per chunk ----
-    static constexpr int CH = 256;
+    static constexpr int CH = 1024;
     float *Xc, *hc, *tmpc, *moec, *qkvc, *bigc, *convc, *oc, *qoc, *agc, *lgc, *rwc, *actp, *ypair, *shgu, *sha, *shs, *shl;
     int* ridxc;
     float *rows_h, *rows_d, *rwc_h, *rwc_d, *ycpu_h, *ycpu_d;  // mapped host memory (zero-copy)
@@ -1057,7 +1058,12 @@ struct Engine {
                 // GPU: resident experts and the shared expert first (all async)
                 CK(cudaMemsetAsync(ypair, 0, (size_t)T * TOPK * D * 4, cs));
                 const int nres = nitems;
-                pairs_forward(items_d, nres, pairs_d, hc, actp, ypair, cs);
+                // prefill: tensor cores over each expert's rows; the 2-row MTP round: GEMV (each weight read once)
+                auto moe_pairs = [&](const PairItem* it, int n) {
+                    if (verify || PF_GEMV) pairs_forward(it, n, pairs_d, hc, actp, ypair, cs);
+                    else pairs_forward_tc(it, n, pairs_d, hc, actp, ypair, cs);
+                };
+                moe_pairs(items_d, nres);
                 if (!verify) shared_rows(w, T);
                 // streamed experts: items point at their staging slot (batch bi uses half bi&1)
                 for (int k = 0; k < (int)streamed.size(); k++)
@@ -1085,7 +1091,7 @@ struct Engine {
                         CK(cudaEventRecord(ev_hfree[half_], cpp));
                         CK(cudaEventRecord(ev_copied[half_], cpp));
                         CK(cudaStreamWaitEvent(cs, ev_copied[half_]));
-                        pairs_forward(items_d + nres + b0, nb, pairs_d, hc, actp, ypair, cs);
+                        moe_pairs(items_d + nres + b0, nb);
                         CK(cudaEventRecord(ev_free[half_], cs));
                     }
                 });

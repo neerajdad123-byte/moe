@@ -337,6 +337,64 @@ int main(int argc, char** argv) {
         }
     }
 
+    if (want(filt, "PF1")) {
+        printf("PF1 prefill MoE on tensor cores vs pairs_forward (layer 0 experts, T=256 rows, top-8 of NE)\n");
+        const int T = 256, K = 8;
+        for (int NE : {256, 32}) {  // 256: ~8 rows per expert (a real chunk); 32: ~64 rows per expert
+            uint8_t* arena; CK(cudaMalloc(&arena, (size_t)NE * EXPERT_BYTES));
+            for (int e = 0; e < NE; e++) {
+                std::string ep = "model.layers.0.mlp.experts." + std::to_string(e) + ".";
+                auto q = C.read(ep + "merged_weight"), s = C.read(ep + "qs");
+                CK(cudaMemcpy(arena + (size_t)e * EXPERT_BYTES, q.data(), q.size(), cudaMemcpyHostToDevice));
+                CK(cudaMemcpy(arena + (size_t)e * EXPERT_BYTES + EXPERT_Q_BYTES, s.data(), s.size(), cudaMemcpyHostToDevice));
+            }
+            std::vector<float> hx((size_t)T * D);  // real activations (12 golden positions), varied per row
+            for (int t = 0; t < T; t++) {
+                auto g = golden(pn_(t % 12, "L00_moe_in"));
+                for (int i = 0; i < D; i++) hx[(size_t)t * D + i] = g[i] * (1.f + 0.01f * (t / 12));
+            }
+            // routing: K distinct experts per row (deterministic), grouped by expert as the engine does
+            std::vector<std::vector<Pair>> per(NE);
+            uint32_t rng = 12345;
+            for (int t = 0; t < T; t++) {
+                std::vector<int> pick;
+                while ((int)pick.size() < K) {
+                    rng = rng * 1664525u + 1013904223u;
+                    int e = (rng >> 8) % NE;
+                    if (std::find(pick.begin(), pick.end(), e) == pick.end()) pick.push_back(e);
+                }
+                for (int r = 0; r < K; r++) per[pick[r]].push_back({t, t * K + r, 0.05f + 0.1f * r});
+            }
+            std::vector<PairItem> items; std::vector<Pair> pairs;
+            for (int e = 0; e < NE; e++) if (!per[e].empty()) {
+                items.push_back({arena + (size_t)e * EXPERT_BYTES, (int)pairs.size(), (int)per[e].size()});
+                pairs.insert(pairs.end(), per[e].begin(), per[e].end());
+            }
+            PairItem* items_d; Pair* pairs_d;
+            CK(cudaMalloc(&items_d, items.size() * sizeof(PairItem))); CK(cudaMalloc(&pairs_d, pairs.size() * sizeof(Pair)));
+            CK(cudaMemcpy(items_d, items.data(), items.size() * sizeof(PairItem), cudaMemcpyHostToDevice));
+            CK(cudaMemcpy(pairs_d, pairs.data(), pairs.size() * sizeof(Pair), cudaMemcpyHostToDevice));
+            float *X = up(hx), *act = dalloc((size_t)T * K * EI, true), *yr = dalloc((size_t)T * K * D, true),
+                  *act2 = dalloc((size_t)T * K * EI, true), *yt = dalloc((size_t)T * K * D, true);
+            const int ni = (int)items.size();
+            pairs_forward(items_d, ni, pairs_d, X, act, yr);
+            pairs_forward_tc(items_d, ni, pairs_d, X, act2, yt);
+            char lbl[96];
+            snprintf(lbl, sizeof lbl, "NE=%d act (silu(g)*u)", NE);
+            check(lbl, down(act2, (size_t)T * K * EI), down(act, (size_t)T * K * EI), 5e-3f);  // fp16 operands
+            snprintf(lbl, sizeof lbl, "NE=%d ypair", NE);
+            check(lbl, down(yt, (size_t)T * K * D), down(yr, (size_t)T * K * D), 5e-3f);
+            const double bytes = (double)ni * EXPERT_BYTES;
+            snprintf(lbl, sizeof lbl, "  NE=%d pairs_forward (GEMV)", NE);
+            float ms_old = bench(lbl, bytes, [&] { pairs_forward(items_d, ni, pairs_d, X, act, yr); }, 10);
+            snprintf(lbl, sizeof lbl, "  NE=%d pairs_forward_tc", NE);
+            float ms_new = bench(lbl, bytes, [&] { pairs_forward_tc(items_d, ni, pairs_d, X, act2, yt); }, 10);
+            printf("      -> %.2fx, %.1f TFLOPS\n", ms_old / ms_new, (double)T * K * 3 * EI * D * 2 / (ms_new * 1e9));
+            for (void* p : {(void*)arena, (void*)items_d, (void*)pairs_d, (void*)X, (void*)act, (void*)yr, (void*)act2, (void*)yt})
+                CK(cudaFree(p));
+        }
+    }
+
     if (want(filt, "K12")) {
         printf("K12 prefill GEMM (WMMA fp16, int8 weights) vs per-token GEMV\n");
         struct Case { const char* name; int O, I; } cases[] = {

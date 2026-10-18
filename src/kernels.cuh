@@ -500,6 +500,170 @@ inline void pairs_forward(const PairItem* items, int n_items, const Pair* pairs,
     pairs_down_k<WARPS><<<dim3(EH / WARPS, n_items), WARPS * 32, 0, st>>>(items, pairs, act, ypair);
 }
 
+// ---- PF1: the same prefill MoE on tensor cores (same work list, act and ypair as pairs_forward). A block
+// takes 128 weight rows x 32 of an item's tokens; each K step is one int4 scale group (64 wide), dequantized
+// to fp16 (v * scale, rounded once) in shared memory. Activations are rounded to fp16, accumulation is fp32.
+// pairs_forward stays for the 2-token MTP round, where a GEMV reads each weight once for both rows.
+constexpr int TC_BN = 32, TC_BK = 64, TC_LD = TC_BK + 8;  // +8 halves: no bank conflicts on fragment loads
+
+// 32 int4 (low nibble first) times one scale -> 32 halves. Same int->float trick as dot32_i4.
+__device__ __forceinline__ void dq32_i4(uint4 u, float s, half* __restrict__ dst) {
+    const uint32_t q[4] = {u.x ^ 0x88888888u, u.y ^ 0x88888888u, u.z ^ 0x88888888u, u.w ^ 0x88888888u};
+#pragma unroll
+    for (int j = 0; j < 4; j++) {
+        half2* d2 = reinterpret_cast<half2*>(dst + 8 * j);
+#pragma unroll
+        for (int n = 0; n < 8; n += 2)
+            d2[n / 2] = __floats2half2_rn((__int_as_float(0x4B000000u | ((q[j] >> (4 * n)) & 0xFu)) - 8388616.f) * s,
+                                          (__int_as_float(0x4B000000u | ((q[j] >> (4 * n + 4)) & 0xFu)) - 8388616.f) * s);
+    }
+}
+
+// C[128][16 * nj] (fp32, shared, aliasing As) = A rows . B^T over K = nk * TC_BK, nj = 1 or 2 token fragments.
+// fetch(k0) loads one K step from global memory into the caller's registers, store() writes them (dequantized /
+// rounded to fp16) into As[128][TC_LD] (row = local weight row) and Bs[TC_BN][TC_LD] (row = token). The next step's
+// fetch is in flight while the tensor cores work on this one. 4 warps, 32 rows x 16 * nj tokens each.
+template <class F, class S>
+__device__ __forceinline__ void tc_tile(int nk, int nj, half* As, half* Bs, float* Cs, F fetch, S store) {
+    using namespace nvcuda;
+    const int warp = threadIdx.x >> 5;
+    wmma::fragment<wmma::accumulator, 16, 16, 16, float> c[2][2];
+    for (int i = 0; i < 2; i++) for (int j = 0; j < 2; j++) wmma::fill_fragment(c[i][j], 0.f);
+    fetch(0);
+    for (int kb = 0; kb < nk; kb++) {
+        store();
+        __syncthreads();
+        if (kb + 1 < nk) fetch((kb + 1) * TC_BK);
+#pragma unroll
+        for (int kk = 0; kk < TC_BK; kk += 16) {
+            wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> a[2];
+            wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::col_major> b;
+            for (int i = 0; i < 2; i++) wmma::load_matrix_sync(a[i], As + (warp * 32 + 16 * i) * TC_LD + kk, TC_LD);
+            for (int j = 0; j < nj; j++) {
+                wmma::load_matrix_sync(b, Bs + (16 * j) * TC_LD + kk, TC_LD);
+                for (int i = 0; i < 2; i++) wmma::mma_sync(c[i][j], a[i], b, c[i][j]);
+            }
+        }
+        __syncthreads();
+    }
+    for (int i = 0; i < 2; i++) for (int j = 0; j < nj; j++)
+        wmma::store_matrix_sync(Cs + (warp * 32 + 16 * i) * TC_BN + 16 * j, c[i][j], TC_BN, wmma::mem_row_major);
+    __syncthreads();
+}
+
+// Shared memory of one tc block: As + Bs during the K loop, then Cs (16 KB) over As. 23 KB: 4 blocks per SM.
+struct TcSmem {
+    __align__(32) half ab[128 * TC_LD + TC_BN * TC_LD];
+    __device__ half* As() { return ab; }
+    __device__ half* Bs() { return ab + 128 * TC_LD; }
+    __device__ float* Cs() { return reinterpret_cast<float*>(ab); }
+};
+static_assert(128 * TC_LD * sizeof(half) >= 128 * TC_BN * sizeof(float), "Cs must fit over As");
+
+// act[p][r0..r0+63] = silu(gate . x_t) * (up . x_t). Block (r0 / 64, item): local rows 0-63 gate, 64-127 up.
+__global__ void __launch_bounds__(128) tc_gate_up_k(const PairItem* __restrict__ items, const Pair* __restrict__ pairs,
+                                                    const float* __restrict__ X, float* __restrict__ act) {
+    __shared__ TcSmem sm;
+    __shared__ int tok[TC_BN], pid[TC_BN];
+    const PairItem it = items[blockIdx.y];
+    const int r0 = blockIdx.x * 64, tid = threadIdx.x;
+    const float* sc = reinterpret_cast<const float*>(it.slot + EXPERT_Q_BYTES);
+    half *As = sm.As(), *Bs = sm.Bs();
+    for (int j0 = 0; j0 < it.count; j0 += TC_BN) {
+        const int nb = min(TC_BN, it.count - j0), nj = nb > 16 ? 2 : 1;
+        if (tid < TC_BN) { const Pair pr = pairs[it.start + j0 + min(tid, nb - 1)]; tok[tid] = pr.t; pid[tid] = pr.p; }
+        __syncthreads();
+        uint4 ua[2]; float sa[2], xb[TC_BN * TC_BK / 128];
+        tc_tile(EH / TC_BK, nj, As, Bs, sm.Cs(),
+            [&](int k0) {  // 128 rows x 64 = two uint4 per row; gate row g is merged row g, up row g is EI + g
+#pragma unroll
+                for (int i = 0; i < 2; i++) {
+                    const int e = tid + 128 * i, r = e >> 1, h = e & 1, gr = r < 64 ? r0 + r : EI + r0 + r - 64;
+                    ua[i] = __ldg(reinterpret_cast<const uint4*>(it.slot + (size_t)gr * (EH / 2) + (k0 + 32 * h) / 2));
+                    sa[i] = sc[gr * (EH / EGS) + k0 / EGS];
+                }
+#pragma unroll
+                for (int i = 0; i < TC_BN * TC_BK / 128; i++) {
+                    const int e = tid + 128 * i, n = e / TC_BK, k = e % TC_BK;
+                    xb[i] = n < nb ? X[(size_t)tok[n] * EH + k0 + k] : 0.f;
+                }
+            },
+            [&] {
+#pragma unroll
+                for (int i = 0; i < 2; i++) { const int e = tid + 128 * i; dq32_i4(ua[i], sa[i], As + (e >> 1) * TC_LD + 32 * (e & 1)); }
+#pragma unroll
+                for (int i = 0; i < TC_BN * TC_BK / 128; i++) {
+                    const int e = tid + 128 * i;
+                    Bs[(e / TC_BK) * TC_LD + e % TC_BK] = __float2half(xb[i]);
+                }
+            });
+        const float* Cs = sm.Cs();
+        for (int e = tid; e < 64 * TC_BN; e += 128) {
+            const int r = e & 63, n = e >> 6;
+            if (n < nb) {
+                const float g = Cs[r * TC_BN + n], u = Cs[(64 + r) * TC_BN + n];
+                act[(size_t)pid[n] * EI + r0 + r] = g / (1.f + __expf(-g)) * u;
+            }
+        }
+        __syncthreads();
+    }
+}
+
+// ypair[p][d0..d0+127] = w_p * (down . act_p). Block (d0 / 128, item).
+__global__ void __launch_bounds__(128) tc_down_k(const PairItem* __restrict__ items, const Pair* __restrict__ pairs,
+                                                 const float* __restrict__ act, float* __restrict__ ypair) {
+    __shared__ TcSmem sm;
+    __shared__ int pid[TC_BN];
+    __shared__ float wt[TC_BN];
+    const PairItem it = items[blockIdx.y];
+    const int d0 = blockIdx.x * 128, tid = threadIdx.x;
+    const uint8_t* dq = it.slot + (size_t)2 * EI * (EH / 2);
+    const float* sc = reinterpret_cast<const float*>(it.slot + EXPERT_Q_BYTES) + 2 * EI * (EH / EGS);
+    half *As = sm.As(), *Bs = sm.Bs();
+    for (int j0 = 0; j0 < it.count; j0 += TC_BN) {
+        const int nb = min(TC_BN, it.count - j0), nj = nb > 16 ? 2 : 1;
+        if (tid < TC_BN) { const Pair pr = pairs[it.start + j0 + min(tid, nb - 1)]; pid[tid] = pr.p; wt[tid] = pr.w; }
+        __syncthreads();
+        uint4 ua[2]; float sa[2], xb[TC_BN * TC_BK / 128];
+        tc_tile(EI / TC_BK, nj, As, Bs, sm.Cs(),
+            [&](int k0) {
+#pragma unroll
+                for (int i = 0; i < 2; i++) {
+                    const int e = tid + 128 * i, d = d0 + (e >> 1), h = e & 1;
+                    ua[i] = __ldg(reinterpret_cast<const uint4*>(dq + (size_t)d * (EI / 2) + (k0 + 32 * h) / 2));
+                    sa[i] = sc[d * (EI / EGS) + k0 / EGS];
+                }
+#pragma unroll
+                for (int i = 0; i < TC_BN * TC_BK / 128; i++) {
+                    const int e = tid + 128 * i, n = e / TC_BK, k = e % TC_BK;
+                    xb[i] = n < nb ? act[(size_t)pid[n] * EI + k0 + k] : 0.f;
+                }
+            },
+            [&] {
+#pragma unroll
+                for (int i = 0; i < 2; i++) { const int e = tid + 128 * i; dq32_i4(ua[i], sa[i], As + (e >> 1) * TC_LD + 32 * (e & 1)); }
+#pragma unroll
+                for (int i = 0; i < TC_BN * TC_BK / 128; i++) {
+                    const int e = tid + 128 * i;
+                    Bs[(e / TC_BK) * TC_LD + e % TC_BK] = __float2half(xb[i]);
+                }
+            });
+        const float* Cs = sm.Cs();
+        for (int e = tid; e < 128 * TC_BN; e += 128) {
+            const int r = e & 127, n = e >> 7;
+            if (n < nb) ypair[(size_t)pid[n] * EH + d0 + r] = wt[n] * Cs[r * TC_BN + n];
+        }
+        __syncthreads();
+    }
+}
+
+inline void pairs_forward_tc(const PairItem* items, int n_items, const Pair* pairs, const float* X, float* act, float* ypair,
+                             cudaStream_t st = 0) {
+    if (!n_items) return;
+    tc_gate_up_k<<<dim3(EI / 64, n_items), 128, 0, st>>>(items, pairs, X, act);
+    tc_down_k<<<dim3(EH / 128, n_items), 128, 0, st>>>(items, pairs, act, ypair);
+}
+
 // rows: out[t][i] = silu(gu[t][i]) * gu[t][SI + i]  (fused [gate; up] GEMM output -> compact [T][SI])
 __global__ void silu_mul_rows_k(const float* __restrict__ gu, float* __restrict__ out, int SI) {
     int t = blockIdx.y, i = blockIdx.x * blockDim.x + threadIdx.x;
