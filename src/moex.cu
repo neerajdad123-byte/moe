@@ -42,6 +42,14 @@ static unsigned long page_faults() { rusage u{}; getrusage(RUSAGE_SELF, &u); ret
 
 __global__ void copy_ids_k(const int* __restrict__ s, int* __restrict__ d) { d[threadIdx.x] = s[threadIdx.x]; }
 
+// memcpy with non-temporal stores: no read-for-ownership of the destination, so the copy into the pinned ring takes
+// 2 units of RAM traffic instead of 3 and leaves more bandwidth to the PCIe DMA reading it. d: 32-byte aligned, n % 32 == 0.
+static void copy_nt(uint8_t* d, const void* s, size_t n) {
+    const __m256i* sv = (const __m256i*)s;
+    for (size_t i = 0; i < n / 32; i++) _mm256_stream_si256((__m256i*)d + i, _mm256_loadu_si256(sv + i));
+    _mm_sfence();
+}
+
 static double now() { return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
 
 // Qwen3.6-35B-A3B geometry (checked against the container shapes at load).
@@ -912,8 +920,8 @@ struct Engine {
                 double q1 = now();
                 std::function<void(int)> cp = [&](int i) {
                     int key = job.first * E + job.second[k0 + i];
-                    memcpy(hbase + (size_t)i * EXPERT_BYTES, eq[key], EXPERT_Q_BYTES);
-                    memcpy(hbase + (size_t)i * EXPERT_BYTES + EXPERT_Q_BYTES, es[key], EXPERT_BYTES - EXPERT_Q_BYTES);
+                    copy_nt(hbase + (size_t)i * EXPERT_BYTES, eq[key], EXPERT_Q_BYTES);
+                    copy_nt(hbase + (size_t)i * EXPERT_BYTES + EXPERT_Q_BYTES, es[key], EXPERT_BYTES - EXPERT_Q_BYTES);
                 };
                 cpool.parallel_for(nb, cp);
                 st_wait += q1 - q0; st_memcpy += now() - q1;

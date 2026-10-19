@@ -576,3 +576,12 @@ A/B alternating (old, new, old, new; laptop warm, so lower than single runs): 4K
 attention at 4K); **16K 367 / 576 / 354 / 575 (+60%)**. Single runs: 4K 712, 16K 600. Same greedy tokens in all runs.
 `--check` PASS: mean KL 1.48e-3 -> **1.71e-3** (fp16 Q and P), worst 1.79e-2, top-1 98.6%. test_kernels ALL PASS.
 `moex bench` decode: 49.1 (old) / 48.7 (new) avg, unchanged.
+
+### S2: the host copy (user's step 2): measured PCIe-bound; non-temporal stores
+nsys, 4K: the H2D engine is busy 6.91 s of the 7.01 s prefill (64.9 GB, 9.4 GB/s while busy): prefill is PCIe-bound,
+kernels busy 3.72 s. Ceiling test (throwaway: skip the memcpy, DMA stale data): 580 -> **727 tok/s** (DMA 11.8 GB/s):
+the copy slows the DMA by contending for RAM bandwidth (RAM peak 55-58 GB/s; memcpy 17.5 GB/s = ~52 GB/s with
+read-for-ownership). A cudaStreamQuery after each enqueue (WDDM batching): no change (583/583, 582/585). Direct
+SSD reads: no (~4 GB/s). Kept: `copy_nt` (AVX2 streaming stores, no RFO): memcpy 3.6 -> 2.9 s; A/B 4K 582/581 ->
+595/605 (+3%), 16K 595/574 -> 590/589 (flat). Same tokens; `--check` PASS (mean KL 1.72e-3); test_kernels ALL PASS;
+bench 49.7 / 49.0. 800+ needs fewer bytes over PCIe, not a cheaper copy (64.9 GB at 11.8 GB/s caps 4K at ~745).
