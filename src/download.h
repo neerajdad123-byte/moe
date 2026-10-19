@@ -102,6 +102,20 @@ static bool fetch_file(const std::string& url, const std::filesystem::path& out,
 static const char* MTP_URL = "https://github.com/neerajdad123-byte/moe/releases/download/weights-mtp-1/mtp.safetensors";
 static const uint64_t MTP_BYTES = 531715224;
 
+// A file name from the Hugging Face listing, as a path inside the model folder `dir`. false for any name that could
+// write elsewhere: absolute, with a drive ("C:x") or a ':' (alternate stream), with a ".." part, or empty.
+static bool model_file_path(const std::filesystem::path& dir, const std::string& name, std::filesystem::path& out) {
+    namespace fs = std::filesystem;
+    if (name.empty() || name.find(':') != std::string::npos) return false;
+    const fs::path rel(name);
+    if (rel.is_absolute() || rel.has_root_name() || rel.has_root_directory()) return false;
+    for (auto& part : rel) if (part == "..") return false;
+    const fs::path norm = rel.lexically_normal();
+    if (norm.empty() || norm == "." || *norm.begin() == "..") return false;
+    out = (dir / norm).lexically_normal();
+    return true;
+}
+
 static int download_model(const std::string& dir, const std::string& only) {
     std::string api;
     int st = http_get(std::string("https://huggingface.co/api/models/") + MODEL_REPO + "?blobs=true", 0,
@@ -110,21 +124,27 @@ static int download_model(const std::string& dir, const std::string& only) {
     const Json* sib = j.get("siblings");
     if (st != 200 || !jp.ok || !sib) { fprintf(stderr, "download: cannot list %s (HTTP %d). Check the internet connection.\n", MODEL_REPO, st); return 1; }
     auto wanted = [&](const std::string& n) { return only.empty() || ("," + only + ",").find("," + n + ",") != std::string::npos; };
-    std::vector<std::pair<std::string, uint64_t>> files;
+    struct File { std::string name; std::filesystem::path out; uint64_t size; };
+    std::vector<File> files;
     uint64_t all = 0;
     for (auto& f : sib->a) {
         auto n = f.get("rfilename");
         if (!n || n->t != Json::STR || n->s.rfind(".", 0) == 0 || !wanted(n->s)) continue;  // skip dotfiles (.gitattributes)
-        files.push_back({n->s, (uint64_t)f.num("size", 0)});
-        all += files.back().second;
+        std::filesystem::path out;
+        if (!model_file_path(dir, n->s, out)) {
+            fprintf(stderr, "download: the listing of %s has a file name outside the model folder (%s); nothing downloaded.\n", MODEL_REPO, n->s.c_str());
+            return 1;
+        }
+        files.push_back({n->s, out, (uint64_t)f.num("size", 0)});
+        all += files.back().size;
     }
     const bool mtp = wanted("mtp.safetensors");
     if (mtp) all += MTP_BYTES;
     std::filesystem::create_directories(dir);
     fprintf(stderr, "download: %s%s -> %s (%zu files, %.1f GB)\n", MODEL_REPO, mtp ? " + MTP head" : "", dir.c_str(), files.size() + mtp, all / 1e9);
     uint64_t done_all = 0;
-    for (auto& [name, size] : files)
-        if (!fetch_file(std::string("https://huggingface.co/") + MODEL_REPO + "/resolve/main/" + name, std::filesystem::path(dir) / name, size, name, done_all, all))
+    for (auto& [name, out, size] : files)
+        if (!fetch_file(std::string("https://huggingface.co/") + MODEL_REPO + "/resolve/main/" + name, out, size, name, done_all, all))
             return 1;
     if (mtp && !fetch_file(MTP_URL, std::filesystem::path(dir) / "mtp.safetensors", MTP_BYTES, "mtp.safetensors", done_all, all)) return 1;
     fprintf(stderr, "download: complete. Run: moex chat --load\n");
