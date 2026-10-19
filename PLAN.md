@@ -820,3 +820,95 @@ int8 produces both run to run). A/B (`build/gate_s1.sh`, 1K prompt + 10 short pr
 |---|---|---|
 | raw | 48.1 / 48.3 | **50.3 / 50.0** |
 | MTP | 57.1 / 58.4 | **59.2 / 60.3** |
+
+## agent2 (branch `agent2`): n-gram drafts, deterministic mode, GPTQ / AWQ research
+
+### A1: prompt-lookup n-gram drafts in the MTP round (opt-in: `MOEX_NGRAM=2`, needs the MTP head)
+What: when the context's last 2..4 tokens occurred earlier in it (prompt + generated), the round drafts up to
+`MOEX_NGRAM_MAX` (default 4, max 8) tokens continuing the earlier occurrence instead of the head's one; no match: the
+head's draft as before. The head still runs every round (its own KV rows). Draft length adapts: alpha = EMA of the
+per-token acceptance, length = 1 + alpha / (1 - alpha) within [1, max]. Verification is exact speculative sampling
+(src/spec.h `spec_verify`: accept d with min(1, p(d) / q(d)), else draw from norm(max(0, p - q)); greedy: p and q
+one-hot = keep a draft iff it is its row's argmax); sampled drafts are drawn from the continuation counts. The round
+is K + 1 rows (VT 4 -> 9): the DeltaNet kernels snapshot the state after every row but the last (~66 MB per draft
+token, allocated only for the n-gram max: 4 drafts = 111 fewer expert slots), rollback copies row a's state; int8
+dense GEMV over up to 8 rows reads W once (`gemm` S <= 8, each row summed exactly as decode's GEMV); CPU pair kernel up
+to 9 rows; session/serve and `--check` take rounds of any length; `--check` with `MOEX_NGRAM` teacher-forces
+`MOEX_NGRAM_MAX` drafts per round.
+Tests: tests/test_spec.cpp (CPU) ALL PASS: drafter, chains, adaptive length, p/q over 5 draft distributions (TV(out,
+p) <= 0.0021, acceptance = sum min(p, q) +- 0.0008), a 3-draft round over a Markov target (TV of the first two tokens
+0.0025 fixed / 0.0024 sampled drafts). test_kernels ALL PASS. `--check` (MTP on): eval1 1.53e-3 / 98.6% (as before);
+code1 1 draft 3.87e-4 / 100%, 4 drafts teacher-forced 3.73e-4 / 100% (rows 1..4 and the rollbacks checked).
+Greedy (MOEX_DETERMINISTIC=1, prompts of eval1 / code1 / agent1, 128 tokens): code1 and agent1 identical to plain decode
+with MTP and with MTP + n-gram; eval1: both split from plain at token 61 (the verify rows' expert kernels round
+differently from decode's, as plain MTP already did), n-gram vs MTP at token 100. So "identical to plain decode"
+holds except at near-ties, exactly as for MTP today.
+Tokens per round (greedy): code1 1.98 (head) -> **3.46** (n-gram drafts in 37% of rounds, 3.05 drafts, 73.8% kept);
+eval1 1.83 -> 1.78 (7% of rounds); agent1 1.88 -> 1.84 (30%, 68%). Sampled (temp 0.7, one correctness run in the queue,
+not a benchmark): 52.1 vs 52.4 tok/s overall, code1 60.1 vs 55.5. Speed needs the GPU owner's A/B.
+Merge: independent of A2 / A3; off by default. Default-path changes: the MTP accept goes through spec_verify (greedy
+unchanged; sampled: same distribution, other random draws for a seed); `gemm` int8 with 3..8 rows uses the GEMV
+(prefill tails too); VT 4 -> 9 (scratch +~1.6 MB, lg2 +5 MB). Open: int6 matrices (speed2's default for dn_out,
+lm_head, sh_d) have gemv_q6 for 1-2 rows only, so 3+ row rounds use the int6 tensor-core GEMM (fp16 activations).
+
+### A2: deterministic test mode (`MOEX_DETERMINISTIC=1`)
+Finding: the reductions are already in a fixed order. No float atomics on the GPU (the one atomicAdd compacts sampling
+candidates, which are then sorted with an id tie-break); attention splits combine in split order; pairs_reduce sums
+ranks in order; each CPU output element is one work item's fixed loop (no cross-thread sums). The run-to-run splits
+come from residency: whether an admission copy has landed by the next layer decides if an expert runs on the GPU or
+on the CPU (int8 activations, other rounding). In this mode poll_admissions waits until the loader has enqueued every
+job and the copy stream is idle, so residency (and every CPU/GPU split, prefill's too) depends only on the tokens. In
+this mode it also closes a window in claim_prefill_slots (the loader may have taken a job but not yet queued its copy).
+Shown in the `[load]` line. Not for the low-RAM mode (own RAM cache reads are timing-dependent).
+Test: `--check ref/eval1` twice with the logits dumped (MOEX_CHECK_DUMP), plain decode and MTP rounds: 72/72
+positions bit-identical in both. Cost: decode ~2.5 tok/s (every admission waited for at every layer): gates only; the
+default path is unchanged.
+Merge: independent; touches poll_admissions and the [load] line only.
+
+### A3: offline GPTQ / AWQ for the dense tensors (research, nothing ships from it)
+Pieces: `MOEX_CALIB=dir` (+ `MOEX_CALIB_EVERY=n`): prefill dumps every dense matrix's input rows (fp16, one file per
+group and layer); tools/calib_prompts.py: 200 calibration prompts (data/prompts.txt's 80 chat + 120 code windows of
+this repo under 8 instructions; the check sets and h2h are left out); tools/quant_dense.py: rtn, awq (per input
+channel s = rms^alpha, alpha grid on the output error tr(E H E^T), then per-group clip search; stored with s), gptq
+(static groups, `--act-order`, `--clip`), awq+gptq; int4 / int6, gs 32 / 64, `--asym` (zero points); output in the
+packed planes (q4 nibbles / q6 low + high planes, f32 scales, optional zeros and AWQ scales: src/dense_ovr.h).
+`MOEX_DENSE=dir` loads such a file (kept as F16 holding the exact dequantized values, so any variant screens without a
+kernel); tools/screen_dense.py --grid runs the per-tensor table (MOEX_FQ RTN column + MOEX_DENSE variants, eval1 /
+code1 / agent1, KL added and top-1 vs the int8 baseline).
+Tests: quant_dense.py --selftest (synthetic, int4 rel output err: rtn 1.25e-2, awq 7.1e-3, gptq 8.6e-3, gptq act-order
+8.8e-3, gptq clip 5.4e-3, awq+gptq 6.3e-3, gptq gs32 6.6e-3, gptq asym 5.8e-3); tests/test_dense.cpp: the C++ decoder
+gives Python's dequantized values bit for bit in 4 layouts (int4/int6, gs 64/32, sym/asym, with/without AWQ scales).
+Calibration dump done (queue job, 244 s): 200 prompts, every 12th prompt token, 161 files, 2.8 GB.
+Table: pending (queued after the n-gram follow-ups). Run: tools/screen_dense.py --grid (see its docstring).
+Merge: research tooling; the engine hooks are opt-in env switches (no effect unset).
+
+### A1b: n-gram follow-ups; n-gram parked (opt-in `MOEX_NGRAM=3`, off by default)
+- Multi-row dense GEMV: int6 3..8 rows (x in shared memory up to 96 KB, else from global), int8 2..8 rows; test_kernels
+  checks every row equals the 1-row GEMV exactly (2, 3, 5, 8 rows; int8 in_proj / out_proj / lm_head, int6 in_proj /
+  out_proj / shared down / lm_head). 3 rows, int6, vs the int6 tensor-core GEMM they used before: lm_head 5.94 ->
+  **2.56 ms** (162 GB/s), in_proj 0.36 -> 0.13, out_proj 0.19 -> 0.10, shared down 0.039 -> 0.020. The 2-row MTP round was
+  already on GEMVs (gemv_i8 NT 2, gemv_q6<2>): lm_head 2.47 ms per round vs 2.36 for one row.
+- Rollback by replay: one full DeltaNet state copy (after row 0, as plain MTP) + per-row conv ring (96 KB/layer) +
+  rows 1..K-1's recurrence inputs (~1 MB per draft); a rollback past row 0 copies the row-0 state back and replays
+  rows 1..a with dn_recur_k (same kernel, same order: bit-identical state). Rollback state with 4 drafts: 263 -> 74 MB
+  (expert slots 1617 vs 1624 MTP-only; was -111). Cost: rollback to row 0 0.92-0.98 ms (copy), past row 0 1.30-1.40 ms
+  (copy + replay of 1-3 rows), 3-4 per 384 tokens. `--check` with `MOEX_CHECK_WRONG=j` (draft j wrong every round, so
+  every round replays j rows): code1 j=2 KL 1.58e-4, j=3 1.97e-4, top-1 100% (normal 4-draft 2.36e-4).
+- Pick (token choice per verified row) timed apart from lm_head: greedy 0.04 ms/row, sampled (t 0.7, top-p 0.95)
+  0.16-0.17 ms/row = 0.3 ms per round: under the 0.5 ms bar, sampling left as is.
+- Profiler: the MTP-round expert counters now cover rounds of any length (they counted 2-row rounds only).
+- Gating (DraftGate, src/spec.h): per prompt, n-gram drafts only while their tokens per ms of round beat the head's
+  (rounds that captured a graph are excluded; the losing side is still tried every 4th round). Gated vs MTP-only, 2
+  alternating runs, 128 tokens per prompt, greedy / sampled t 0.7 (tok/s):
+
+  | prompt | greedy MTP-only | greedy gated | sampled MTP-only | sampled gated |
+  |---|---|---|---|---|
+  | chat (eval1) | 52.7 / 55.5 | 55.0 / 54.5 (+1.1%) | 54.1 / 56.6 | 57.1 / 54.3 (+0.6%) |
+  | code (code1) | 62.2 / 62.3 | 59.3 / 60.5 (-3.7%) | 61.1 / 58.0 | 53.8 / 64.3 (-0.9%) |
+  | agent (agent1) | 56.9 / 57.8 | 53.8 / 59.0 (-1.6%) | 54.7 / 55.2 | 55.1 / 57.0 (+1.9%) |
+  | overall | 57.0 / 58.4 | 55.9 / 57.9 (-1.4%) | 56.5 / 56.6 | 55.3 / 58.2 (+0.4%) |
+
+  (that run probed every 16th round; the gate found n-gram 19% ahead on code, 0.072 vs 0.061 tokens/ms, only after
+  ~44 gated rounds.) Verdict: parked. On code the head already keeps 98% of its drafts (1.98 tokens per round), and
+  run-to-run noise (53.8 vs 64.3 on one config) is larger than the effect. Kept as an opt-in: the verify path,
+  sampling and rollback are exact and tested.

@@ -193,13 +193,21 @@ template <int WARPS>
 __global__ void gemv_q4_k(const uint8_t* __restrict__ Q, const float* __restrict__ s, const float* __restrict__ x,
                           float* __restrict__ y, int I, int O);
 inline int persistent_blocks();
-template <int WARPS, int NT>
+template <int WARPS, int NT, bool GX = false>
 __global__ void gemv_q6_k(const uint8_t* __restrict__ Q, const uint8_t* __restrict__ Qh, const float* __restrict__ s,
                           const float* __restrict__ x, float* __restrict__ y, int I, int O);
+// x staged in shared memory when NT rows fit in Q6_SMEM (lm_head, 2048 wide: all 8 rows); wider inputs with more rows
+// (dn_out, 4096 wide: 6 .. 8 rows would need up to 147 KB) read x from global / L1, measured faster than the int6 GEMM
+// there but 1.3x slower than it on lm_head. Each row is summed exactly as the 1-row GEMV. gemv_q6_init() once first.
+constexpr int Q6_SMEM = 96 * 1024;
 template <int NT>
 inline void gemv_q6(const Mat& m, const float* x, float* y, int I, int O, cudaStream_t st) {
-    gemv_q6_k<8, NT><<<std::min(persistent_blocks(), (O + 7) / 8), 256, NT * (I + I / 8) * 4, st>>>(m.q6, m.q6h, m.s, x, y, I, O);
+    const int sm = NT * (I + I / 8) * 4, nb = std::min(persistent_blocks(), (O + 7) / 8);
+    if (NT <= 2 || sm <= Q6_SMEM) gemv_q6_k<8, NT><<<nb, 256, sm, st>>>(m.q6, m.q6h, m.s, x, y, I, O);
+    else gemv_q6_k<8, NT, true><<<nb, 256, 0, st>>>(m.q6, m.q6h, m.s, x, y, I, O);
 }
+template <int NT> inline void q6_attr() { CK(cudaFuncSetAttribute(gemv_q6_k<8, NT>, cudaFuncAttributeMaxDynamicSharedMemorySize, Q6_SMEM)); }
+inline void gemv_q6_init() { q6_attr<3>(); q6_attr<4>(); q6_attr<5>(); q6_attr<6>(); q6_attr<7>(); q6_attr<8>(); }
 
 inline void gemv(const Mat& m, const float* x, float* y, int I, int O, cudaStream_t st = 0) {
     constexpr int WARPS = 8;
@@ -329,9 +337,25 @@ __global__ void __launch_bounds__(256) gemm_i8_k(const int8_t* __restrict__ W, c
 
 // Y[S][O] = X[S][I] . W^T for a dense matrix in either form.
 inline void gemm(const Mat& m, const float* X, float* Y, int S, int I, int O, cudaStream_t st = 0) {
-    if (S <= 2) {  // the MTP round: tensor-core tiles of 64 tokens would waste 62 of them; GEMV reads W once for both
-        if (S == 2 && m.q) gemv_i8<8, 1, 2>(m.q, m.s, X, Y, I, O, st);
-        else if (S == 2 && m.q6) gemv_q6<2>(m, X, Y, I, O, st);
+    if (m.q && S <= 8) {  // MTP / draft rounds (and tiny prefill tails): one GEMV reads W once for all rows, each row
+        switch (S) {         // summed exactly as decode's gemv
+            case 1: gemv_i8<8, 1, 1>(m.q, m.s, X, Y, I, O, st); break; case 2: gemv_i8<8, 1, 2>(m.q, m.s, X, Y, I, O, st); break;
+            case 3: gemv_i8<8, 1, 3>(m.q, m.s, X, Y, I, O, st); break; case 4: gemv_i8<8, 1, 4>(m.q, m.s, X, Y, I, O, st); break;
+            case 5: gemv_i8<8, 1, 5>(m.q, m.s, X, Y, I, O, st); break; case 6: gemv_i8<8, 1, 6>(m.q, m.s, X, Y, I, O, st); break;
+            case 7: gemv_i8<8, 1, 7>(m.q, m.s, X, Y, I, O, st); break; default: gemv_i8<8, 1, 8>(m.q, m.s, X, Y, I, O, st);
+        }
+        return;
+    }
+    if (m.q6 && S >= 3 && S <= 8) {  // draft rounds: one GEMV reads W once for all rows
+        switch (S) {
+            case 3: gemv_q6<3>(m, X, Y, I, O, st); break; case 4: gemv_q6<4>(m, X, Y, I, O, st); break;
+            case 5: gemv_q6<5>(m, X, Y, I, O, st); break; case 6: gemv_q6<6>(m, X, Y, I, O, st); break;
+            case 7: gemv_q6<7>(m, X, Y, I, O, st); break; default: gemv_q6<8>(m, X, Y, I, O, st);
+        }
+        return;
+    }
+    if (S <= 2) {  // tensor-core tiles of 64 tokens would waste 62 of them
+        if (S == 2 && m.q6) gemv_q6<2>(m, X, Y, I, O, st);
         else for (int t = 0; t < S; t++) gemv(m, X + (size_t)t * I, Y + (size_t)t * O, I, O, st);
         return;
     }
@@ -451,13 +475,15 @@ __device__ __forceinline__ float dot32_q6(uint4 u, uint2 h, const float* __restr
     }
     return acc;
 }
-template <int WARPS, int NT>
+template <int WARPS, int NT, bool GX>
 __global__ void gemv_q6_k(const uint8_t* __restrict__ Q, const uint8_t* __restrict__ Qh, const float* __restrict__ s,
                           const float* __restrict__ x, float* __restrict__ y, int I, int O) {
-    extern __shared__ __align__(16) float xs[];  // NT x [xpad_size(I)]
-    for (int t = 0; t < NT; t++)
-        for (int i = threadIdx.x; i < I; i += blockDim.x) xs[t * xpad_size(I) + xpad(i)] = x[(size_t)t * I + i];
-    __syncthreads();
+    extern __shared__ __align__(16) float xs[];  // NT x [xpad_size(I)]; GX: unused, x read from global
+    if (!GX) {
+        for (int t = 0; t < NT; t++)
+            for (int i = threadIdx.x; i < I; i += blockDim.x) xs[t * xpad_size(I) + xpad(i)] = x[(size_t)t * I + i];
+        __syncthreads();
+    }
     const int lane = threadIdx.x & 31, G = I / 64;
     for (int row = blockIdx.x * WARPS + (threadIdx.x >> 5); row < O; row += gridDim.x * WARPS) {
         const uint4* wr = reinterpret_cast<const uint4*>(Q + (size_t)row * (I / 2));
@@ -470,7 +496,7 @@ __global__ void gemv_q6_k(const uint8_t* __restrict__ Q, const uint8_t* __restri
             const uint2 h = __ldcs(hr + c);
             const float sc = sr[c >> 1];
 #pragma unroll
-            for (int t = 0; t < NT; t++) acc[t] += dot32_q6(u, h, xs + t * xpad_size(I) + 36 * c) * sc;
+            for (int t = 0; t < NT; t++) acc[t] += dot32_q6(u, h, GX ? x + (size_t)t * I + 32 * c : xs + t * xpad_size(I) + 36 * c) * sc;
         }
 #pragma unroll
         for (int t = 0; t < NT; t++) { const float v = warp_sum(acc[t]); if (lane == 0) y[(size_t)t * O + row] = v; }
@@ -1268,9 +1294,10 @@ __global__ void set_int_k(int* p, int v) { *p = v; }
 // ---- K8: Gated DeltaNet decode ----
 // Conv: causal depthwise conv (kernel CK) over C channels with a carried ring [C][CK-1], then SiLU.
 // T tokens in order (T = 1 for decode, a chunk for prefill). qkv rows have stride ld; out is [T][C].
-// ring0 (optional, T > 1): the ring after the first token, so the MTP round can drop the second (a wrong draft)
+// ring0 (optional, T > 1): the ring after each token but the last (token t at ring0 + t * rstride), so the MTP round can
+// drop the tokens after any accepted one (rejected drafts)
 __global__ void dn_conv_k(const float* __restrict__ qkv, int ld, const half* __restrict__ w, float* __restrict__ ring,
-                          float* __restrict__ out, int C, int CKn, int T, float* __restrict__ ring0 = nullptr) {
+                          float* __restrict__ out, int C, int CKn, int T, float* __restrict__ ring0 = nullptr, size_t rstride = 0) {
     if (g_skip) return;
     int c = blockIdx.x * blockDim.x + threadIdx.x;
     if (c >= C) return;
@@ -1282,7 +1309,7 @@ __global__ void dn_conv_k(const float* __restrict__ qkv, int ld, const half* __r
         for (int i = 0; i < CKn - 2; i++) rg[i] = rg[i + 1];
         rg[CKn - 2] = x;
         out[(size_t)t * C + c] = acc / (1.f + __expf(-acc));
-        if (t == 0 && ring0) for (int i = 0; i < CKn - 1; i++) ring0[(size_t)c * (CKn - 1) + i] = rg[i];
+        if (t < T - 1 && ring0) for (int i = 0; i < CKn - 1; i++) ring0[t * rstride + (size_t)c * (CKn - 1) + i] = rg[i];
     }
 }
 
@@ -1294,7 +1321,7 @@ __global__ void dn_recur_k(const float* __restrict__ conv, int C, const float* _
                            const float* __restrict__ a, const float* __restrict__ b, int ld,
                            const half* __restrict__ A_log, const half* __restrict__ dt_bias,
                            const half* __restrict__ nw, float* __restrict__ S, float* __restrict__ o,
-                           int VH, int KH, float eps, int T, float* __restrict__ S0 = nullptr) {  // S0: state after token 0
+                           int VH, int KH, float eps, int T, float* __restrict__ S0 = nullptr) {  // S0: the state after token 0
     __shared__ float qs[DNK], ks[DNK];
     const int h = blockIdx.x, v = threadIdx.x, kh = h / (VH / KH);
     const float alog = expf(__half2float(A_log[h])), dtb = __half2float(dt_bias[h]), nwv = __half2float(nw[v]);
@@ -1338,8 +1365,8 @@ inline void deltanet_core(const float* qkv, const float* z, const float* a, cons
                           const half* conv_w, const half* A_log, const half* dt_bias, const half* nw,
                           float* ring, float* S, float* conv_scratch, float* o,
                           int C, int CKn, int VH, int KH, float eps, int T = 1, cudaStream_t st = 0,
-                          float* S0 = nullptr, float* ring0 = nullptr) {
-    dn_conv_k<<<(C + 255) / 256, 256, 0, st>>>(qkv, ld, conv_w, ring, conv_scratch, C, CKn, T, ring0);
+                          float* S0 = nullptr, float* ring0 = nullptr, size_t rstride = 0) {
+    dn_conv_k<<<(C + 255) / 256, 256, 0, st>>>(qkv, ld, conv_w, ring, conv_scratch, C, CKn, T, ring0, rstride);
     dn_recur_k<<<VH, DNV, 0, st>>>(conv_scratch, C, z, a, b, ld, A_log, dt_bias, nw, S, o, VH, KH, eps, T, S0);
 }
 

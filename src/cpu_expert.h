@@ -255,7 +255,7 @@ struct CpuExperts {
     // of its tokens. X: [T][H] rows; pair outputs ypair[pid][H] = w * expert(x_t). All threads share one
     // parallel_for over (expert, row block) items.
     struct Job { const uint8_t* q; const float* sc; std::vector<int> toks, pids; std::vector<float> ws; };
-    // The MTP round's CPU misses (T <= 4 rows): run_i8's two phases over (expert, token) pairs; each weight row is read
+    // The MTP round's CPU misses (T <= 9 rows): run_i8's two phases over (expert, token) pairs; each weight row is read
     // once and dotted with every row that uses the expert. ypair[pid][H] = w * expert(x_t), as run_pairs.
     std::vector<QAct> qxt, qp;
     void run_pairs_small(const std::vector<Job>& jobs, const float* X, int T, float* ypair) {
@@ -273,7 +273,7 @@ struct CpuExperts {
         std::function<void(int)> gu = [&](int it) {
             const Job& jb = jobs[it / NG];
             const int g = it % NG, r0 = g * GS, nk = (int)jb.toks.size();
-            alignas(32) float a[4][GS];
+            alignas(32) float a[9][GS];
             for (int r = 0; r < GS; r++)
                 for (int k = 0; k < nk; k++) {
                     const QAct& x = qxt[jb.toks[k]];
