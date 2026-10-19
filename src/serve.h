@@ -524,21 +524,33 @@ static void serve(Session& ss, Tokenizer& tk, const std::string& host, int port,
         SOCKET c = accept(ls, nullptr, nullptr);
         if (c == INVALID_SOCKET) continue;
         // One request at a time, so a client that stalls must not hold the server: 15 s per read, 60 s per write
-        // (a stream to a client that stopped reading).
+        // (a stream to a client that stopped reading), and a total deadline for the request (a client trickling a
+        // byte at a time stays under the per-read timeout): 30 s for the headers, then 30 s + 1 s per MB of body.
+        auto set_timeout = [&](int opt, double s) {
 #ifdef _WIN32
-        DWORD rto = 15000, sto = 60000;
+            DWORD t = (DWORD)std::max(1.0, s * 1000);
 #else
-        timeval rto{15, 0}, sto{60, 0};
+            timeval t{(long)s, (long)((s - (long)s) * 1e6)}; if (!t.tv_sec && !t.tv_usec) t.tv_usec = 1000;
 #endif
-        setsockopt(c, SOL_SOCKET, SO_RCVTIMEO, (const char*)&rto, sizeof rto);
-        setsockopt(c, SOL_SOCKET, SO_SNDTIMEO, (const char*)&sto, sizeof sto);
+            setsockopt(c, SOL_SOCKET, opt, (const char*)&t, sizeof t);
+        };
+        set_timeout(SO_SNDTIMEO, 60);
         constexpr long long MAX_BODY = 64ll << 20, MAX_HEAD = 1 << 20;
         std::string req; char buf[65536];
         size_t hdr_end = std::string::npos; long long clen = 0;
         int refuse = 0;  // 413 body too large, 431 headers too large, 408 incomplete
+        bool too_slow = false;
+        double deadline = now() + 30;
         while (true) {  // headers, then Content-Length bytes of body
+            const double left = deadline - now();
+            if (left <= 0) { refuse = 408; too_slow = true; break; }
+            set_timeout(SO_RCVTIMEO, std::min(15.0, left));
             int n = recv(c, buf, sizeof buf, 0);
-            if (n <= 0) { if (hdr_end == std::string::npos || (long long)req.size() < (long long)hdr_end + 4 + clen) refuse = 408; break; }
+            if (n <= 0) {
+                if (hdr_end == std::string::npos || (long long)req.size() < (long long)hdr_end + 4 + clen) refuse = 408;
+                too_slow = refuse && now() >= deadline - 0.1;  // the read waited out the deadline
+                break;
+            }
             req.append(buf, n);
             if (hdr_end == std::string::npos && (hdr_end = req.find("\r\n\r\n")) != std::string::npos) {
                 std::string h = req.substr(0, hdr_end);
@@ -546,6 +558,7 @@ static void serve(Session& ss, Tokenizer& tk, const std::string& host, int port,
                 size_t k = h.find("content-length:");
                 clen = k == std::string::npos ? 0 : strtoll(h.c_str() + k + 15, nullptr, 10);
                 if (clen < 0 || clen > MAX_BODY) { refuse = 413; break; }
+                deadline = now() + 30 + clen / 1e6;
             }
             if (hdr_end == std::string::npos && (long long)req.size() > MAX_HEAD) { refuse = 431; break; }
             if (hdr_end != std::string::npos && (long long)req.size() >= (long long)hdr_end + 4 + clen) break;
@@ -554,7 +567,8 @@ static void serve(Session& ss, Tokenizer& tk, const std::string& host, int port,
             if (refuse != 408 || !req.empty())  // nothing at all: just close
                 send_all(c, "HTTP/1.1 " + std::to_string(refuse) + (refuse == 413 ? " Payload Too Large" : refuse == 431 ? " Request Header Fields Too Large" : " Request Timeout") +
                             "\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: 0\r\n\r\n");
-            if (refuse != 408) fprintf(stderr, "[serve] refused a request: %s\n", refuse == 413 ? "body over 64 MB" : "headers over 1 MB");
+            if (refuse != 408 || too_slow)
+                fprintf(stderr, "[serve] refused a request: %s\n", refuse == 413 ? "body over 64 MB" : refuse == 431 ? "headers over 1 MB" : "sent too slowly");
             closesocket(c);
             continue;
         }

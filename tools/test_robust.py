@@ -41,6 +41,24 @@ t = time.time(); ok = alive(timeout=90); dt = time.time() - t
 idle.close()
 check("idle connection doesn't block the server for long", ok and dt < 40, f"other client served after {dt:.1f}s")
 
+# 1b. a client that trickles its headers (a byte every 5 s, under the 15 s per-read timeout) must not hold the
+# server forever: a request has a total deadline
+import threading
+stop = threading.Event()
+def trickle():
+    s = socket.create_connection((u.hostname, u.port))
+    try:
+        for ch in b"GET /health HTTP/1.1\r\nX-Slow: " + b"a" * 1000:
+            s.send(bytes([ch]))
+            if stop.wait(5): break
+    except OSError: pass  # the server dropped us
+    s.close()
+th = threading.Thread(target=trickle); th.start()
+time.sleep(1)
+t = time.time(); ok = alive(timeout=120); dt = time.time() - t
+stop.set(); th.join()
+check("trickling client doesn't block the server for long", ok and dt < 45, f"other client served after {dt:.1f}s")
+
 # 2. deeply nested JSON: refused, no crash
 r = post(b"[" * 100000)
 check("JSON nested 100,000 deep: refused, server alive", " 400 " in r and alive(), r)
