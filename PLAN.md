@@ -716,3 +716,24 @@ GPU idle (CPU wait + gaps) ~4.2 (CPU work 5.0) | total 20.3 = 49.2 tok/s raw, 58
 Parked (small lever: ~+0.6 tok/s per 100 slots): lazy KV (grow in chunks; ~70 MB = ~40 slots at 1K; the decode graphs
 capture the KV pointers, so growth needs a re-capture), a dynamic expert cache (shrink as the context grows), a smaller
 driver reserve (150 MB worked here; risky with other apps using VRAM).
+
+### Checkpoint 2: int4 dense - not shipped (no tensor passes)
+GEMV is ready: int4 gs64 lm_head 1.66 ms = 172.6 GB/s (92%; int8 2.77 ms). Quality is the blocker. Ideal saving if every
+dense tensor were int4: ~804 MB, ~4.8 ms/token (dn_in 318 MB / 1.89 ms, lm_head 213 / 1.27, dn_out 105 / 0.63,
+attn_qkv 79 / 0.47, attn_o 35 / 0.21, sh_gu 35 / 0.21, sh_d 18 / 0.11).
+`--check --no-prefill`, one tensor type int4 at a time (int8 baseline mean KL 2.09e-3, top-1 98.1%); budget for the
+whole mix: KL +1e-3, top-1 -0.5:
+
+| tensor | RTN (with prefill) | MSE clip search | Hadamard 256 | Hadamard 1024 |
+|---|---|---|---|---|
+| dn_in | 3.58e-2 / 88.9% | 9.83e-3 / 97.2% | 9.14e-3 / 99.1% | 2.57e-2 / 97.2% |
+| lm_head | 6.70e-3 / 95.8% | 7.83e-3 / 98.1% | 7.95e-3 / 96.3% | 7.54e-3 / 97.2% |
+| dn_out | 6.01e-3 / 97.2% | 1.55e-2 / 96.3% | 1.12e-2 / 94.4% | 1.66e-2 / 96.3% |
+| attn_qkv | (with attn_o) 2.39e-2 / 98.6% | 1.19e-2 / 97.2% | 1.21e-2 / 95.3% | 6.02e-3 / 98.1% |
+| attn_o | | 7.49e-3 / 98.1% | 8.33e-3 / 97.2% | 1.91e-2 / 98.1% |
+| sh_gu | (with sh_d) 7.33e-3 / 95.8% | 3.53e-3 / 96.3% | 4.29e-3 / 98.1% | 3.98e-3 / 97.2% |
+| sh_d | | 5.70e-3 / 95.3% | 2.99e-3 / 97.2% | 4.36e-3 / 97.2% |
+
+(dn_in also: Hadamard 64 1.24e-2 / 95.3%, 64 + MSE 1.26e-2, 256 + MSE 1.97e-2.) The closest, sh_d with Hadamard 256, adds
++0.9e-3 but drops top-1 0.9 points. Stopped after two rotation tries. Not tried: GPTQ / AWQ with calibration data,
+6-bit dense with group scales (~0.78x the bytes of int8 per-row, ~2.4 ms/token if every tensor takes it).
