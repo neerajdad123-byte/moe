@@ -168,7 +168,9 @@ turns it on for every request; a request can still choose with `chat_template_kw
 `reasoning_effort` (`"none"` = off). The thinking arrives as `reasoning_content` and the answer as `content`, so Open WebUI
 and other apps show it as a separate thinking section. Apps that resend the whole conversation each turn only pay for
 the new message.
-It listens on your machine only; `--host 0.0.0.0 --port N` changes that.
+It listens on your machine only; `--host 0.0.0.0 --port N` changes that (there is no API key, so only on networks you
+trust). Web pages can't use it unless they are served from localhost: a site you visit can't send your model
+requests or read its replies. To let a web app on another address call moex, start it with `--allow-origin URL`.
 
 ## Speed
 

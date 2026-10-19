@@ -1395,6 +1395,7 @@ int main(int argc, char** argv) {
     bool think = false, samp_set = false, n_set = false, warm = false;
     int mtp = -1;  // --mtp 1, --no-mtp 0, else on where it was measured faster
     std::string host = "127.0.0.1";
+    std::vector<std::string> allow_origins;  // serve: web pages (Origin) besides localhost ones that may call
     int port = 8765;
     if (argc > 1 && argv[1][0] != '-') { mode = argv[1]; argv++; argc--; }  // moex chat | moex serve
     std::vector<int> ids, stop;
@@ -1417,6 +1418,7 @@ int main(int argc, char** argv) {
         else if (s == "--no-mtp") mtp = 0;
         else if (s == "-v" || s == "--version") mode = "version";
         else if (s == "--host") host = next();
+        else if (s == "--allow-origin") allow_origins.push_back(next());
         else if (s == "--port") port = std::stoi(next());
         else if (s == "--ctx") ctx = std::stoi(next());
         else if (s == "--stop") stop = parse_ids(next());
@@ -1463,6 +1465,7 @@ int main(int argc, char** argv) {
                 "  --temp T --top-p P --top-k K --repeat-penalty R --seed N   sampling (chat: 0.7 / 0.8 / 20)\n"
                 "  --ctx N                context length in tokens (chat/serve default 8192)\n"
                 "  --port N --host H      server address (serve; default 8765, 127.0.0.1 = this PC only)\n"
+                "  --allow-origin URL     serve: let web pages from URL call moex (default: localhost pages only; * = any)\n"
                 "  --model DIR            model folder (default %s; or set MOEX_MODEL)\n"
                 "  --no-mtp               no multi-token prediction (on by default when RAM holds every expert: ~5%% faster)\n\n"
                 "Developer: --ids 1,2,3 [--n N] | --batch ids.txt | --check ref/eval1 | --f16 | --profile\n",
@@ -1523,7 +1526,7 @@ int main(int argc, char** argv) {
         Tokenizer tk(model + "/tokenizer.json");
         Session ss(eng, tk);
         ss.think = think;  // the default for requests that don't say (chat_template_kwargs.enable_thinking, reasoning_effort)
-        serve(ss, tk, host, port, "qwen3.6-35b-a3b");
+        serve(ss, tk, host, port, "qwen3.6-35b-a3b", allow_origins);
         return 0;
     }
     if (mode == "chat") {

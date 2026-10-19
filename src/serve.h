@@ -46,9 +46,33 @@ static bool send_all(SOCKET c, const std::string& s) {
     for (size_t p = 0; p < s.size();) { int n = send(c, s.data() + p, (int)(s.size() - p), 0); if (n <= 0) return false; p += n; }
     return true;
 }
-static const char* CORS = "Access-Control-Allow-Origin: *\r\nAccess-Control-Allow-Headers: *\r\nAccess-Control-Allow-Methods: GET, POST, OPTIONS\r\n";
+// CORS headers for the current request: only an allowed Origin is echoed back (never "*"), so a web page from
+// another site cannot read moex's replies. Set per request by serve(); one request at a time.
+static std::string CORS;
+// A header's value (name lowercase), "" if absent.
+static std::string header_of(const std::string& head, const std::string& name) {
+    std::string low = head;
+    for (auto& ch : low) ch = (char)tolower(ch);
+    size_t k = low.find("\r\n" + name + ":");
+    if (k == std::string::npos) return "";
+    k += name.size() + 3;
+    size_t e = head.find("\r\n", k);
+    return trim(head.substr(k, (e == std::string::npos ? head.size() : e) - k));
+}
+// "http://localhost:3000" -> "localhost"; "[::1]:8765" -> "::1"; "127.0.0.1:8765" -> "127.0.0.1"
+static std::string host_part(std::string s) {
+    size_t sch = s.find("://");
+    if (sch != std::string::npos) s = s.substr(sch + 3);
+    s = s.substr(0, s.find('/'));
+    if (!s.empty() && s[0] == '[') return s.substr(1, s.find(']') - 1);
+    return s.substr(0, s.find(':'));
+}
+static bool is_loopback_name(const std::string& h) {
+    std::string l = h; for (auto& ch : l) ch = (char)tolower(ch);
+    return l == "localhost" || l == "::1" || starts_with(l, "127.") || ends_with(l, ".localhost");
+}
 static void respond(SOCKET c, int code, const std::string& type, const std::string& body) {
-    const char* msg = code == 200 ? "OK" : code == 400 ? "Bad Request" : code == 404 ? "Not Found" : "Error";
+    const char* msg = code == 200 ? "OK" : code == 400 ? "Bad Request" : code == 403 ? "Forbidden" : code == 404 ? "Not Found" : "Error";
     send_all(c, "HTTP/1.1 " + std::to_string(code) + " " + msg + "\r\nContent-Type: " + type + "\r\nContent-Length: " +
                 std::to_string(body.size()) + "\r\n" + CORS + "Connection: close\r\n\r\n" + body);
 }
@@ -433,7 +457,26 @@ static void completions_serve(SOCKET c, Session& ss, Tokenizer& tk, const Json& 
             finish + "\"}],\"usage\":" + usage + "}");
 }
 
-static void serve(Session& ss, Tokenizer& tk, const std::string& host, int port, const std::string& model_id) {
+// Who may call: with moex on loopback, the Host header must name loopback too (a DNS-rebinding page names its own
+// domain). A browser request (it carries Origin) is allowed from loopback pages and from --allow-origin; requests
+// without Origin (curl, SDKs, Open WebUI's backend) are not affected. Returns "" if allowed, else the reason.
+static std::string check_caller(const std::string& head, bool loopback, const std::vector<std::string>& allow_origins,
+                                std::string& cors) {
+    cors.clear();
+    const std::string hosth = header_of(head, "host"), origin = header_of(head, "origin");
+    if (loopback && !hosth.empty() && !is_loopback_name(host_part(hosth)))
+        return "Host '" + hosth + "' is not this computer (moex serve listens on localhost only)";
+    if (origin.empty()) return "";
+    bool ok = is_loopback_name(host_part(origin));
+    for (auto& a : allow_origins) ok |= a == "*" || a == origin;
+    if (!ok) return "requests from web pages at " + origin + " are not allowed (start moex serve with --allow-origin " + origin + " to allow them)";
+    cors = "Access-Control-Allow-Origin: " + origin + "\r\nVary: Origin\r\nAccess-Control-Allow-Headers: *\r\n"
+           "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n";
+    return "";
+}
+
+static void serve(Session& ss, Tokenizer& tk, const std::string& host, int port, const std::string& model_id,
+                  const std::vector<std::string>& allow_origins = {}) {
 #ifdef _WIN32
     WSADATA wsa; WSAStartup(MAKEWORD(2, 2), &wsa);
 #else
@@ -445,6 +488,7 @@ static void serve(Session& ss, Tokenizer& tk, const std::string& host, int port,
     uint8_t ip[4];
     if (!parse_host(host, ip)) { fprintf(stderr, "[serve] --host %s is not an IPv4 address (e.g. 127.0.0.1, or 0.0.0.0 for your network)\n", host.c_str()); return; }
     memcpy(&a.sin_addr, ip, 4);
+    const bool loopback = ip[0] == 127;
     int yes = 1; setsockopt(ls, SOL_SOCKET, SO_REUSEADDR, (const char*)&yes, sizeof yes);
     if (bind(ls, (sockaddr*)&a, sizeof a) || listen(ls, 16)) { fprintf(stderr, "[serve] cannot listen on %s:%d (port in use? choose another with --port)\n", host.c_str(), port); return; }
     const std::string base = "http://" + std::string(host == "0.0.0.0" ? "127.0.0.1" : host) + ":" + std::to_string(port);
@@ -472,7 +516,8 @@ static void serve(Session& ss, Tokenizer& tk, const std::string& host, int port,
             "  %s\n"
             "  Ctrl+C stops the server.\n\n",
             model_id.c_str(), base.c_str(), model_id.c_str(), ps_example.c_str(), py_example.c_str(), base.c_str(), ss.eng.ctx,
-            host == "127.0.0.1" ? "Only this PC can connect (--host 0.0.0.0 opens it to your network)." : "Other devices on your network can connect too.");
+            loopback ? "Only this PC can connect (--host 0.0.0.0 opens it to your network). Web pages: only localhost ones (--allow-origin URL for others)."
+                     : "Other devices on your network can connect too (no API key: only on networks you trust).");
     while (true) {
         SOCKET c = accept(ls, nullptr, nullptr);
         if (c == INVALID_SOCKET) continue;
@@ -496,6 +541,13 @@ static void serve(Session& ss, Tokenizer& tk, const std::string& host, int port,
         std::string path = req.substr(ps, req.find(' ', ps) - ps);
         path = path.substr(0, path.find('?'));  // e.g. /v1/messages?beta=true
         std::string body = hdr_end == std::string::npos ? "" : req.substr(hdr_end + 4);
+        const std::string why = check_caller(hdr_end == std::string::npos ? "" : req.substr(0, hdr_end), loopback, allow_origins, CORS);
+        if (!why.empty()) {
+            fprintf(stderr, "[serve] refused %s %s: %s\n", method.c_str(), path.c_str(), why.c_str());
+            respond(c, 403, "application/json", "{\"error\":{\"message\":\"" + jesc(why) + "\"}}");
+            closesocket(c);
+            continue;
+        }
         if (method == "OPTIONS") { respond(c, 200, "text/plain", ""); }
         else if (method == "GET" && path == "/health") respond(c, 200, "application/json", "{\"status\":\"ok\"}");
         else if (method == "GET" && (path == "/api" || path == "/")) respond(c, 200, "application/json", api_help);
