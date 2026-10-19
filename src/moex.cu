@@ -1202,7 +1202,8 @@ struct Engine {
                 // CPU: non-resident experts, each read once for all of its tokens, overlapped with the above
                 double c1 = now();
                 if (vs_on) vt[0] += c1 - hb0;
-                cpu.run_pairs(jobs, rows_h, T, T * TOPK, ypair_cpu.data());
+                if (verify) cpu.run_pairs_small(jobs, rows_h, T, ypair_cpu.data());  // the MTP round: int8 kernel, as decode
+                else cpu.run_pairs(jobs, rows_h, T, T * TOPK, ypair_cpu.data());
                 lap(5);
                 for (int t = 0; t < T; t++) {
                     float* y = ycpu_h + (size_t)t * D;
@@ -1840,6 +1841,13 @@ int main(int argc, char** argv) {
         }
         for (int m = 1; m < 3; m++) if (eng.cl[m][9]) eng.print_cl(m, eng.cl[m][9] / 1e6, "us/layer", m == 1 ? "MTP layers, all hits in VRAM" : "MTP layers, with a CPU miss ");
         eng.rc_report(tot.dec);
+        if (eng.cpu.calls) {
+            const CpuExperts& c = eng.cpu; const double t = std::max(tot.dec, 1);
+            fprintf(stderr, "    cpu experts (%s): %.1f calls/tok, %.1f items/call | wall ms/tok: quantize x %.2f  gate+up phase %.2f  down phase %.2f"
+                            " | item CPU ms/tok: gate+up %.2f  act+requant %.2f  down %.2f\n", c.vnni ? "AVX-VNNI" : "AVX2",
+                    c.calls / t, (double)c.items / c.calls, 1e3 * c.t_quant / t, 1e3 * c.t_par / t, 1e3 * c.t_red / t,
+                    c.ns_gu / 1e6 / t, c.ns_act / 1e6 / t, c.ns_dn / 1e6 / t);
+        }
         if (eng.mtp_rounds) {
             const double r = (double)eng.mtp_rounds;
             fprintf(stderr, "[mtp] %lld rounds, draft accepted %.1f%% | ms/round: snapshot %.2f  40 layers %.2f  lm_head+pick %.2f  mtp layer %.2f  redo %.2f | layers: gpu-wait %.2f  cpu-experts %.2f\n",

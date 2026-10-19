@@ -684,3 +684,19 @@ b043d3, b480a0 across its runs), the known near-tie; the new binary produces the
 | untraced total | 21.9 (45.6 tok/s) | 23.2 (43.1 tok/s) |
 CPU misses 108.6 / 104.0 per token, CPU experts 6.6 ms/token; 90% of layers have a miss (wait-routing 274 us + CPU
 184 us + admissions 26 us). Admissions 83 experts/token = ~147 MB H2D per token (~6.6 GB/s at 45 tok/s): churn, see D5.
+
+### D3: CPU experts with int8 activations + AVX-VNNI (decode and the MTP round)
+x quantized once per layer (int8 per 64-group, deinterleaved like the nibbles; nibble ^ 8 = w + 8 unsigned, the
+8 * sum(x) correction precomputed); vpdpbusd (AVX-VNNI, picked by cpuid; AVX2 maddubs + madd fallback). Two phases:
+(expert, 64-row block) items do gate/up and quantize their 64 activations as one group of the down input; then
+64-row blocks of down read whole 256-byte rows for every expert. The MTP round's CPU misses (`run_pairs_small`) use
+the same kernel over (expert, token) pairs; prefill keeps fp32 `run_pairs`.
+First try, fused (each item one column group of down for all rows): CPU 6.2 -> 6.8 ms/token. Phase profile:
+down took as long as gate+up (22.1 vs 22.7 CPU-ms/token) at half the bytes: two items read halves of each 64-byte
+line of down, so its RAM traffic doubled. Two-phase: down 11.3 CPU-ms (half of gate+up), quantize x 0.42 -> 0.09 ms.
+test_kernels K14 (8 threads, from RAM): 1 expert 0.071 -> 0.052 ms, 8 experts 0.345 -> 0.330 (~43 GB/s; RAM ~55).
+A/B (old, new, 2 rounds), 10 prompts x 64 tokens: MTP off 47.2 / 47.2 -> 49.3 / 49.3 tok/s, CPU 6.0 -> 5.0 ms/token;
+MTP on 55.2 / 54.7 -> 59.3 / 58.6, CPU 6.9 -> 5.65. `moex bench`: MTP on 50.3 / 49.6 -> 53.5 / 53.4; off 48.0 / 47.7 ->
+49.9 / 50.1. `--check` PASS: mean KL 1.26e-3 -> 1.52e-3, worst 2.99e-2, top-1 98.6%. Greedy: 8/10 prompts identical
+over 64 tokens; 2 split late (tokens 58, 61) at top-2 gaps 0.14 / 0.33 logit (median gap 11.5). Accepted on KL and
+top-1 (approximate kernels are gated on those); this build is the new greedy baseline.

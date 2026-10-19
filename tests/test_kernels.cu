@@ -218,7 +218,7 @@ int main(int argc, char** argv) {
             CpuExperts ce(threads);
             std::vector<float> cpu(D);
             ce.run(K, hq.data(), hs.data(), rwv.data(), h.data(), cpu.data());
-            if (threads == 8) check("CPU 8 experts vs GPU", cpu, gpu, 1e-5f);
+            if (threads == 8) check("CPU 8 experts vs GPU", cpu, gpu, 2e-2f);  // int8 activations (per 64-group) on the CPU
             for (int m : {1, 2, 4, 8}) {
                 for (int i = 0; i < 3; i++) ce.run(m, hq.data(), hs.data(), rwv.data(), h.data(), cpu.data());
                 std::vector<double> t(21);
