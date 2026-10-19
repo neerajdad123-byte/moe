@@ -46,6 +46,7 @@ static int http_get(const std::string& url, uint64_t from, const std::function<b
             }
             std::vector<char> buf(1 << 20);
             DWORD got = 0;
+            if (!(from && status == 200))  // 200 to a Range = the whole file: no body, the caller starts over
             while (status < 400 && WinHttpReadData(r, buf.data(), (DWORD)buf.size(), &got) && got)
                 if (!sink(buf.data(), got)) { status = 0; break; }
         }
@@ -56,15 +57,18 @@ static int http_get(const std::string& url, uint64_t from, const std::function<b
     return status;
 }
 #else
-// shortcut: curl's exit code stands in for the HTTP status (22 = HTTP error); `total` stays unset (no caller uses it)
+#include <sys/wait.h>
+// shortcut: curl's exit code stands in for the HTTP status (22 = HTTP error); `total` stays unset (no caller uses it).
+// -C resumes and fails with 33 (nothing written) when the server ignores the Range: reported as 200, like Windows.
 static int http_get(const std::string& url, uint64_t from, const std::function<bool(const char*, size_t)>& sink, uint64_t* = nullptr) {
-    std::string cmd = "curl -sSLf" + (from ? " -r " + std::to_string(from) + "-" : std::string()) + " " + shell_quote(url);
+    std::string cmd = "curl -sSLf" + (from ? " -C " + std::to_string(from) : std::string()) + " " + shell_quote(url);
     FILE* p = popen(cmd.c_str(), "r");
     if (!p) return 0;
     std::vector<char> buf(1 << 20);
     bool ok = true;
     for (size_t got; ok && (got = fread(buf.data(), 1, buf.size(), p)) > 0;) ok = sink(buf.data(), got);
     const int rc = pclose(p);
+    if (ok && from && WIFEXITED(rc) && WEXITSTATUS(rc) == 33) return 200;
     return ok && rc == 0 ? (from ? 206 : 200) : 0;
 }
 #endif
@@ -75,24 +79,30 @@ static bool fetch_file(const std::string& url, const std::filesystem::path& out,
     std::filesystem::path part = out; part += ".part";
     if (std::filesystem::exists(out) && (!size || std::filesystem::file_size(out) == size)) { done_all += size; return true; }
     uint64_t have = std::filesystem::exists(part) ? std::filesystem::file_size(part) : 0;
+    if (size && have > size) have = 0;  // longer than the file: start over
+    int code = size && have == size ? 206 : 0;  // complete, only the rename is missing (a Range past the end gets 416)
+    while (!code) {
 #ifdef _WIN32
-    FILE* f = _wfopen(part.wstring().c_str(), have ? L"ab" : L"wb");
+        FILE* f = _wfopen(part.wstring().c_str(), have ? L"ab" : L"wb");
 #else
-    FILE* f = fopen(part.c_str(), have ? "ab" : "wb");
+        FILE* f = fopen(part.c_str(), have ? "ab" : "wb");
 #endif
-    if (!f) { fprintf(stderr, "download: cannot write %s\n", part.string().c_str()); return false; }
-    double t0 = now(), tp = 0; uint64_t got = have;
-    int code = http_get(url, have, [&](const char* p, size_t n) {
-        if (fwrite(p, 1, n, f) != n) return false;
-        got += n;
-        if (now() - tp > 1.0) {
-            tp = now();
-            fprintf(stderr, "\r  %-34s %6.0f / %6.0f MB  %5.1f MB/s  (total %.1f%%)   ", name.c_str(), got / 1e6, size / 1e6,
-                    (got - have) / 1e6 / std::max(tp - t0, 1e-3), 100.0 * (done_all + got) / std::max<uint64_t>(all, 1));
-        }
-        return true;
-    });
-    fclose(f);
+        if (!f) { fprintf(stderr, "download: cannot write %s\n", part.string().c_str()); return false; }
+        double t0 = now(), tp = 0; uint64_t got = have;
+        code = http_get(url, have, [&](const char* p, size_t n) {
+            if (fwrite(p, 1, n, f) != n) return false;
+            got += n;
+            if (now() - tp > 1.0) {
+                tp = now();
+                fprintf(stderr, "\r  %-34s %6.0f / %6.0f MB  %5.1f MB/s  (total %.1f%%)   ", name.c_str(), got / 1e6, size / 1e6,
+                        (got - have) / 1e6 / std::max(tp - t0, 1e-3), 100.0 * (done_all + got) / std::max<uint64_t>(all, 1));
+            }
+            return true;
+        });
+        fclose(f);
+        if (have && code == 200) { have = 0; code = 0; }  // the server ignored the Range (body not read): from the start
+        else break;
+    }
     if ((code != 200 && code != 206) || (size && std::filesystem::file_size(part) != size)) {
         fprintf(stderr, "\ndownload: %s failed (HTTP %d, %llu of %llu bytes). Run `moex download` again to resume.\n", name.c_str(), code,
                 (unsigned long long)std::filesystem::file_size(part), (unsigned long long)size);
