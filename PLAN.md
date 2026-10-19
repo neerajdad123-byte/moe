@@ -912,3 +912,33 @@ Merge: research tooling; the engine hooks are opt-in env switches (no effect uns
   ~44 gated rounds.) Verdict: parked. On code the head already keeps 98% of its drafts (1.98 tokens per round), and
   run-to-run noise (53.8 vs 64.3 on one config) is larger than the effect. Kept as an opt-in: the verify path,
   sampling and rollback are exact and tested.
+
+### Checkpoint 3 so far (speed2, 2026-10-20)
+Commits: 1f8e1c5 router + shared gate one GEMV (no measurable change); ac5a9c8 whole-step CUDA graph + spin timeout
+(MOEX_SPIN_MS, default 200 ms; timeout -> device g_skip, host finishes the token per layer; graph conditional nodes
+faulted, see commit); 1b95bff merge agent2; 2a17009 32 admission stages with MTP (96 cost MTP -4%); e4729f5 host
+follows the GPU hit mask + admissions start mid-token (step graph hit rate 60% -> 67%).
+Tried, not kept: P-core pinning (CPU experts 2x slower: 8 spinning workers on 6 HT P-cores), more CPU threads
+(8 / 12 / 16: 52.1 / 51.4 / 51.6, RAM read 55-60 GB/s at any thread count: memory-bound), GEMV rows-per-warp knobs
+(not measured, dropped). No-barrier CPU experts (MOEX_CPU_NB): one clean +5% run, one run died; open.
+Measurement traps found: the CPU was throttled to ~60% of base clock (Windows "Balanced" + laptop thermal mode) and
+another agent's CPU/RAM jobs ran beside benchmarks; both made decode 5-15 tok/s. Fixed by the user (High performance).
+RAM: 2 x 12 GB DDR5-4800 on two controllers (matched dual channel), 55-60 GB/s read with 8-20 threads.
+Open: a rare exit after prompt 0 seen twice in non-default runs (MOEX_CPU_NB=1, MOEX_CPU_THREADS=12); 18 default runs clean.
+
+Budget at 1K (e4729f5, raw, ms/token; GPU kernel times from nsys, waits from the GPU-side meter):
+
+| part | ms |
+|---|---|
+| dense GEMVs (dn in/out, attn qkv/o, shared expert) | 8.2 |
+| lm_head (int6) | 2.4 |
+| GPU experts | 2.4 |
+| attention core (1K) | 0.15 |
+| other kernels (norms, router, top-k, DeltaNet recurrence/conv, export) | 1.6 |
+| GPU waiting on CPU experts | 3.0 |
+| gaps / host | ~1.7 |
+| **total** | **19.4 = 51.4 tok/s raw; MTP ~59** |
+
+Launches per token: ~145 host launches (40 layer graphs + add_k + table_k) -> ~50 (1 step graph + small setup +
+per-layer table flushes queued behind it). Target 15 ms (67 raw / 80 MTP): 4.4 ms missing. Biggest parts left: the
+3.0 ms CPU wait (105 misses/token on the CPU), dense GEMVs already at 90%+ of bandwidth.
