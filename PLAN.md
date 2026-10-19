@@ -560,3 +560,9 @@ before. The ring borrows ~250 MB more cache during prefill; GPUs whose cache wou
 4K: 373 -> **525 tok/s** (copier-wait 3.80 -> 0.72 s; streamer busy 6.3 of 7.8 s: memcpy 3.5 + DMA wait 2.8; streamed
 26.7K -> 36.4K experts: the bigger ring leaves fewer resident). 16K: 283 -> **344** (gpu-wait 43.4 s = attention + GEMMs).
 Small cache (520 slots, 2 batches): 335 tok/s. Same greedy tokens; `--check` PASS (mean KL 1.49e-3, top-1 98.6%).
+
+### S1c: int8-weight prefill GEMM, 128x128x32 tiles (gemm_i8_k)
+8 warps of 32x64, 16-byte loads, next K step's loads in flight. test_kernels K12 (now also S=1024): qkv 8192x2048
+S=1024 **1.83 ms = 18.8 TFLOPS** (old gemm_wmma_k: ~3.7 TFLOPS; S=256 2.35 -> 0.70 ms). Prefill 4K: 525 -> **644 tok/s**
+(gpu-wait 6.72 -> 3.73 s; now the streamer is the limit: memcpy 3.73 + DMA wait 1.80 of 6.36 s). 16K: 344 -> **362**
+(gpu-wait 32.8 s: attention). Same greedy tokens; `--check` PASS (mean KL 1.48e-3, top-1 98.6%); test_kernels ALL PASS.

@@ -217,6 +217,59 @@ __global__ void gemm_wmma_k(const WT* __restrict__ W, const float* __restrict__ 
     }
 }
 
+// int8 weights, the common case: block tile 128 weight rows x 128 tokens x 32 K, 8 warps of 32 rows x 64 tokens,
+// 16-byte loads, the next K step's loads in flight during the MMAs. Same operands as gemm_wmma_k (fp16, fp32 sums).
+__global__ void __launch_bounds__(256) gemm_i8_k(const int8_t* __restrict__ W, const float* __restrict__ s,
+                                                 const float* __restrict__ X, float* __restrict__ Y, int S, int I, int O) {
+    using namespace nvcuda;
+    constexpr int BM = 128, BN = 128, BK = 32, LD = BK + 8;
+    __shared__ __align__(32) half As[BM * LD], Bs[BN * LD];
+    const int o0 = blockIdx.x * BM, s0 = blockIdx.y * BN, tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
+    const int wm = (warp >> 1) * 32, wn = (warp & 1) * 64;
+    const int wr = tid >> 1, wc = (tid & 1) * 16;  // this thread's 16 weights of the tile
+    wmma::fragment<wmma::accumulator, 16, 16, 16, float> c[2][4];
+    for (int i = 0; i < 2; i++) for (int j = 0; j < 4; j++) wmma::fill_fragment(c[i][j], 0.f);
+    uint4 wv; float4 xv[4];
+    auto load = [&](int k0) {
+        wv = o0 + wr < O ? *reinterpret_cast<const uint4*>(W + (size_t)(o0 + wr) * I + k0 + wc) : make_uint4(0, 0, 0, 0);
+        for (int j = 0; j < 4; j++) {
+            const int x = tid + 256 * j, r = x >> 3, k = (x & 7) * 4;
+            xv[j] = s0 + r < S ? *reinterpret_cast<const float4*>(X + (size_t)(s0 + r) * I + k0 + k) : make_float4(0, 0, 0, 0);
+        }
+    };
+    load(0);
+    for (int k0 = 0; k0 < I; k0 += BK) {
+        const int8_t* b = reinterpret_cast<const int8_t*>(&wv);
+        half2* a = reinterpret_cast<half2*>(As + wr * LD + wc);
+        for (int i = 0; i < 8; i++) a[i] = __halves2half2(__int2half_rn(b[2 * i]), __int2half_rn(b[2 * i + 1]));
+        for (int j = 0; j < 4; j++) {
+            const int x = tid + 256 * j, r = x >> 3, k = (x & 7) * 4;
+            half2* bp = reinterpret_cast<half2*>(Bs + r * LD + k);
+            bp[0] = __floats2half2_rn(xv[j].x, xv[j].y); bp[1] = __floats2half2_rn(xv[j].z, xv[j].w);
+        }
+        __syncthreads();
+        if (k0 + BK < I) load(k0 + BK);
+        for (int kk = 0; kk < BK; kk += 16) {
+            wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> fa[2];
+            wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::col_major> fb[4];
+            for (int i = 0; i < 2; i++) wmma::load_matrix_sync(fa[i], As + (wm + 16 * i) * LD + kk, LD);
+            for (int j = 0; j < 4; j++) wmma::load_matrix_sync(fb[j], Bs + (wn + 16 * j) * LD + kk, LD);
+            for (int i = 0; i < 2; i++) for (int j = 0; j < 4; j++) wmma::mma_sync(c[i][j], fa[i], fb[j], c[i][j]);
+        }
+        __syncthreads();
+    }
+    float* cs = reinterpret_cast<float*>(As) + warp * 256;  // the tiles are free now: a 16x16 scratch per warp
+    for (int i = 0; i < 2; i++) for (int j = 0; j < 4; j++) {
+        wmma::store_matrix_sync(cs, c[i][j], 16, wmma::mem_col_major);  // cs[token][row]: lanes along O (coalesced)
+        __syncwarp();
+        for (int e = lane; e < 256; e += 32) {
+            const int o = o0 + wm + 16 * i + (e & 15), t = s0 + wn + 16 * j + (e >> 4);
+            if (o < O && t < S) Y[(size_t)t * O + o] = cs[e] * s[o];
+        }
+        __syncwarp();
+    }
+}
+
 // Y[S][O] = X[S][I] . W^T for a dense matrix in either form.
 inline void gemm(const Mat& m, const float* X, float* Y, int S, int I, int O, cudaStream_t st = 0) {
     if (S <= 2) {  // the MTP round: tensor-core tiles of 64 tokens would waste 62 of them; GEMV reads W once for both
@@ -226,7 +279,7 @@ inline void gemm(const Mat& m, const float* X, float* Y, int S, int I, int O, cu
     }
     dim3 grid((O + 63) / 64, (S + 63) / 64);
     if (m.q4) gemm_wmma_k<uint8_t, true><<<grid, 128, 0, st>>>(m.q4, m.s, X, Y, S, I, O);
-    else if (m.q) gemm_wmma_k<int8_t><<<grid, 128, 0, st>>>(m.q, m.s, X, Y, S, I, O);
+    else if (m.q) gemm_i8_k<<<dim3((O + 127) / 128, (S + 127) / 128), 256, 0, st>>>(m.q, m.s, X, Y, S, I, O);
     else gemm_wmma_k<half><<<grid, 128, 0, st>>>(m.f16, nullptr, X, Y, S, I, O);
 }
 

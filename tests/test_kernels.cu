@@ -404,14 +404,14 @@ int main(int argc, char** argv) {
             int8_t* q; float* s; CK(cudaMalloc(&q, (size_t)cs.O * cs.I)); CK(cudaMalloc(&s, cs.O * 4));
             quantize_rows_i8_k<<<cs.O, 256>>>(W, q, s, cs.I);
             Mat m; m.q = q; m.s = s;
-            const int SMAX = 256;
+            const int SMAX = 1024;
             std::vector<float> hx((size_t)SMAX * cs.I);
             for (int t = 0; t < SMAX; t++) {  // real activations (12 golden positions), varied per token
                 auto g = golden(pn_(t % 12, "L00_moe_in"));
                 for (int i = 0; i < cs.I; i++) hx[(size_t)t * cs.I + i] = g[i % D] * (1.f + 0.01f * (t / 12)) * ((i / D) ? -1.f : 1.f);
             }
             float *X = up(hx), *Y = dalloc((size_t)SMAX * cs.O), *Yr = dalloc((size_t)SMAX * cs.O);
-            for (int S : {64, 128, 256}) {
+            for (int S : {64, 128, 256, 1024}) {
                 gemm(m, X, Y, S, cs.I, cs.O);
                 for (int t = 0; t < S; t++) gemv(m, X + (size_t)t * cs.I, Yr + (size_t)t * cs.O, cs.I, cs.O);
                 auto g = down(Y, (size_t)S * cs.O), r = down(Yr, (size_t)S * cs.O);
