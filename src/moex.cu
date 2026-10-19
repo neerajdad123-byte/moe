@@ -143,7 +143,7 @@ struct Engine {
         if (upd.n) { table_k<<<1, TableUpd::N, 0, cs>>>(table_d, upd); upd.n = 0; }
     }
     // admission: loader thread copies mmap -> pinned stage -> slot on the copy stream
-    static constexpr int NSTAGE = 32;
+    static constexpr int NSTAGE = 96;  // the step graph admits a whole token's misses at once (~75 at 1K)
     struct Stage {
         uint8_t* buf; cudaEvent_t after_compute, done, back_done; int slot = -1, key = -1; int back_io = -1; uint8_t *back_q, *back_s;
         std::atomic<int> back_ready{0};  // the backer thread has enqueued this victim's copy-back (back_done recorded)
@@ -884,7 +884,7 @@ struct Engine {
     // All of layer l's GPU work: mixer, post norm, router (+ routing to the host, ev_route), then the
     // resident experts and the shared expert. Host-independent, so it is captured once as a CUDA graph:
     // ~18 launches at ~7 us each on WDDM become one graph launch.
-    void enqueue_layer(int l) {
+    void enqueue_layer(int l, bool full = false) {
         LayerW& w = L[l];
         rmsnorm(x, l ? moe : nullptr, w.in_ln, h, D, EPS, 1, cs);  // folds in the previous layer's MoE output
         if (is_attn(l)) {
@@ -899,12 +899,16 @@ struct Engine {
         rmsnorm(x, tmp, w.post_ln, h, D, EPS, 1, cs);
         gemv_f16(w.router, h, rlog, D, E + 1, cs);  // router logits + the shared expert's gate logit (rlog[E])
         router_topk(rlog, E, TOPK, NORM_TOPK, ridx, rw, cs);
-        export_route_k<<<(D + 255) / 256, 256, 0, cs>>>(h, ridx, rw, h_hd, ids_hd, w_hd, D, TOPK);
-        CK(cudaEventRecordWithFlags(ev_route, cs, cudaEventRecordExternal));  // host-visible even from a graph
+        if (full) export_signal_k<<<1, 256, 0, cs>>>(h, ridx, rw, h_hd, ids_hd, w_hd, D, TOPK, seq_d, rflag_hd + l);
+        else {
+            export_route_k<<<(D + 255) / 256, 256, 0, cs>>>(h, ridx, rw, h_hd, ids_hd, w_hd, D, TOPK);
+            CK(cudaEventRecordWithFlags(ev_route, cs, cudaEventRecordExternal));  // host-visible even from a graph
+        }
         // hits from the device slot table, then resident experts + shared expert, no host in the loop
         route_hits_k<<<1, 32, 0, cs>>>(ridx, rw, TOPK, l * E, table_d, slots_d, hw_d, nh_d);
         experts_forward(slots_d, hw_d, TOPK, h, act, moe, cs, nh_d);
         shared_expert_add(w.sh_gu, w.sh_d, rlog + E, h, moe, scr, D, SI, cs);
+        if (full) wait_add_k<<<1, 256, 0, cs>>>(moe, y_hd, seq_d, dflag_hd + l, D, abort_hd, l, NL, spin_ns, waited_hd);
         // Router-ahead prediction for the own RAM cache's prefetch: after this layer's GPU work, while the GPU waits for
         // the CPU's misses (x is still this layer's pre-MoE residual). The host reads it after the next layer's routing
         // event; double-buffered so the next layer's prediction can't overwrite it first.
@@ -917,7 +921,33 @@ struct Engine {
     }
 
     std::vector<cudaGraphExec_t> graphs;
+    // Whole-step graph (all NL layers, one launch per token; step_full). Not on low-RAM machines (per-layer SSD
+    // prefetch, own RAM cache, router-ahead need the host between layers; a page fault would stall a spinning GPU) or MOEX_STEP_GRAPH=0.
+    cudaGraphExec_t step_graph = nullptr;
+    int *seq_d = nullptr, *rflag_h, *rflag_hd, *dflag_h, *dflag_hd, *abort_h, *abort_hd;
+    int seq = 0;
+    int* skip_d = nullptr;          // &g_skip
+    long long spin_ns = 200000000;  // MOEX_SPIN_MS (default 200): the GPU's longest wait for one layer's CPU result
+    long long fallbacks = 0;        // tokens finished on the per-layer path after such a timeout
+    long long *waited_h, *waited_hd;  // per layer, ns the GPU waited for the host's CPU result (GPU clock)
+    double gpu_wait_s = 0;            // their sum over tokens
     void capture_graphs() {
+        if (!low_ram && !rc_n && !ahead_k && !(getenv("MOEX_STEP_GRAPH") && atoi(getenv("MOEX_STEP_GRAPH")) == 0)) {
+            CK(cudaMalloc(&seq_d, 4)); CK(cudaMemset(seq_d, 0, 4));
+            CK(cudaHostAlloc((void**)&rflag_h, NL * 4, cudaHostAllocMapped)); CK(cudaHostGetDevicePointer((void**)&rflag_hd, rflag_h, 0));
+            CK(cudaHostAlloc((void**)&dflag_h, NL * 4, cudaHostAllocMapped)); CK(cudaHostGetDevicePointer((void**)&dflag_hd, dflag_h, 0));
+            CK(cudaHostAlloc((void**)&waited_h, NL * 8, cudaHostAllocMapped)); CK(cudaHostGetDevicePointer((void**)&waited_hd, waited_h, 0));
+            CK(cudaHostAlloc((void**)&abort_h, 8, cudaHostAllocMapped)); CK(cudaHostGetDevicePointer((void**)&abort_hd, abort_h, 0));
+            memset(rflag_h, 0, NL * 4); memset(dflag_h, 0, NL * 4); abort_h[0] = abort_h[1] = 0;
+            if (getenv("MOEX_SPIN_MS")) spin_ns = (long long)(atof(getenv("MOEX_SPIN_MS")) * 1e6);
+            CK(cudaGetSymbolAddress((void**)&skip_d, g_skip));
+            cudaGraph_t g;
+            CK(cudaStreamBeginCapture(cs, cudaStreamCaptureModeThreadLocal));
+            for (int l = 0; l < NL; l++) enqueue_layer(l, true);
+            CK(cudaStreamEndCapture(cs, &g));
+            CK(cudaGraphInstantiate(&step_graph, g, 0));
+            CK(cudaGraphDestroy(g));
+        }
         graphs.resize(NL);
         for (int l = 0; l < NL; l++) {
             cudaGraph_t g;
@@ -1461,15 +1491,93 @@ struct Engine {
         fwrite(rec, sizeof rec, 1, trace_ahead);
     }
 
-    int step(int tok, int pos, bool want_logits) {
+    // step() as one graph launch: the host only polls each layer's routing flag, runs the CPU misses and raises the
+    // layer's done flag. Residency is frozen for the token (slot table flushed before the launch, admissions decided
+    // after the last layer), so the GPU's hits and the host's misses always partition the top-8.
+    std::vector<int> adm_keys;
+    bool y_pending = false;  // the last layer's CPU result, in case the GPU timed out before adding it
+    int step_full(int tok, int pos, bool want_logits) {
         struct Range { Range() { nvtxRangePushA("decode"); } ~Range() { nvtxRangePop(); } } range;
         tokens++;
         note(tok);
-        double t = now();
+        double h0 = now();
+        poll_admissions();
+        flush_table();
         for (int i = 0; i < D; i++) h_h[i] = __half2float(embed[(size_t)tok * D + i]);
-        copy_k<<<(D + 255) / 256, 256, 0, cs>>>(x, h_hd, D);  // zero-copy from the mapped host row
+        copy_k<<<(D + 255) / 256, 256, 0, cs>>>(x, h_hd, D);
         set_int_k<<<1, 1, 0, cs>>>(pos_d, pos);
+        set_int_k<<<1, 1, 0, cs>>>(seq_d, ++seq);
+        set_int_k<<<1, 1, 0, cs>>>(skip_d, 0);
+        CK(cudaGraphLaunch(step_graph, cs));
+        ht[0] += now() - h0;
+        adm_keys.clear();
+        static const int stall_l = getenv("MOEX_TEST_STALL") ? atoi(getenv("MOEX_TEST_STALL")) : -1;  // test: "layer:ms:every"
+        static const int stall_ms = getenv("MOEX_TEST_STALL") && strchr(getenv("MOEX_TEST_STALL"), ':') ? atoi(strchr(getenv("MOEX_TEST_STALL"), ':') + 1) : 0;
+        static const int stall_every = getenv("MOEX_TEST_STALL") && strrchr(getenv("MOEX_TEST_STALL"), ':') != strchr(getenv("MOEX_TEST_STALL"), ':') ? atoi(strrchr(getenv("MOEX_TEST_STALL"), ':') + 1) : 1;
         for (int l = 0; l < NL; l++) {
+            const double w0 = now();
+            while (*(volatile int*)&rflag_h[l] != seq) {
+                if (*(volatile int*)abort_h == seq) {  // the GPU gave up waiting on layer l - 1: finish on the per-layer path
+                    fallbacks++;
+                    set_int_k<<<1, 1, 0, cs>>>(skip_d, 0);  // after the rest of the graph, before the per-layer kernels
+                    if (y_pending) add_k<<<(D + 255) / 256, 256, 0, cs>>>(moe, y_hd, D);
+                    for (int key : adm_keys) if (slot_of[key] < 0) admit(key);
+                    start_admissions();
+                    return step(tok, pos, want_logits, l);
+                }
+                if (now() - w0 > 10.0) { CK(cudaStreamSynchronize(cs)); fprintf(stderr, "decode: layer %d's routing never arrived\n", l); exit(1); }
+                _mm_pause();
+            }
+            const double w1 = now();
+            ht[1] += w1 - w0;
+            clock++;
+            int nm = 0;
+            const uint8_t* mq[TOPK]; const float* msc[TOPK]; float mw[TOPK];
+            for (int j = 0; j < TOPK; j++) {
+                int key = l * E + ids_h[j], sl = slot_of[key];
+                touch(key);
+                if (sl >= 0) last[sl] = clock;
+                if (sl >= 0 && ready[sl]) hits++;
+                else { mw[nm] = w_h[j]; mq[nm] = eq[key]; msc[nm++] = es[key]; misses++; if (sl < 0) adm_keys.push_back(key); }
+            }
+            if (nm) {
+                cpu.run(nm, mq, msc, mw, h_h, y_h);
+                cpu_s += now() - w1; ht[2] += now() - w1; hs[1][2] += now() - w1;
+            }
+            if (l == stall_l && stall_ms && tokens % stall_every == 0) std::this_thread::sleep_for(std::chrono::milliseconds(stall_ms));
+            std::atomic_thread_fence(std::memory_order_seq_cst);  // y_h before the flag
+            *(volatile int*)&dflag_h[l] = 2 * seq + (nm > 0);
+            y_pending = nm > 0;
+            hs[nm > 0][1] += w1 - w0; hs[nm > 0][4]++;
+        }
+        // the last layer's wait: passed, or timed out (then its CPU result is added here)
+        for (const double w0 = now(); ((volatile int*)abort_h)[1] != seq && ((volatile int*)abort_h)[0] != seq; _mm_pause())
+            if (now() - w0 > 10.0) { CK(cudaStreamSynchronize(cs)); fprintf(stderr, "decode: the step graph never finished\n"); exit(1); }
+        if (((volatile int*)abort_h)[0] == seq) { fallbacks++; set_int_k<<<1, 1, 0, cs>>>(skip_d, 0); if (y_pending) add_k<<<(D + 255) / 256, 256, 0, cs>>>(moe, y_hd, D); }
+        else for (int l = 0; l < NL; l++) gpu_wait_s += ((volatile long long*)waited_h)[l] * 1e-9;
+        rmsnorm(x, moe, norm, h, D, EPS, 1, cs);
+        if (want_logits) gemv(lm_head, h, logits, D, V, cs);
+        const double a0 = now();  // admissions overlap the lm_head; their copies wait for this token's graph
+        poll_admissions();  // frees the stages of finished copies (their table updates land before the next graph)
+        for (int key : adm_keys) if (slot_of[key] < 0) admit(key);
+        start_admissions();
+        ht[3] += now() - a0;
+        return want_logits ? pick_token() : -1;
+    }
+
+    // from > 0: the rest of a token whose whole-step graph stopped before layer `from` (step_full)
+    int step(int tok, int pos, bool want_logits, int from = 0) {
+        if (!from && step_graph && !prof && !trace && !trace_ahead) return step_full(tok, pos, want_logits);
+        struct Range { Range() { nvtxRangePushA("decode"); } ~Range() { nvtxRangePop(); } } range;
+        double t = now();
+        if (!from) {
+            tokens++;
+            note(tok);
+            for (int i = 0; i < D; i++) h_h[i] = __half2float(embed[(size_t)tok * D + i]);
+            copy_k<<<(D + 255) / 256, 256, 0, cs>>>(x, h_hd, D);  // zero-copy from the mapped host row
+            set_int_k<<<1, 1, 0, cs>>>(pos_d, pos);
+        }
+        for (int l = from; l < NL; l++) {
             double h0 = now();
             poll_admissions();
             flush_table();  // the GPU's view of residency for this layer == the host's ready[] below
@@ -1832,7 +1940,7 @@ int main(int argc, char** argv) {
         return ok ? 0 : 1;
     }
 
-    struct Stats { int dec = 0; double sec = 0; long long hits = 0, misses = 0, admits = 0; double cpu = 0, ht[4] = {}, ttft = 0; };
+    struct Stats { int dec = 0; double sec = 0; long long hits = 0, misses = 0, admits = 0; double cpu = 0, ht[4] = {}, ttft = 0, gwait = 0; };
     // Prompt token-by-token, then up to n greedy tokens. Returns decode-phase stats.
     auto generate = [&](const std::vector<int>& p, std::vector<int>& out, bool stream) {
         Stats st;
@@ -1842,7 +1950,7 @@ int main(int argc, char** argv) {
         int pos = 0, tok = -1;
         if (use_prefill && !eng.trace) { tok = eng.prefill(p.data(), (int)p.size(), 0); pos = (int)p.size(); }
         else for (; pos < (int)p.size(); pos++) tok = eng.step(p[pos], pos, pos + 1 == (int)p.size());
-        long long h0 = eng.hits, m0 = eng.misses, a0 = eng.admits; double c0 = eng.cpu_s, t1 = now();
+        long long h0 = eng.hits, m0 = eng.misses, a0 = eng.admits; double c0 = eng.cpu_s, gw0 = eng.gpu_wait_s, t1 = now();
         double ht0[4]; for (int i = 0; i < 4; i++) ht0[i] = eng.ht[i];
         eng.trace_phase = 1;
         const bool mtp = eng.has_mtp && use_prefill && !eng.trace;
@@ -1864,7 +1972,7 @@ int main(int argc, char** argv) {
             }
         }
         st.ttft = t1 - t0;
-        st.sec = now() - t1; st.hits = eng.hits - h0; st.misses = eng.misses - m0; st.admits = eng.admits - a0; st.cpu = eng.cpu_s - c0;
+        st.sec = now() - t1; st.hits = eng.hits - h0; st.misses = eng.misses - m0; st.admits = eng.admits - a0; st.cpu = eng.cpu_s - c0; st.gwait = eng.gpu_wait_s - gw0;
         for (int i = 0; i < 4; i++) st.ht[i] = eng.ht[i] - ht0[i];
         return st;
     };
@@ -1873,8 +1981,8 @@ int main(int argc, char** argv) {
         fprintf(stderr, "[%s] %d tok in %.2f s = %.2f tok/s | expert hit %.1f%% | %.1f misses/tok on CPU = %.1f ms/tok | %lld admitted\n",
                 tag, st.dec, st.sec, st.dec / std::max(st.sec, 1e-9), 100.0 * st.hits / std::max(st.hits + st.misses, 1LL),
                 (double)st.misses / dec, 1e3 * st.cpu / dec, st.admits);
-        fprintf(stderr, "    host ms/tok: launch %.2f  wait-routing %.2f  cpu-misses %.2f  admissions %.2f | TTFT %.2f s\n",
-                1e3 * st.ht[0] / dec, 1e3 * st.ht[1] / dec, 1e3 * st.ht[2] / dec, 1e3 * st.ht[3] / dec, st.ttft);
+        fprintf(stderr, "    host ms/tok: launch %.2f  wait-routing %.2f  cpu-misses %.2f  admissions %.2f | TTFT %.2f s | step graph %s, fallbacks %lld, GPU waited on CPU %.2f ms/tok\n",
+                1e3 * st.ht[0] / dec, 1e3 * st.ht[1] / dec, 1e3 * st.ht[2] / dec, 1e3 * st.ht[3] / dec, st.ttft, eng.step_graph ? "on" : "off", eng.fallbacks, 1e3 * st.gwait / dec);
     };
     if (!trace_path.empty() && !(eng.trace = fopen(trace_path.c_str(), "wb"))) { fprintf(stderr, "cannot write %s\n", trace_path.c_str()); return 1; }
     if (!ahead_path.empty() && (trace_path.empty() || !(eng.trace_ahead = fopen(ahead_path.c_str(), "wb")))) {
@@ -1901,7 +2009,7 @@ int main(int argc, char** argv) {
             report(tag, st);
             if (eng.mtp_rounds > mr0)
                 fprintf(stderr, "    mtp: %lld rounds, draft accepted %.1f%%\n", eng.mtp_rounds - mr0, 100.0 * (eng.mtp_acc - ma0) / (eng.mtp_rounds - mr0));
-            tot.dec += st.dec; tot.sec += st.sec; tot.hits += st.hits; tot.misses += st.misses; tot.admits += st.admits; tot.cpu += st.cpu;
+            tot.dec += st.dec; tot.sec += st.sec; tot.hits += st.hits; tot.misses += st.misses; tot.admits += st.admits; tot.cpu += st.cpu; tot.gwait += st.gwait;
             for (int k = 0; k < 4; k++) tot.ht[k] += st.ht[k];
         }
         report("batch total", tot);

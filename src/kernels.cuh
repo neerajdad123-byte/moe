@@ -38,10 +38,16 @@ __device__ __forceinline__ float block_max(float v) {
     return v;
 }
 
+// Set by wait_add_k when the GPU gave up waiting for the host in the whole-step decode graph: the kernels that change
+// state the per-layer fallback needs (residual, KV cache, DeltaNet conv ring + state, MoE output, routing signal) then
+// return at once for the rest of that graph launch. The host clears it before every step graph launch and fallback.
+__device__ int g_skip;
+
 // ---- K1: RMSNorm, Qwen3.5 style: y = x * rsqrt(mean(x^2)+eps) * (1 + w) ----
 // One block per row. If `delta` is set, x += delta first (residual add) and x is written back.
 __global__ void rmsnorm_k(float* __restrict__ x, const float* __restrict__ delta,
                           const half* __restrict__ w, float* __restrict__ y, int D, float eps) {
+    if (g_skip) return;
     float* xr = x + (size_t)blockIdx.x * D;
     const float* dr = delta ? delta + (size_t)blockIdx.x * D : nullptr;
     float* yr = y + (size_t)blockIdx.x * D;
@@ -552,6 +558,7 @@ __global__ void expert_gate_up_k(const uint8_t* const* __restrict__ slots, int K
 template <int WARPS>
 __global__ void expert_down_k(const uint8_t* const* __restrict__ slots, const float* __restrict__ w, int K,
                               const int* __restrict__ nh, const float* __restrict__ act, float* __restrict__ out) {
+    if (g_skip) return;
     if (nh) K = *nh;
     extern __shared__ __align__(16) float as[];  // [K][xpad_size(EI)]
     for (int i = threadIdx.x; i < K * EI; i += blockDim.x) as[(i / EI) * xpad_size(EI) + xpad(i % EI)] = act[i];
@@ -874,6 +881,51 @@ __global__ void export_route_k(const float* __restrict__ h, const int* __restric
     if (i < K) { idx_out[i] = idx[i]; w_out[i] = w[i]; }
 }
 
+// Whole-step decode graph (one launch per token): the GPU hands each layer's routing to the host and waits for the
+// host's CPU-expert result through mapped host memory flags instead of events and per-layer launches.
+// export_signal_k: as export_route_k (one block), then flag = *seq once the data is visible to the host.
+__global__ void export_signal_k(const float* __restrict__ h, const int* __restrict__ idx, const float* __restrict__ w,
+                                float* h_out, int* idx_out, float* w_out, int D, int K, const int* __restrict__ seq, int* flag) {
+    if (g_skip) return;
+    for (int i = threadIdx.x; i < D; i += blockDim.x) h_out[i] = h[i];
+    if (threadIdx.x < K) { idx_out[threadIdx.x] = idx[threadIdx.x]; w_out[threadIdx.x] = w[threadIdx.x]; }
+    __threadfence_system();
+    __syncthreads();
+    if (threadIdx.x == 0) *(volatile int*)flag = *seq;
+}
+// Spins until the host's flag = 2 * seq + (1 if it wrote a CPU result), then out += y (y: mapped host memory).
+// Gives up after timeout_ns (a stalled host must not keep the GPU busy into a Windows TDR reset, 2 s): then y is not
+// added, g_skip is set (layers l+1.. leave their state untouched) and *abort = seq tells the host
+// to finish this token on the per-layer path. The last layer reports a normal pass in abort[1] = seq.
+__global__ void wait_add_k(float* __restrict__ out, const float* y, const int* __restrict__ seq, const int* flag, int D,
+                           int* abort, int l, int NL, long long timeout_ns,
+                           long long* waited) {  // mapped host [NL]: ns this layer's GPU waited for the host (exposed CPU time)
+    if (g_skip) return;
+    __shared__ int f;
+    if (threadIdx.x == 0) {
+        const int want = *seq;
+        long long t0, t;
+        asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t0));
+        int v;
+        while (((v = *(const volatile int*)flag) >> 1) != want) {
+            asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
+            if (t - t0 > timeout_ns) {
+                g_skip = 1;
+                __threadfence_system();
+                *(volatile int*)abort = want;
+                v = 0;
+                break;
+            }
+        }
+        f = v;
+        asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
+        waited[l] = t - t0;
+    }
+    __syncthreads();
+    if (f & 1)
+        for (int i = threadIdx.x; i < D; i += blockDim.x) out[i] += ((const volatile float*)y)[i];
+    if (l == NL - 1 && f && threadIdx.x == 0) { __threadfence_system(); *(volatile int*)(abort + 1) = *seq; }
+}
 // out[i] = y[i]
 __global__ void copy_k(float* __restrict__ out, const float* __restrict__ y, int n) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -887,6 +939,7 @@ __global__ void add_k(float* __restrict__ out, const float* __restrict__ y, int 
 // out[d] += sigmoid(gate_logit[0]) * sh[d]
 __global__ void gated_add_k(float* __restrict__ out, const float* __restrict__ sh,
                             const float* __restrict__ gate_logit, int n) {
+    if (g_skip) return;
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) out[i] += sh[i] / (1.f + __expf(-gate_logit[0]));
 }
@@ -901,6 +954,7 @@ __global__ void qk_norm_rope_k(const float* __restrict__ q, const float* __restr
                                const half* __restrict__ qn, const half* __restrict__ kn,
                                float* __restrict__ qo, KVCache kv,
                                int H, int KV, const int* __restrict__ pos_d, int max_t, int rot, float theta, float eps, int ld) {
+    if (g_skip) return;
     __shared__ float t[AHD];
     // token blockIdx.y of a chunk is at *pos_d + y (device-side so a captured CUDA graph sees each token's position)
     const int tok = blockIdx.y, pos = *pos_d + tok;
@@ -1217,6 +1271,7 @@ __global__ void set_int_k(int* p, int v) { *p = v; }
 // ring0 (optional, T > 1): the ring after the first token, so the MTP round can drop the second (a wrong draft)
 __global__ void dn_conv_k(const float* __restrict__ qkv, int ld, const half* __restrict__ w, float* __restrict__ ring,
                           float* __restrict__ out, int C, int CKn, int T, float* __restrict__ ring0 = nullptr) {
+    if (g_skip) return;
     int c = blockIdx.x * blockDim.x + threadIdx.x;
     if (c >= C) return;
     float* rg = ring + (size_t)c * (CKn - 1);
@@ -1248,6 +1303,7 @@ __global__ void dn_recur_k(const float* __restrict__ conv, int C, const float* _
 #pragma unroll
     for (int i = 0; i < DNK; i++) col[i] = Sh[i * DNV + v];
     for (int t = 0; t < T; t++) {
+    if (g_skip) return;
         const float* cv = conv + (size_t)t * C;
         float qv = cv[kh * DNK + v], kv_ = cv[KH * DNK + kh * DNK + v];  // DNK == DNV == blockDim
         float vin = cv[2 * KH * DNK + h * DNV + v];
