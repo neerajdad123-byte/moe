@@ -700,3 +700,19 @@ MTP on 55.2 / 54.7 -> 59.3 / 58.6, CPU 6.9 -> 5.65. `moex bench`: MTP on 50.3 / 
 49.9 / 50.1. `--check` PASS: mean KL 1.26e-3 -> 1.52e-3, worst 2.99e-2, top-1 98.6%. Greedy: 8/10 prompts identical
 over 64 tokens; 2 split late (tokens 58, 61) at top-2 gaps 0.14 / 0.33 logit (median gap 11.5). Accepted on KL and
 top-1 (approximate kernels are gated on those); this build is the new greedy baseline.
+
+### VRAM audit (Checkpoint 1; `[vram]` line at load), ctx 8192, 6140 MB
+In use before load 1060 MB: a bare CUDA context already shows it (nvidia-smi: 0 MB): the WDDM driver's reservation,
+not ours. lm_head int8 486 | dense int8 + MTP head 1448 / 1496 (routers f16 40) | KV cache 81 (sized for ctx) |
+DeltaNet state 63 | decode / MTP scratch 4 / 88 (MTP snapshot 63) | expert cache 1586 slots (MTP off) / 1508 (MTP on)
+= 2.7 / 2.5 GB, of which prefill borrows 365 | reserve 320. Embeddings are already in RAM (mapped); prefill scratch is
+already borrowed from the cache. Hit rate 68.8% / 61.4%, misses 99.8 / 130 per token (10 short prompts).
+Cache-size slope, same binary, MOEX_RESERVE_MB 320 vs 150 (+101 slots), alternating: hit 68.4 / 68.9 -> 69.7 / 70.1%,
+misses 101 / 100 -> 96.8 / 95.7, 49.0 / 49.1 -> 49.7 / 49.6 tok/s (+1.2%, below the 3% noise bar).
+
+Budget at Checkpoint 1 (b577b69, short prompts, ms/token): dense int8 8.4 | lm_head 2.9 | GPU experts 2.4 | other 2.4 |
+GPU idle (CPU wait + gaps) ~4.2 (CPU work 5.0) | total 20.3 = 49.2 tok/s raw, 58.5 with MTP.
+
+Parked (small lever: ~+0.6 tok/s per 100 slots): lazy KV (grow in chunks; ~70 MB = ~40 slots at 1K; the decode graphs
+capture the KV pointers, so growth needs a re-capture), a dynamic expert cache (shrink as the context grows), a smaller
+driver reserve (150 MB worked here; risky with other apps using VRAM).

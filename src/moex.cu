@@ -694,6 +694,8 @@ struct Engine {
 
     void load() {
         double t0 = now();
+        size_t vf[5], vtot; CK(cudaMemGetInfo(&vf[0], &vtot));  // VRAM audit: free before load, after weights, after the
+                                                                // F16 staging is freed, after the scratch, after the cache
         embed = (const half*)C.map("model.embed_tokens.weight");
         if (!f16) CK(cudaMalloc(&qtmp, (size_t)V * D * 2));  // largest matrix
         lm_head = wmat({{"lm_head.weight", V}}, D, "lm_head");
@@ -738,7 +740,9 @@ struct Engine {
             mtp_nh = wup("mtp.pre_fc_norm_hidden.weight", D);
             mtp_norm = wup("mtp.norm.weight", D);
         }
+        CK(cudaMemGetInfo(&vf[1], &vtot));
         if (qtmp) { CK(cudaDeviceSynchronize()); CK(cudaFree(qtmp)); qtmp = nullptr; }
+        CK(cudaMemGetInfo(&vf[2], &vtot));
         CK(cudaStreamCreateWithFlags(&cs, cudaStreamNonBlocking));
         CK(cudaStreamCreateWithFlags(&cp, cudaStreamNonBlocking));
         x = falloc(D); h = falloc(D); tmp = falloc(D); moe = falloc(D);
@@ -774,7 +778,24 @@ struct Engine {
         nres = (int)((carve_prefill(nullptr) + EXPERT_BYTES - 1) / EXPERT_BYTES);
         if (nslots < 3 * nres) { nring = 2; nres = (int)((carve_prefill(nullptr) + EXPERT_BYTES - 1) / EXPERT_BYTES); }  // small GPUs
         if (nslots < nres + 2 * TOPK) { fprintf(stderr, "only %d expert slots fit; need >= %d\n", nslots, 2 * TOPK); exit(1); }
+        vf[3] = fr;
         CK(cudaMalloc(&arena, (size_t)nslots * EXPERT_BYTES));
+        CK(cudaMemGetInfo(&vf[4], &vtot));
+        {
+            const double MB = 1 << 20;
+            const size_t kv = (size_t)(NL / 4) * (2 * (size_t)AKV * ctx * AHD + 2 * (size_t)AKV * ctx * 4);
+            const size_t dn = (size_t)(NL - NL / 4) * ((size_t)DC * (CONVK - 1) + (size_t)DVH * DNK * DNV) * 4;
+            const size_t lmh = f16 ? (size_t)V * D * 2 : (size_t)V * D + (size_t)V * 4;
+            const size_t router = (size_t)(NL + has_mtp) * E * D * 2;
+            const size_t weights = vf[0] - vf[1] - (f16 ? 0 : (size_t)V * D * 2) - kv - dn;  // minus the F16 staging
+            const size_t snapb = has_mtp ? (size_t)(NL - NL / 4) * ((size_t)DVH * DNK * DNV + (size_t)DC * (CONVK - 1)) * 4 : 0;
+            fprintf(stderr, "[vram] total %.0f MB, in use before load %.0f (CUDA context, display, other apps) | lm_head %.0f | "
+                            "dense + MTP head %.0f (incl. routers f16 %.0f) | KV cache %.0f (ctx %d) | DeltaNet state %.0f | "
+                            "decode/MTP scratch %.0f (incl. MTP snapshot %.0f) | expert cache %d slots = %.0f MB (prefill borrows %d) | "
+                            "free %.0f (reserve)\n",
+                    vtot / MB, (vtot - vf[0]) / MB, lmh / MB, (weights - lmh) / MB, router / MB, kv / MB, ctx, dn / MB,
+                    (vf[2] - vf[3]) / MB, snapb / MB, nslots, nslots * (double)EXPERT_BYTES / MB, nres, vf[4] / MB);
+        }
         carve_prefill(arena + (size_t)(nslots - nres) * EXPERT_BYTES);
         slot_of.assign(NKEY, -1); owner.assign(nslots, -1); last.assign(nslots, 0);
         ready.assign(nslots, 0); inflight.assign(nslots, 0);
