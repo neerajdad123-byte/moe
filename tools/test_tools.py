@@ -53,6 +53,21 @@ for stream in (False, True):
         check(f"openai {'stream' if stream else 'plain '} think={think}: answers from the result", "18" in ans and r.choices[0].finish_reason == "stop",
               f"{time.time() - t:.1f}s (history resent) {ans[:80]!r}")
 
+# a tool call cut off by max_tokens ("<tool_call>" but no "<function=...>") comes back as text, not dropped
+for stream in (False, True):
+    msgs = [{"role": "user", "content": "What's the weather in Paris right now? Use the tool."}]
+    extra = {"chat_template_kwargs": {"enable_thinking": False}}
+    if stream:
+        text, ncalls, finish = "", 0, None
+        for ch in oa.chat.completions.create(model=MODEL, messages=msgs, tools=tools, stream=True, max_tokens=3, seed=1, extra_body=extra):
+            d = ch.choices[0].delta
+            text += d.content or ""; ncalls += len(d.tool_calls or []); finish = ch.choices[0].finish_reason or finish
+    else:
+        r = oa.chat.completions.create(model=MODEL, messages=msgs, tools=tools, max_tokens=3, seed=1, extra_body=extra)
+        text, ncalls, finish = r.choices[0].message.content or "", len(r.choices[0].message.tool_calls or []), r.choices[0].finish_reason
+    check(f"openai {'stream' if stream else 'plain '}: cut-off tool call kept as text", "<tool_call>" in text and not ncalls and finish == "length",
+          f"finish={finish} calls={ncalls} text={text!r}")
+
 # ---- Anthropic ----
 an = anthropic.Anthropic(base_url=BASE, api_key="none")
 atools = [{"name": "get_weather", "description": "Current weather for a city",

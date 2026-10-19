@@ -127,6 +127,7 @@ static GenOut run_request(Session& ss, Tokenizer& tk, const GenReq& q, const std
     const bool tools = !q.tools.empty();
     Utf8Stream us; ThinkSplit split(q.think); CallSplit cs;
     bool alive = true; size_t sent = 0;
+    std::string cut_ws;  // whitespace dropped before <tool_call>, put back if no call parses
     size_t hold = 0; for (auto& s : q.stops) hold = std::max(hold, s.size() - 1);
     auto feed = [&](const std::string& piece, bool last) {
         std::string rd, ad;
@@ -140,7 +141,7 @@ static GenOut run_request(Session& ss, Tokenizer& tk, const GenReq& q, const std
             }
         size_t can;
         if (cs.in_calls) {  // the text before a tool call ends here: drop its trailing whitespace
-            while (g.content.size() > sent && strchr(" \t\r\n", g.content.back())) g.content.pop_back();
+            while (g.content.size() > sent && strchr(" \t\r\n", g.content.back())) { cut_ws.insert(cut_ws.begin(), g.content.back()); g.content.pop_back(); }
             can = g.content.size();
         } else if (g.hit_stop || last) can = g.content.size();
         else {
@@ -157,6 +158,14 @@ static GenOut run_request(Session& ss, Tokenizer& tk, const GenReq& q, const std
     });
     if (!g.hit_stop) feed(us.held, true);
     if (cs.in_calls) g.calls = parse_tool_calls(cs.calls, q.tools, q.id_prefix);
+    if (cs.in_calls && g.calls.empty()) {  // "<tool_call>" but no call in it (e.g. cut off by max_tokens): it is text after all
+        g.content += cut_ws + cs.calls;
+        for (auto& s : q.stops) {
+            size_t k = g.content.find(s, sent);
+            if (k != std::string::npos) { g.content.resize(k); g.hit_stop = true; g.stop_seq = s; break; }
+        }
+        if (alive && g.content.size() > sent) { alive = on_content(g.content.substr(sent)); sent = g.content.size(); }
+    }
     g.gen_n = out.size();
     g.length = !g.hit_stop && ((int)out.size() >= max_new || (int)(prompt.size() + out.size()) + 4 >= ss.eng.ctx);
     ss.remember(Session::key_of(g.content, g.calls), out);
