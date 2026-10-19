@@ -671,3 +671,16 @@ old 0.30 / 3.92 / 6.18 -> new 0.18 / 1.58 / 2.49; per MTP round, old 1.36 / **20
 32 unsplit blocks over the whole context) -> new 0.29 / 2.34 / 3.62. MTP round wall at 26K: 72.4 -> 45.0 ms.
 Greedy tokens: 1K identical in every run; 16K / 26K hashes vary run to run in the old binary alone too (16K: 50edb1,
 b043d3, b480a0 across its runs), the known near-tie; the new binary produces the same hashes as old runs.
+
+### D2: re-profile after D1 (MTP off; nsys wall includes ~1.5 ms/token of tracing)
+| ms/token | 1K | 16K |
+|---|---|---|
+| dense int8 GEMV | 11.26 | 11.09 |
+| GPU idle waiting on CPU experts (traced) | 7.30 | 7.57 |
+| GPU experts | 2.39 | 2.40 |
+| attention | 0.18 | 1.58 |
+| DeltaNet | 0.58 | 0.58 |
+| norms / router / other | 1.66 | 1.64 |
+| untraced total | 21.9 (45.6 tok/s) | 23.2 (43.1 tok/s) |
+CPU misses 108.6 / 104.0 per token, CPU experts 6.6 ms/token; 90% of layers have a miss (wait-routing 274 us + CPU
+184 us + admissions 26 us). Admissions 83 experts/token = ~147 MB H2D per token (~6.6 GB/s at 45 tok/s): churn, see D5.
