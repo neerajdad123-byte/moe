@@ -590,3 +590,12 @@ bench 49.7 / 49.0. 800+ needs fewer bytes over PCIe, not a cheaper copy (64.9 GB
 4K: 36,360 streamed = 64.3 GB, H2D busy 6.70 s (9.6 GB/s). Rows each streamed expert ended up with: **0: 6,727 (18.5%)**,
 1: 2,402 (6.6%), 2: 1,774, 3: 1,417, 4: 1,169, 5+: 22,871. 16K: 145,440 = 257.4 GB, H2D 26.9 s; 0: 23,359, 1: 8,534,
 2: 6,173, 3: 4,938, 4: 4,213, 5+: 98,223. Routing is skewed: a quarter of stream-ahead's bytes (0 or 1 row) is waste.
+
+### S4: predicted stream-ahead (layer l+1's router on layer l's residual)
+Chunks of >= 256 rows: layer l's pre-routing work also runs layer l+1's router on its residual (normed with l+1's post
+norm; one fp16 tensor-core GEMM + top-8), and right after l's routing the host queues the non-resident experts predicted
+for >= 2 rows; real routing decides (unpredicted >= 2 rows: on demand; 1 row: CPU). Layer 0 and the MTP layer: on demand.
+4K: 64.3 -> **50.9 GB**, H2D busy 6.70 -> 5.36 s; streamed experts with 0 rows 6,727 -> 662, 1 row 2,402 -> 920.
+16K: 257.4 -> 211.7 GB, H2D 26.9 -> 22.2 s. A/B alternating: **4K 612 / 727 / 598 / 723**, **16K 589 / 679 / 594 / 681**
+(+20% / +15%). Same greedy tokens; `--check` PASS (mean KL 1.71e-3, top-1 98.6%); test_kernels ALL PASS; bench 49.3 / 48.2,
+rerun in reverse order 48.4 (new) / 48.3 (old): unchanged (the second run of a pair is the warmer one).

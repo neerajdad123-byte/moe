@@ -889,10 +889,11 @@ struct Engine {
     cudaEvent_t ev_hfree[2], ev_dma0[2];  // a pinned half's DMA: start / end (timed: H2D busy time)
     cudaStream_t cpp;
     cudaEvent_t ev_copied[NB], ev_free[NB];
-    // Streamer thread (one per prefill): takes per-layer expert lists in chunk_layer's call order and stages them
-    // batch by batch into the VRAM ring (global batch b -> ring batch b % NB). Chunks of >= AHEAD_T rows queue
-    // every layer's non-resident experts at the chunk's start (~all are used: ~32 rows per expert), so the copies run
-    // under the GPU's earlier work; smaller chunks queue each layer's list after its routing.
+    // Streamer thread (one per prefill): takes expert lists in the order chunk_layer consumes them and stages them
+    // batch by batch into the VRAM ring (global batch b -> ring batch b % nring). In chunks of >= AHEAD_T rows, layer
+    // l also runs layer l+1's router on its residual (normed with l+1's post norm) and queues the non-resident experts
+    // predicted for >= STREAM_MIN rows right after l's routing, so they stream under l's experts and l+1's GEMMs.
+    // Real routing decides: unpredicted experts with >= STREAM_MIN rows are queued on demand, the rest go to the CPU.
     static constexpr int AHEAD_T = 256;
     std::thread streamer;
     std::mutex st_mu;
@@ -900,7 +901,9 @@ struct Engine {
     bool st_stop = false;
     std::atomic<long long> st_copied{0}, st_freed{0};  // batches whose H2D copy is enqueued / whose compute is enqueued
     long long main_b = 0;                              // main thread's next batch
-    std::deque<std::vector<int>> ahead_lists;          // main thread: lists queued ahead, in call order
+    std::vector<int> pred_list;                        // main thread: the next layer's predicted list (queued)
+    bool pred_set = false;
+    int *predi_h, *predi_d;                            // mapped: predicted top-8 of the next layer, [CH][TOPK]
     double st_wait = 0, st_memcpy = 0, st_dma = 0;     // streamer: waiting for a free pinned half, host memcpy; H2D busy
     long long st_rows[6] = {};                         // streamed experts by the rows they got: 0, 1, 2, 3, 4, 5+
     void stream_push(int l, const std::vector<int>& v) { std::lock_guard<std::mutex> g(st_mu); st_q.push_back({l, v}); }
@@ -980,7 +983,7 @@ struct Engine {
     void alloc_prefill() {
         mapped_alloc(&rows_h, &rows_d, (size_t)CH * D); mapped_alloc(&rwc_h, &rwc_d, (size_t)CH * TOPK);
         mapped_alloc(&ycpu_h, &ycpu_d, (size_t)CH * D); mapped_alloc(&ridxc_h, &ridxc_d, (size_t)CH * TOPK);
-        mapped_alloc(&items_h, &items_d, (size_t)E); mapped_alloc(&pairs_h, &pairs_d, (size_t)CH * TOPK);
+        mapped_alloc(&items_h, &items_d, (size_t)E); mapped_alloc(&predi_h, &predi_d, (size_t)CH * TOPK); mapped_alloc(&pairs_h, &pairs_d, (size_t)CH * TOPK);
         ypair_cpu.resize((size_t)CH * TOPK * D);
         CK(cudaMallocHost(&hstage, (size_t)2 * SB * EXPERT_BYTES));
         CK(cudaStreamCreateWithFlags(&cpp, cudaStreamNonBlocking));
@@ -1011,13 +1014,6 @@ struct Engine {
         streamer = std::thread([this] { streamer_main(); });
         for (int c0 = 0; c0 < n; c0 += CH) {
             const int T = std::min(CH, n - c0);
-            if (T >= AHEAD_T)
-                for (int l = 0; l < NL + has_mtp; l++) {  // the call order of chunk_layer below (+ the MTP layer)
-                    std::vector<int> v;
-                    for (int e = 0; e < E; e++) { int sl = slot_of[l * E + e]; if (!(sl >= 0 && ready[sl])) v.push_back(e); }
-                    stream_push(l, v);
-                    ahead_lists.push_back(std::move(v));
-                }
             tokens += T;
             for (int t = 0; t < T; t++) note(ids[c0 + t]);
             for (int t = 0; t < T; t++)
@@ -1080,6 +1076,12 @@ struct Engine {
                 gemv_f16(w.router, hc, lgc, D, E, cs, T);  // fp32 routing, as decode
                 router_topk(lgc, E, TOPK, NORM_TOPK, ridxc, rwc, cs, T);
                 export_route_k<<<(T * D + 255) / 256, 256, 0, cs>>>(hc, ridxc, rwc, rows_d, ridxc_d, rwc_d, T * D, T * TOPK);
+                if (!verify && T >= AHEAD_T && l + 1 < NL) {  // predict layer l+1's routing (fp16 GEMM: only a prediction)
+                    rmsnorm(Xc, nullptr, L[l + 1].post_ln, tmpc, D, EPS, T, cs);
+                    Mat r; r.f16 = L[l + 1].router;
+                    gemm(r, tmpc, lgc, T, D, E, cs);
+                    router_topk(lgc, E, TOPK, NORM_TOPK, predi_d, rwc, cs, T);
+                }
                 if (verify) {  // the host only needs the routing: signal it, then the shared expert overlaps the CPU work
                     CK(cudaEventRecordWithFlags(ev_route, cs, cudaEventRecordExternal));
                     shared_rows(w, T);
@@ -1116,9 +1118,10 @@ struct Engine {
                 int nitems = 0, npairs = 0, job_of[E];
                 std::fill(job_of, job_of + E, -1);
                 std::vector<CpuExperts::Job> jobs;
-                std::vector<int> streamed;  // in the streamer's order
-                const bool listed = !verify && !ahead_lists.empty();  // queued at the chunk's start: all non-resident
-                if (listed) { streamed = std::move(ahead_lists.front()); ahead_lists.pop_front(); }
+                std::vector<int> streamed, ondemand;  // queued when l-1 predicted l / now, in the streamer's order
+                if (!verify && pred_set) { streamed = std::move(pred_list); pred_set = false; }
+                char listed[E] = {};
+                for (int e : streamed) listed[e] = 1;
                 auto add_item = [&](int e, const uint8_t* slot) {
                     items_h[nitems] = {slot, npairs, (int)per[e].size()};
                     for (auto& pr : per[e]) pairs_h[npairs++] = pr;
@@ -1133,18 +1136,27 @@ struct Engine {
                     if (vs_on) vs[per[e].size() == 2 ? 4 : per[e][0].t == 0 ? 2 : 3]++;
                     misses += per[e].size();
                     if (verify && sl < 0) admits_todo.push_back(key);
-                    if (listed) continue;
-                    if (!verify && (int)per[e].size() >= STREAM_MIN) { streamed.push_back(e); continue; }
+                    if (listed[e]) continue;
+                    if (!verify && (int)per[e].size() >= STREAM_MIN) { ondemand.push_back(e); continue; }
                     job_of[e] = (int)jobs.size();
                     jobs.push_back({eq[key], es[key], {}, {}, {}});
                     for (auto& pr : per[e]) { jobs.back().toks.push_back(pr.t); jobs.back().pids.push_back(pr.p); jobs.back().ws.push_back(pr.w); }
                 }
-                if (!listed && !streamed.empty()) stream_push(l, streamed);
+                if (!ondemand.empty()) stream_push(l, ondemand);
+                if (!verify && T >= AHEAD_T && l + 1 < NL) {  // after l's own list: the streamer's order is consumption order
+                    int cnt[E] = {};
+                    pred_list.clear();
+                    for (int i = 0; i < T * TOPK; i++) cnt[predi_h[i]]++;
+                    for (int e = 0; e < E; e++) { int sl = slot_of[(l + 1) * E + e]; if (cnt[e] >= STREAM_MIN && !(sl >= 0 && ready[sl])) pred_list.push_back(e); }
+                    if (!pred_list.empty()) stream_push(l + 1, pred_list);
+                    pred_set = true;
+                }
                 lap(2);
                 {
                     std::vector<int> pk;
                     for (int e = 0; e < E; e++) if (job_of[e] >= 0) pk.push_back(l * E + e);
                     for (int e : streamed) pk.push_back(l * E + e);
+                    for (int e : ondemand) pk.push_back(l * E + e);
                     prefetch_experts(pk.data(), (int)pk.size());
                 }
                 lap(3);
@@ -1160,15 +1172,18 @@ struct Engine {
                 if (!verify) shared_rows(w, T);
                 // streamed experts: items point at their ring slot; batch k of this list is global batch b0 + k
                 const long long b0 = main_b;
-                const int nbat = ((int)streamed.size() + SB - 1) / SB;
-                std::vector<int> bi(nbat + 1);
-                for (int k = 0; k < (int)streamed.size(); k++) {
-                    if (k % SB == 0) bi[k / SB] = nitems;
-                    if (!per[streamed[k]].empty()) add_item(streamed[k], stage_p + ((size_t)((b0 + k / SB) % nring) * SB + k % SB) * EXPERT_BYTES);
+                std::vector<int> bi;  // item index at each batch's start, then the end
+                for (auto* v : {&streamed, &ondemand}) {  // two lists: batches don't span lists
+                    for (int k = 0; k < (int)v->size(); k++) {
+                        const int e = (*v)[k];
+                        if (k % SB == 0) bi.push_back(nitems);
+                        if (!per[e].empty()) add_item(e, stage_p + ((size_t)((main_b + k / SB) % nring) * SB + k % SB) * EXPERT_BYTES);
+                        st_rows[std::min((int)per[e].size(), 5)]++;
+                    }
+                    main_b += (v->size() + SB - 1) / SB;
                 }
-                bi[nbat] = nitems;
-                for (int e : streamed) st_rows[std::min((int)per[e].size(), 5)]++;
-                main_b += nbat;
+                const int nbat = (int)(main_b - b0);
+                bi.push_back(nitems);
                 int launched = 0;
                 auto launch_streamed = [&](bool wait) {  // each batch's experts once its copy is enqueued
                     for (; launched < nbat; launched++) {
@@ -1182,7 +1197,7 @@ struct Engine {
                     }
                 };
                 launch_streamed(false);
-                streamed_n += streamed.size();
+                streamed_n += streamed.size() + ondemand.size();
                 lap(4);
                 // CPU: non-resident experts, each read once for all of its tokens, overlapped with the above
                 double c1 = now();
