@@ -1240,10 +1240,10 @@ __global__ void set_int_k(int* p, int v) { *p = v; }
 // ---- K8: Gated DeltaNet decode ----
 // Conv: causal depthwise conv (kernel CK) over C channels with a carried ring [C][CK-1], then SiLU.
 // T tokens in order (T = 1 for decode, a chunk for prefill). qkv rows have stride ld; out is [T][C].
-// ring0 (optional, T > 1): the ring after each token but the last (token t at ring0 + t * snap), so the MTP round can
+// ring0 (optional, T > 1): the ring after each token but the last (token t at ring0 + t * rstride), so the MTP round can
 // drop the tokens after any accepted one (rejected drafts)
 __global__ void dn_conv_k(const float* __restrict__ qkv, int ld, const half* __restrict__ w, float* __restrict__ ring,
-                          float* __restrict__ out, int C, int CKn, int T, float* __restrict__ ring0 = nullptr, size_t snap = 0) {
+                          float* __restrict__ out, int C, int CKn, int T, float* __restrict__ ring0 = nullptr, size_t rstride = 0) {
     int c = blockIdx.x * blockDim.x + threadIdx.x;
     if (c >= C) return;
     float* rg = ring + (size_t)c * (CKn - 1);
@@ -1254,7 +1254,7 @@ __global__ void dn_conv_k(const float* __restrict__ qkv, int ld, const half* __r
         for (int i = 0; i < CKn - 2; i++) rg[i] = rg[i + 1];
         rg[CKn - 2] = x;
         out[(size_t)t * C + c] = acc / (1.f + __expf(-acc));
-        if (t < T - 1 && ring0) for (int i = 0; i < CKn - 1; i++) ring0[t * snap + (size_t)c * (CKn - 1) + i] = rg[i];
+        if (t < T - 1 && ring0) for (int i = 0; i < CKn - 1; i++) ring0[t * rstride + (size_t)c * (CKn - 1) + i] = rg[i];
     }
 }
 
@@ -1266,7 +1266,7 @@ __global__ void dn_recur_k(const float* __restrict__ conv, int C, const float* _
                            const float* __restrict__ a, const float* __restrict__ b, int ld,
                            const half* __restrict__ A_log, const half* __restrict__ dt_bias,
                            const half* __restrict__ nw, float* __restrict__ S, float* __restrict__ o,
-                           int VH, int KH, float eps, int T, float* __restrict__ S0 = nullptr, size_t snap = 0) {  // S0: state after token t < T-1 at S0 + t * snap
+                           int VH, int KH, float eps, int T, float* __restrict__ S0 = nullptr) {  // S0: the state after token 0
     __shared__ float qs[DNK], ks[DNK];
     const int h = blockIdx.x, v = threadIdx.x, kh = h / (VH / KH);
     const float alog = expf(__half2float(A_log[h])), dtb = __half2float(dt_bias[h]), nwv = __half2float(nw[v]);
@@ -1295,9 +1295,9 @@ __global__ void dn_recur_k(const float* __restrict__ conv, int C, const float* _
         float r = rsqrtf(block_sum(out * out) / DNV + eps);
         float zz = z[(size_t)t * ld + h * DNV + v];
         o[(size_t)t * VH * DNV + h * DNV + v] = out * r * nwv * (zz / (1.f + __expf(-zz)));
-        if (t < T - 1 && S0) {
+        if (t == 0 && S0) {
 #pragma unroll
-            for (int i = 0; i < DNK; i++) S0[t * snap + (size_t)h * DNK * DNV + i * DNV + v] = col[i];
+            for (int i = 0; i < DNK; i++) S0[(size_t)h * DNK * DNV + i * DNV + v] = col[i];
         }
     }
 #pragma unroll
@@ -1309,9 +1309,9 @@ inline void deltanet_core(const float* qkv, const float* z, const float* a, cons
                           const half* conv_w, const half* A_log, const half* dt_bias, const half* nw,
                           float* ring, float* S, float* conv_scratch, float* o,
                           int C, int CKn, int VH, int KH, float eps, int T = 1, cudaStream_t st = 0,
-                          float* S0 = nullptr, float* ring0 = nullptr, size_t snap = 0) {
-    dn_conv_k<<<(C + 255) / 256, 256, 0, st>>>(qkv, ld, conv_w, ring, conv_scratch, C, CKn, T, ring0, snap);
-    dn_recur_k<<<VH, DNV, 0, st>>>(conv_scratch, C, z, a, b, ld, A_log, dt_bias, nw, S, o, VH, KH, eps, T, S0, snap);
+                          float* S0 = nullptr, float* ring0 = nullptr, size_t rstride = 0) {
+    dn_conv_k<<<(C + 255) / 256, 256, 0, st>>>(qkv, ld, conv_w, ring, conv_scratch, C, CKn, T, ring0, rstride);
+    dn_recur_k<<<VH, DNV, 0, st>>>(conv_scratch, C, z, a, b, ld, A_log, dt_bias, nw, S, o, VH, KH, eps, T, S0);
 }
 
 // ---- K19: sampling helpers ----

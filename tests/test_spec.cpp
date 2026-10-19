@@ -52,6 +52,23 @@ int main() {
         f.chain(2, 4, false, crng, ds, qs);
         check(!ds.empty() && (ds[0] == 9 || ds[0] == 7) && qs[0].size() == 2, "drafter: sampled chain keeps q (two continuations)");
     }
+    {  // gate: n-gram rounds yield 3.4 tokens per 44 ms, head rounds 1.9 per 36 -> n-gram; reversed -> head, probing 1 in 4
+        auto run = [](double ng_tok, double ng_ms, double hd_tok, double hd_ms) {
+            DraftGate g; int used = 0;
+            for (int i = 0; i < 320; i++) {
+                const bool ng = g.use_ngram(); used += ng;
+                (ng ? g.ng : g.head).add(ng ? ng_tok : hd_tok, ng ? ng_ms : hd_ms);
+            }
+            return used;
+        };
+        const int good = run(3.4, 44, 1.9, 36), bad = run(1.8, 44, 1.9, 36);
+        char msg[128]; snprintf(msg, sizeof msg, "gate: n-gram used %d/320 when it pays, %d/320 when it doesn't", good, bad);
+        check(good >= 316 && bad >= 75 && bad <= 85, msg);
+        NgramDrafter d = drafter({1, 2, 3, 4, 9, 1, 2, 3}, 2);
+        std::vector<int> ds; std::vector<std::vector<TokP>> qs;
+        d.chain(4, 2, true, crng, ds, qs);
+        check(d.match == 4 && ds.size() == 2, "drafter: match = the first proposal's suffix length");
+    }
     {  // adaptive length
         DraftLen L; L.kmax = 8;
         const int k0 = L.k();

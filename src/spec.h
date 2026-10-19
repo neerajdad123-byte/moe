@@ -25,6 +25,8 @@ inline int sample_from(const std::vector<TokP>& v, std::mt19937_64& rng) {
 // shortcut: a linear scan per draft (~0.1 ms at 26K tokens vs a ~38 ms round); a suffix index if contexts grow 10x.
 struct NgramDrafter {
     int nmin = 0, nmax = 4;
+    int matched = 0;     // the suffix length the last propose matched (0: none)
+    int match = 0;       // the first propose's match length in the last chain
     std::vector<int> h;  // every token fed so far
     void reset() { h.clear(); }
     void push(int t) { h.push_back(t); }
@@ -33,6 +35,7 @@ struct NgramDrafter {
         h.insert(h.end(), tail.begin(), tail.end());
         std::vector<TokP> q;
         const int n = (int)h.size();
+        matched = 0;
         for (int k = std::min(nmax, n - 1); nmin > 0 && k >= nmin && q.empty(); k--) {
             double tot = 0;
             for (int i = n - k - 1; i >= 0; i--) {  // h[i, i+k) == the last k tokens, followed by h[i+k]
@@ -41,6 +44,7 @@ struct NgramDrafter {
                 if (it == q.end()) q.push_back({h[i + k], 1.0}); else it->p += 1.0;
                 tot++;
             }
+            if (!q.empty()) matched = k;
             for (TokP& e : q) e.p /= tot;
             std::stable_sort(q.begin(), q.end(), [](const TokP& a, const TokP& b) { return a.p > b.p; });
         }
@@ -54,6 +58,7 @@ struct NgramDrafter {
         std::vector<int> tail{last};
         while ((int)d.size() < k) {
             std::vector<TokP> q = propose(tail);
+            if (d.empty()) match = matched;
             if (q.empty()) break;
             const int t = greedy ? q[0].id : sample_from(q, rng);
             d.push_back(t); tail.push_back(t);
@@ -98,3 +103,21 @@ std::vector<int> spec_verify(const std::vector<int>& d, const std::vector<std::v
     out.push_back(sample_from(dist((int)d.size()), rng));
     return out;
 }
+
+// Choose between two draft sources by measured yield: tokens per unit of cost (EMA with a fast start). While the
+// n-gram rate is behind the head's, it is still tried every `probe`-th eligible round so its estimate stays current.
+struct DraftGate {
+    struct Rate {
+        double tok = 0, cost = 0;
+        int n = 0;
+        void add(double t, double c) { const double f = n < 4 ? 1.0 / (n + 1) : 0.25; tok += f * (t - tok); cost += f * (c - cost); n++; }
+        double r() const { return tok / std::max(cost, 1e-9); }
+    };
+    Rate ng, head;
+    int probe = 4, skipped = 0;  // 16 recovered too slowly within a 128-token reply (PLAN.md A1 gating)
+    void reset() { ng = head = Rate{}; skipped = 0; }
+    bool use_ngram() {  // both arms measured twice first (the head too: where n-gram always matches it would never run)
+        if (ng.n < 2 || head.n < 2) return ng.n <= head.n;
+        return ng.r() >= head.r() || ++skipped % probe == 0;
+    }
+};

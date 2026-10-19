@@ -881,3 +881,34 @@ gives Python's dequantized values bit for bit in 4 layouts (int4/int6, gs 64/32,
 Calibration dump done (queue job, 244 s): 200 prompts, every 12th prompt token, 161 files, 2.8 GB.
 Table: pending (queued after the n-gram follow-ups). Run: tools/screen_dense.py --grid (see its docstring).
 Merge: research tooling; the engine hooks are opt-in env switches (no effect unset).
+
+### A1b: n-gram follow-ups; n-gram parked (opt-in `MOEX_NGRAM=3`, off by default)
+- Multi-row dense GEMV: int6 3..8 rows (x in shared memory up to 96 KB, else from global), int8 2..8 rows; test_kernels
+  checks every row equals the 1-row GEMV exactly (2, 3, 5, 8 rows; int8 in_proj / out_proj / lm_head, int6 in_proj /
+  out_proj / shared down / lm_head). 3 rows, int6, vs the int6 tensor-core GEMM they used before: lm_head 5.94 ->
+  **2.56 ms** (162 GB/s), in_proj 0.36 -> 0.13, out_proj 0.19 -> 0.10, shared down 0.039 -> 0.020. The 2-row MTP round was
+  already on GEMVs (gemv_i8 NT 2, gemv_q6<2>): lm_head 2.47 ms per round vs 2.36 for one row.
+- Rollback by replay: one full DeltaNet state copy (after row 0, as plain MTP) + per-row conv ring (96 KB/layer) +
+  rows 1..K-1's recurrence inputs (~1 MB per draft); a rollback past row 0 copies the row-0 state back and replays
+  rows 1..a with dn_recur_k (same kernel, same order: bit-identical state). Rollback state with 4 drafts: 263 -> 74 MB
+  (expert slots 1617 vs 1624 MTP-only; was -111). Cost: rollback to row 0 0.92-0.98 ms (copy), past row 0 1.30-1.40 ms
+  (copy + replay of 1-3 rows), 3-4 per 384 tokens. `--check` with `MOEX_CHECK_WRONG=j` (draft j wrong every round, so
+  every round replays j rows): code1 j=2 KL 1.58e-4, j=3 1.97e-4, top-1 100% (normal 4-draft 2.36e-4).
+- Pick (token choice per verified row) timed apart from lm_head: greedy 0.04 ms/row, sampled (t 0.7, top-p 0.95)
+  0.16-0.17 ms/row = 0.3 ms per round: under the 0.5 ms bar, sampling left as is.
+- Profiler: the MTP-round expert counters now cover rounds of any length (they counted 2-row rounds only).
+- Gating (DraftGate, src/spec.h): per prompt, n-gram drafts only while their tokens per ms of round beat the head's
+  (rounds that captured a graph are excluded; the losing side is still tried every 4th round). Gated vs MTP-only, 2
+  alternating runs, 128 tokens per prompt, greedy / sampled t 0.7 (tok/s):
+
+  | prompt | greedy MTP-only | greedy gated | sampled MTP-only | sampled gated |
+  |---|---|---|---|---|
+  | chat (eval1) | 52.7 / 55.5 | 55.0 / 54.5 (+1.1%) | 54.1 / 56.6 | 57.1 / 54.3 (+0.6%) |
+  | code (code1) | 62.2 / 62.3 | 59.3 / 60.5 (-3.7%) | 61.1 / 58.0 | 53.8 / 64.3 (-0.9%) |
+  | agent (agent1) | 56.9 / 57.8 | 53.8 / 59.0 (-1.6%) | 54.7 / 55.2 | 55.1 / 57.0 (+1.9%) |
+  | overall | 57.0 / 58.4 | 55.9 / 57.9 (-1.4%) | 56.5 / 56.6 | 55.3 / 58.2 (+0.4%) |
+
+  (that run probed every 16th round; the gate found n-gram 19% ahead on code, 0.072 vs 0.061 tokens/ms, only after
+  ~44 gated rounds.) Verdict: parked. On code the head already keeps 98% of its drafts (1.98 tokens per round), and
+  run-to-run noise (53.8 vs 64.3 on one config) is larger than the effect. Kept as an opt-in: the verify path,
+  sampling and rollback are exact and tested.

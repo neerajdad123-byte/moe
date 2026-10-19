@@ -109,11 +109,15 @@ struct Engine {
     DraftLen dlen{getenv("MOEX_NGRAM_MAX") ? std::max(1, std::min(VT - 1, atoi(getenv("MOEX_NGRAM_MAX")))) : 4};
     std::vector<int> drafts;                // this round's drafts
     std::vector<std::vector<TokP>> dqs;     // the distribution each was drawn from (one-hot: head, greedy, --check)
-    long long ng_rounds = 0, ng_acc = 0, ng_drafted = 0;
+    long long ng_rounds = 0, ng_acc = 0, ng_drafted = 0, ng_gated = 0;
     bool ng_draft = false;
+    // Per prompt (reset by prefill): n-gram drafts only while their tokens per ms of round beat the head's (DraftGate;
+    // deterministic mode prices a round by its rows instead of its wall time, so the choice is repeatable)
+    DraftGate gate;
     void choose_draft(int head, int last) {
         draft = head;
         if (ngram.nmin) ngram.chain(last, dlen.k(), samp.temp <= 0.f, rng, drafts, dqs); else drafts.clear();
+        if (!drafts.empty() && !gate.use_ngram()) { drafts.clear(); ng_gated++; }
         if (!(ng_draft = !drafts.empty())) { drafts = {head}; dqs = {{{head, 1.0}}}; }
     }
     void set_drafts(const std::vector<int>& d) {  // --check: teacher-forced drafts
@@ -850,7 +854,13 @@ struct Engine {
         if (has_mtp) {
             CK(cudaMalloc(&vbuf, carve_prefill(nullptr, VT)));
             mtp_cat = falloc((size_t)CH * 2 * D); lg2 = falloc((size_t)VT * V); dlog = falloc(V);
-            snap = falloc(SNAPROW * (ngram.nmin ? dlen.kmax : 1));  // ~66 MB per draft token a round may hold
+            snap_rows = ngram.nmin ? dlen.kmax : 1;
+            snap = falloc(NDN * DNS); rsnap = falloc((size_t)snap_rows * RSTRIDE);
+            if (snap_rows > 1) {  // replay inputs for rows 1 .. kmax - 1 (~1 MB per draft row)
+                rp_conv = falloc(NDN * (snap_rows - 1) * DC); rp_ab = falloc(NDN * (snap_rows - 1) * 2 * DVH);
+                rp_out = falloc((size_t)(snap_rows - 1) * DVH * DNV);
+            }
+            snap_bytes = (NDN * DNS + (size_t)snap_rows * RSTRIDE + (snap_rows > 1 ? NDN * (snap_rows - 1) * (DC + 2 * DVH) + (size_t)(snap_rows - 1) * DVH * DNV : 0)) * 4;
         }
         eq.assign(NKEY, nullptr); es.assign(NKEY, nullptr);
         for (int l = 0; l < NL + has_mtp; l++) for (int e = 0; e < E; e++) {
@@ -880,7 +890,7 @@ struct Engine {
             const size_t lmh = f16 ? (size_t)V * D * 2 : is_q6("lm_head") ? (size_t)V * D * 3 / 4 + (size_t)V * (D / 64) * 4 : (size_t)V * D + (size_t)V * 4;
             const size_t router = (size_t)(NL + has_mtp) * E * D * 2;
             const size_t weights = vf[0] - vf[1] - (f16 ? 0 : (size_t)V * D * 2) - kv - dn;  // minus the F16 staging
-            const size_t snapb = has_mtp ? (size_t)(NL - NL / 4) * ((size_t)DVH * DNK * DNV + (size_t)DC * (CONVK - 1)) * 4 : 0;
+            const size_t snapb = snap_bytes;
             fprintf(stderr, "[vram] total %.0f MB, in use before load %.0f (CUDA context, display, other apps) | lm_head %.0f | "
                             "dense + MTP head %.0f (incl. routers f16 %.0f) | KV cache %.0f (ctx %d) | DeltaNet state %.0f | "
                             "decode/MTP scratch %.0f (incl. MTP snapshot %.0f) | expert cache %d slots = %.0f MB (prefill borrows %d) | "
@@ -1116,6 +1126,7 @@ struct Engine {
         const int LQ = AH * 2 * AHD + 2 * AKV * AHD, LB = DC + DVH * DNV + 2 * DVH;
         int next = -1;
         nvtxRangePushA("prefill");
+        gate.reset();  // a new prompt: n-gram vs head is judged afresh
         claim_prefill_slots();
         cpool.spin = true;  // the copy pool is hot for the length of the prefill
         double pt0 = now(), pt[5] = {};
@@ -1191,7 +1202,11 @@ struct Engine {
                     gemm(w.dn_in, hc, bigc, T, D, LB, cs);
                     deltanet_core(bigc, bigc + DC, bigc + DC + DVH * DNV, bigc + DC + DVH * DNV + DVH, LB, w.conv, w.alog, w.dtb, w.nw,
                                   w.ring, w.S, convc, oc, DC, CONVK, DVH, DKH, EPS, T, cs,
-                                  verify ? snap_S(l) : nullptr, verify ? snap_S(l) + DVH * DNK * DNV : nullptr, SNAPROW);  // state after each row
+                                  verify ? snap_S(l) : nullptr, verify ? ring_S(l) : nullptr, RSTRIDE);  // state after row 0, ring after each row
+                    if (verify && T > 2) {  // rows 1 .. T-2: the inputs a rollback past row 0 replays
+                        CK(cudaMemcpyAsync(rp_c(l), convc + DC, (size_t)(T - 2) * DC * 4, cudaMemcpyDeviceToDevice, cs));
+                        CK(cudaMemcpy2DAsync(rp_a(l), 2 * DVH * 4, bigc + LB + DC + DVH * DNV, LB * 4, 2 * DVH * 4, T - 2, cudaMemcpyDeviceToDevice, cs));
+                    }
                     calib("dn_out", l, oc, T, DVH * DNV);
                     gemm(w.out, oc, tmpc, T, DVH * DNV, D, cs);
                 }
@@ -1213,6 +1228,7 @@ struct Engine {
                 if (verify) {
                     cudaGraphExec_t& g = vgraph[T - 1][l];
                     if (!g) {
+                        vcaptured = true;  // a new row count: this round's time is not representative (DraftGate)
                         cudaGraph_t gr;
                         CK(cudaStreamBeginCapture(cs, cudaStreamCaptureModeThreadLocal));
                         pre();
@@ -1228,7 +1244,7 @@ struct Engine {
                 pt[0] += now() - w0;
                 lap(1);
                 const double hb0 = now();
-                const bool vs_on = verify && T == 2 && l < NL;
+                const bool vs_on = verify && T >= 2 && l < NL;  // every draft round (T - 1 drafts)
                 // group the chunk's (token, expert) pairs by expert: resident -> GPU, non-resident with
                 // >= STREAM_MIN tokens -> streamed to the GPU, the rest -> CPU
                 for (auto& v : per) v.clear();
@@ -1256,7 +1272,7 @@ struct Engine {
                     if (verify && sl >= 0) last[sl] = clock;  // protects this layer's experts (incl. in-flight) from eviction
                     if (vs_on) vs[0]++;
                     if (sl >= 0 && ready[sl]) { add_item(e, arena + (size_t)sl * EXPERT_BYTES); hits += per[e].size(); if (vs_on) vs[1]++; continue; }
-                    if (vs_on) vs[per[e].size() == 2 ? 4 : per[e][0].t == 0 ? 2 : 3]++;
+                    if (vs_on) { const bool t0 = per[e][0].t == 0; vs[t0 && per[e].size() > 1 ? 4 : t0 ? 2 : 3]++; }  // pairs are in t order
                     misses += per[e].size();
                     if (verify && sl < 0) admits_todo.push_back(key);
                     if (listed[e]) continue;
@@ -1422,17 +1438,29 @@ struct Engine {
         return ids_h[0];
     }
 
-    // snap: per linear-attention layer, its DeltaNet state + conv ring after the real token of the MTP round (written
-    // by the kernels as they go). A wrong draft copies it back: the state as if only the real token had been fed.
-    // snap row r (rows 0 .. drafts - 1): every DeltaNet layer's state and conv ring after the round's row r
-    static constexpr size_t SNAPROW = (size_t)(NL - NL / 4) * (DVH * DNK * DNV + DC * (CONVK - 1));
-    float* snap_S(int l, int r = 0) { return snap + r * SNAPROW + (size_t)(l - (l + 1) / 4) * (DVH * DNK * DNV + DC * (CONVK - 1)); }
+    // Rollback state of the MTP round (written by the kernels as they go): per linear-attention layer, the DeltaNet
+    // state after row 0 (snap, 2 MB: the only full copy), the conv ring after every row but the last (rsnap, 96 KB per
+    // row), and for rows 1 .. K-1 the recurrence's inputs (rp_c: conv output, rp_a: a | b; ~32 KB per row). Keeping rows
+    // 0 .. r: the state after row 0 is copied back, rows 1 .. r are replayed by the same kernel (same order: the same
+    // state, bit for bit), the ring after row r copied back. Full per-row states would cost ~66 MB per draft token.
+    static constexpr size_t NDN = NL - NL / 4, DNS = (size_t)DVH * DNK * DNV, RSTRIDE = NDN * DC * (CONVK - 1);
+    int snap_rows = 1;
+    size_t snap_bytes = 0;
+    float *rsnap = nullptr, *rp_conv = nullptr, *rp_ab = nullptr, *rp_out = nullptr;
+    static size_t dn_of(int l) { return (size_t)(l - (l + 1) / 4); }
+    float* snap_S(int l) { return snap + dn_of(l) * DNS; }
+    float* ring_S(int l, int r = 0) { return rsnap + r * RSTRIDE + dn_of(l) * DC * (CONVK - 1); }
+    float* rp_c(int l) { return rp_conv + dn_of(l) * (snap_rows - 1) * DC; }
+    float* rp_a(int l) { return rp_ab + dn_of(l) * (snap_rows - 1) * 2 * DVH; }
     void dn_rollback(int r) {
-        const size_t nS = (size_t)DVH * DNK * DNV, nR = (size_t)DC * (CONVK - 1);
         for (int l = 0; l < NL; l++) if (!is_attn(l)) {
-            CK(cudaMemcpyAsync(L[l].S, snap_S(l, r), nS * 4, cudaMemcpyDeviceToDevice, cs));
-            CK(cudaMemcpyAsync(L[l].ring, snap_S(l, r) + nS, nR * 4, cudaMemcpyDeviceToDevice, cs));
+            CK(cudaMemcpyAsync(L[l].S, snap_S(l), DNS * 4, cudaMemcpyDeviceToDevice, cs));
+            CK(cudaMemcpyAsync(L[l].ring, ring_S(l, r), (size_t)DC * (CONVK - 1) * 4, cudaMemcpyDeviceToDevice, cs));
+            if (r > 0)  // z = the conv rows (any readable memory: the outputs are not kept)
+                dn_recur_k<<<DVH, DNV, 0, cs>>>(rp_c(l), DC, rp_c(l), rp_a(l), rp_a(l) + DVH, 2 * DVH, L[l].alog, L[l].dtb, L[l].nw,
+                                                L[l].S, rp_out, DVH, DKH, EPS, r);
         }
+        CK(cudaGetLastError());
     }
 
     // One MTP decode round: feeds y at position p and the K drafts at p+1.. together (K = 1: the head's draft). Returns
@@ -1440,13 +1468,19 @@ struct Engine {
     // or the token after the last draft.
     long long mtp_rounds = 0, mtp_acc = 0, mtp_drafted = 0;  // rounds, drafts accepted, drafts verified
     double vpt[2] = {};  // in the 40 layers: waiting for the GPU's routing, CPU experts
-    double mt[5] = {};  // MTP round time: snapshot, 40 layers, lm_head+pick, mtp layer, rejected-draft redo
+    double mt[6] = {};  // MTP round time: snapshot, 40 layers, lm_head, mtp layer, rollback (+ replay), pick
+    long long picks = 0;  // token_dist calls in rounds
+    bool vcaptured = false;  // this round captured a layer graph
+    long long rb_n[2] = {};  // rollbacks: to row 0 (copy only), past row 0 (copy + replay)
+    double rb_t[2] = {};
     std::vector<int> mtp_round(int y, int p) {
         if (drafts.empty()) set_drafts({draft});
         // snap holds kmax rows; the KV cache ends at ctx
         const int K = std::max(0, std::min({(int)drafts.size(), ngram.nmin ? dlen.kmax : 1, ctx - 1 - p})), T = K + 1;
         drafts.resize(K); dqs.resize(K);
         double pt[5] = {}, t0 = now();
+        const double tr = t0;
+        vcaptured = false;
         mtp_rounds++;
         nvtxRangePushA("mtp round");
         carve_prefill(vbuf, VT);
@@ -1461,19 +1495,23 @@ struct Engine {
         vpt[0] += pt[0]; vpt[1] += pt[2];
         rmsnorm(Xc, moec, norm, hc, D, EPS, T, cs);  // Xc = final hidden at p .. p+K
         gemm(lm_head, hc, lg2, T, D, V, cs);
+        CK(cudaStreamSynchronize(cs)); mt[2] += now() - t0; t0 = now();
         // greedy: p and q one-hot, a draft is kept iff it is its row's argmax
-        auto row_dist = [&](int r) { float* sv = logits; logits = lg2 + (size_t)r * V; auto d = token_dist(); logits = sv; return d; };
+        auto row_dist = [&](int r) { picks++; float* sv = logits; logits = lg2 + (size_t)r * V; auto d = token_dist(); logits = sv; return d; };
         const std::vector<int> out = spec_verify(drafts, dqs, row_dist, rng);
+        mt[5] += now() - t0; t0 = now();
         const int a = (int)out.size() - 1;  // drafts accepted
-        mt[2] += now() - t0; t0 = now();
         mtp_acc += a; mtp_drafted += K;
         if (ng_draft) { ng_rounds++; ng_acc += a; ng_drafted += K; dlen.update(K, a); }
         tokens += a + 1; note(y);
         for (int t = 0; t < a; t++) note(drafts[t]);
         if (a < K) {  // keep rows 0..a (KV rows after p+a hold rejected drafts; they are overwritten when fed)
             dn_rollback(a);
-            CK(cudaStreamSynchronize(cs)); mt[4] += now() - t0; t0 = now();
+            CK(cudaStreamSynchronize(cs));
+            rb_n[a > 0]++; rb_t[a > 0] += now() - t0;
+            mt[4] += now() - t0; t0 = now();
         }
+        if (!vcaptured) (ng_draft ? gate.ng : gate.head).add(a + 1, deterministic ? 1.0 + 0.1 * (T - 2) : now() - tr);
         const std::vector<int> kept(drafts.begin(), drafts.begin() + a);
         choose_draft(mtp_forward(kept.data(), a + 1, out.back(), p + 1, pt, true), out.back());
         mt[3] += now() - t0;
@@ -1897,7 +1935,10 @@ int main(int argc, char** argv) {
                 // MTP rounds, teacher-forced: the true next tokens are the drafts, so every row up to the model's first
                 // disagreement is checked; a disagreement exercises the rollback
                 {
-                    eng.set_drafts(std::vector<int>(ids.begin() + pos + 1, ids.begin() + std::min(pos + 1 + KCHK, (int)ids.size())));
+                    std::vector<int> dr(ids.begin() + pos + 1, ids.begin() + std::min(pos + 1 + KCHK, (int)ids.size()));
+                    // MOEX_CHECK_WRONG=j: draft j is made wrong every round, so each round rolls back to row j (replays rows 1..j)
+                    if (const char* w = getenv("MOEX_CHECK_WRONG")) if (atoi(w) < (int)dr.size()) dr[atoi(w)] = (dr[atoi(w)] + 1) % V;
+                    eng.set_drafts(dr);
                     auto ts = eng.mtp_round(tok, pos);
                     CK(cudaMemcpy(got.data(), eng.lg2, V * 4, cudaMemcpyDeviceToHost));
                     id = ts[0];
@@ -2002,9 +2043,11 @@ int main(int argc, char** argv) {
             if (eng.mtp_rounds > mr0)
                 fprintf(stderr, "    mtp: %lld rounds, draft accepted %.1f%%, %.2f tokens/round\n", eng.mtp_rounds - mr0,
                         100.0 * (eng.mtp_acc - ma0) / (eng.mtp_drafted - md0), 1.0 + (double)(eng.mtp_acc - ma0) / (eng.mtp_rounds - mr0));
-            if (eng.ng_rounds) fprintf(stderr, "    n-gram drafts (run so far): %lld rounds (%.1f%%), %.2f drafts/round, accepted %.1f%%, draft length now %d\n",
-                                       eng.ng_rounds, 100.0 * eng.ng_rounds / eng.mtp_rounds, (double)eng.ng_drafted / eng.ng_rounds,
-                                       100.0 * eng.ng_acc / eng.ng_drafted, eng.dlen.k());
+            if (eng.ngram.nmin) fprintf(stderr, "    n-gram drafts (run so far): %lld rounds (%.1f%%), %.2f drafts/round, accepted %.1f%%, draft length now %d,"
+                                        " gated off %lld | this prompt, tokens per ms: n-gram %.4f (%d rounds), head %.4f (%d)\n",
+                                        eng.ng_rounds, 100.0 * eng.ng_rounds / std::max(1LL, eng.mtp_rounds), (double)eng.ng_drafted / std::max(1LL, eng.ng_rounds),
+                                        100.0 * eng.ng_acc / std::max(1LL, eng.ng_drafted), eng.dlen.k(), eng.ng_gated,
+                                        eng.gate.ng.r() / 1e3, eng.gate.ng.n, eng.gate.head.r() / 1e3, eng.gate.head.n);
             tot.dec += st.dec; tot.sec += st.sec; tot.hits += st.hits; tot.misses += st.misses; tot.admits += st.admits; tot.cpu += st.cpu;
             for (int k = 0; k < 4; k++) tot.ht[k] += st.ht[k];
         }
@@ -2026,9 +2069,13 @@ int main(int argc, char** argv) {
         }
         if (eng.mtp_rounds) {
             const double r = (double)eng.mtp_rounds;
-            fprintf(stderr, "[mtp] %lld rounds, draft accepted %.1f%% | ms/round: snapshot %.2f  40 layers %.2f  lm_head+pick %.2f  mtp layer %.2f  redo %.2f | layers: gpu-wait %.2f  cpu-experts %.2f\n",
-                    eng.mtp_rounds, 100.0 * eng.mtp_acc / eng.mtp_drafted, 1e3 * eng.mt[0] / r, 1e3 * eng.mt[1] / r, 1e3 * eng.mt[2] / r, 1e3 * eng.mt[3] / r, 1e3 * eng.mt[4] / r,
+            fprintf(stderr, "[mtp] %lld rounds, %.2f drafts/round, accepted %.1f%% | ms/round: 40 layers %.2f  lm_head %.2f  pick %.2f (%.3f per row, %.2f rows)"
+                            "  mtp layer %.2f  rollback %.2f | layers: gpu-wait %.2f  cpu-experts %.2f\n",
+                    eng.mtp_rounds, eng.mtp_drafted / r, 100.0 * eng.mtp_acc / eng.mtp_drafted, 1e3 * eng.mt[1] / r, 1e3 * eng.mt[2] / r,
+                    1e3 * eng.mt[5] / r, 1e3 * eng.mt[5] / std::max(1LL, eng.picks), eng.picks / r, 1e3 * eng.mt[3] / r, 1e3 * eng.mt[4] / r,
                     1e3 * eng.vpt[0] / r, 1e3 * eng.vpt[1] / r);
+            fprintf(stderr, "[mtp] rollbacks: to row 0 %lld x %.3f ms (state copy) | past row 0 %lld x %.3f ms (state copy + replay)\n",
+                    eng.rb_n[0], 1e3 * eng.rb_t[0] / std::max(1LL, eng.rb_n[0]), eng.rb_n[1], 1e3 * eng.rb_t[1] / std::max(1LL, eng.rb_n[1]));
             const double* v = eng.vs;
             fprintf(stderr, "[mtp] per round, 40 layers: %.0f experts needed, %.0f in VRAM | CPU misses: real token only %.0f, draft only %.0f, both %.0f"
                             " | host: before CPU %.2f ms, after CPU %.2f ms\n",
