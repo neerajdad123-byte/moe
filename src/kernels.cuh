@@ -187,13 +187,21 @@ template <int WARPS>
 __global__ void gemv_q4_k(const uint8_t* __restrict__ Q, const float* __restrict__ s, const float* __restrict__ x,
                           float* __restrict__ y, int I, int O);
 inline int persistent_blocks();
-template <int WARPS, int NT>
+template <int WARPS, int NT, bool GX = false>
 __global__ void gemv_q6_k(const uint8_t* __restrict__ Q, const uint8_t* __restrict__ Qh, const float* __restrict__ s,
                           const float* __restrict__ x, float* __restrict__ y, int I, int O);
+// x staged in shared memory when NT rows fit in Q6_SMEM (lm_head, 2048 wide: all 8 rows); wider inputs with more rows
+// (dn_out, 4096 wide: 6 .. 8 rows would need up to 147 KB) read x from global / L1, measured faster than the int6 GEMM
+// there but 1.3x slower than it on lm_head. Each row is summed exactly as the 1-row GEMV. gemv_q6_init() once first.
+constexpr int Q6_SMEM = 96 * 1024;
 template <int NT>
 inline void gemv_q6(const Mat& m, const float* x, float* y, int I, int O, cudaStream_t st) {
-    gemv_q6_k<8, NT><<<std::min(persistent_blocks(), (O + 7) / 8), 256, NT * (I + I / 8) * 4, st>>>(m.q6, m.q6h, m.s, x, y, I, O);
+    const int sm = NT * (I + I / 8) * 4, nb = std::min(persistent_blocks(), (O + 7) / 8);
+    if (NT <= 2 || sm <= Q6_SMEM) gemv_q6_k<8, NT><<<nb, 256, sm, st>>>(m.q6, m.q6h, m.s, x, y, I, O);
+    else gemv_q6_k<8, NT, true><<<nb, 256, 0, st>>>(m.q6, m.q6h, m.s, x, y, I, O);
 }
+template <int NT> inline void q6_attr() { CK(cudaFuncSetAttribute(gemv_q6_k<8, NT>, cudaFuncAttributeMaxDynamicSharedMemorySize, Q6_SMEM)); }
+inline void gemv_q6_init() { q6_attr<3>(); q6_attr<4>(); q6_attr<5>(); q6_attr<6>(); q6_attr<7>(); q6_attr<8>(); }
 
 inline void gemv(const Mat& m, const float* x, float* y, int I, int O, cudaStream_t st = 0) {
     constexpr int WARPS = 8;
@@ -332,6 +340,14 @@ inline void gemm(const Mat& m, const float* X, float* Y, int S, int I, int O, cu
         }
         return;
     }
+    if (m.q6 && S >= 3 && S <= 8) {  // draft rounds: one GEMV reads W once for all rows
+        switch (S) {
+            case 3: gemv_q6<3>(m, X, Y, I, O, st); break; case 4: gemv_q6<4>(m, X, Y, I, O, st); break;
+            case 5: gemv_q6<5>(m, X, Y, I, O, st); break; case 6: gemv_q6<6>(m, X, Y, I, O, st); break;
+            case 7: gemv_q6<7>(m, X, Y, I, O, st); break; default: gemv_q6<8>(m, X, Y, I, O, st);
+        }
+        return;
+    }
     if (S <= 2) {  // tensor-core tiles of 64 tokens would waste 62 of them
         if (S == 2 && m.q6) gemv_q6<2>(m, X, Y, I, O, st);
         else for (int t = 0; t < S; t++) gemv(m, X + (size_t)t * I, Y + (size_t)t * O, I, O, st);
@@ -453,13 +469,15 @@ __device__ __forceinline__ float dot32_q6(uint4 u, uint2 h, const float* __restr
     }
     return acc;
 }
-template <int WARPS, int NT>
+template <int WARPS, int NT, bool GX>
 __global__ void gemv_q6_k(const uint8_t* __restrict__ Q, const uint8_t* __restrict__ Qh, const float* __restrict__ s,
                           const float* __restrict__ x, float* __restrict__ y, int I, int O) {
-    extern __shared__ __align__(16) float xs[];  // NT x [xpad_size(I)]
-    for (int t = 0; t < NT; t++)
-        for (int i = threadIdx.x; i < I; i += blockDim.x) xs[t * xpad_size(I) + xpad(i)] = x[(size_t)t * I + i];
-    __syncthreads();
+    extern __shared__ __align__(16) float xs[];  // NT x [xpad_size(I)]; GX: unused, x read from global
+    if (!GX) {
+        for (int t = 0; t < NT; t++)
+            for (int i = threadIdx.x; i < I; i += blockDim.x) xs[t * xpad_size(I) + xpad(i)] = x[(size_t)t * I + i];
+        __syncthreads();
+    }
     const int lane = threadIdx.x & 31, G = I / 64;
     for (int row = blockIdx.x * WARPS + (threadIdx.x >> 5); row < O; row += gridDim.x * WARPS) {
         const uint4* wr = reinterpret_cast<const uint4*>(Q + (size_t)row * (I / 2));
@@ -472,7 +490,7 @@ __global__ void gemv_q6_k(const uint8_t* __restrict__ Q, const uint8_t* __restri
             const uint2 h = __ldcs(hr + c);
             const float sc = sr[c >> 1];
 #pragma unroll
-            for (int t = 0; t < NT; t++) acc[t] += dot32_q6(u, h, xs + t * xpad_size(I) + 36 * c) * sc;
+            for (int t = 0; t < NT; t++) acc[t] += dot32_q6(u, h, GX ? x + (size_t)t * I + 32 * c : xs + t * xpad_size(I) + 36 * c) * sc;
         }
 #pragma unroll
         for (int t = 0; t < NT; t++) { const float v = warp_sum(acc[t]); if (lane == 0) y[(size_t)t * O + row] = v; }

@@ -785,6 +785,7 @@ struct Engine {
 
     void load() {
         double t0 = now();
+        gemv_q6_init();
         size_t vf[5], vtot; CK(cudaMemGetInfo(&vf[0], &vtot));  // VRAM audit: free before load, after weights, after the
                                                                 // F16 staging is freed, after the scratch, after the cache
         embed = (const half*)C.map("model.embed_tokens.weight");

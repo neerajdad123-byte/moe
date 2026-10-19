@@ -78,6 +78,7 @@ static std::string pn_(int p, const char* rest) { char b[64]; snprintf(b, sizeof
 
 int main(int argc, char** argv) {
     const char* filt = argc > 1 ? argv[1] : nullptr;
+    gemv_q6_init();
     Container C(MODEL);
     const int D = 2048;
     const std::string P = "p005_";
@@ -290,6 +291,16 @@ int main(int argc, char** argv) {
             double mx = 0, e = 0; for (int i = 0; i < cs.O; i++) { mx = std::max(mx, (double)fabsf(gf[i])); e = std::max(e, (double)fabsf(gq[i] - gf[i])); }
             printf("  %-34s int8-vs-F16 rel %.3e (quantization drift)\n", nm.c_str(), e / mx);
             bench((nm + " int8").c_str(), (double)cs.O * cs.I + cs.O * 4.0, [&] { gemv({nullptr, q, s}, xd, y, cs.I, cs.O); }, cs.O > 100000 ? 20 : 50);
+            for (int S : {2, 3, 5, 8}) {  // MTP (2) and draft rounds through gemm(): each row exactly the 1-row GEMV
+                std::vector<float> hx((size_t)S * cs.I);
+                for (int t = 0; t < S; t++) for (int i = 0; i < cs.I; i++) hx[(size_t)t * cs.I + i] = xin[i] * (1.f + 0.05f * t);
+                float *X = up(hx), *Y = dalloc((size_t)S * cs.O), *Yr = dalloc((size_t)S * cs.O);
+                gemm({nullptr, q, s}, X, Y, S, cs.I, cs.O);
+                for (int t = 0; t < S; t++) gemv({nullptr, q, s}, X + (size_t)t * cs.I, Yr + (size_t)t * cs.O, cs.I, cs.O);
+                check((nm + " gemv_i8 " + std::to_string(S) + " rows == 1-row").c_str(), down(Y, (size_t)S * cs.O), down(Yr, (size_t)S * cs.O), 1e-7f);
+                if (S == 2) bench((nm + " int8 2 rows").c_str(), (double)cs.O * cs.I + cs.O * 4.0, [&] { gemm({nullptr, q, s}, X, Y, 2, cs.I, cs.O); }, cs.O > 100000 ? 20 : 50);
+                for (void* p : {(void*)X, (void*)Y, (void*)Yr}) CK(cudaFree(p));
+            }
             for (void* p : {(void*)W, (void*)q, (void*)s, (void*)xd, (void*)y, (void*)yf}) CK(cudaFree(p));
         }
     }
@@ -362,6 +373,22 @@ int main(int argc, char** argv) {
             gemv_f16(W, xd + cs.I, yr + cs.O, cs.I, cs.O);
             check((nm + " gemv_q6 2 tokens").c_str(), down(y, (size_t)2 * cs.O), down(yr, (size_t)2 * cs.O), 1e-3f);
             bench((nm + " int6").c_str(), (double)cs.O * cs.I * 0.75 + cs.O * (cs.I / 64) * 4.0, [&] { gemv(m, xd, y, cs.I, cs.O); }, cs.O > 100000 ? 20 : 50);
+            for (int S : {2, 3, 5, 8}) {  // MTP (2) and draft rounds: each row exactly the 1-row GEMV; 4 rows timed against the int6 GEMM
+                std::vector<float> hx((size_t)S * cs.I);
+                for (int t = 0; t < S; t++) for (int i = 0; i < cs.I; i++) hx[(size_t)t * cs.I + i] = xin[i] * (1.f + 0.05f * t);
+                float *X = up(hx), *Y = dalloc((size_t)S * cs.O), *Yr = dalloc((size_t)S * cs.O);
+                gemm(m, X, Y, S, cs.I, cs.O);
+                for (int t = 0; t < S; t++) gemv(m, X + (size_t)t * cs.I, Yr + (size_t)t * cs.O, cs.I, cs.O);
+                check((nm + " gemv_q6 " + std::to_string(S) + " rows == 1-row").c_str(), down(Y, (size_t)S * cs.O), down(Yr, (size_t)S * cs.O), 1e-7f);
+                if (S == 2) bench((nm + " int6 2 rows").c_str(), (double)cs.O * cs.I * 0.75 + cs.O * (cs.I / 64) * 4.0, [&] { gemm(m, X, Y, 2, cs.I, cs.O); }, cs.O > 100000 ? 20 : 50);
+                if (S == 3) {
+                    const double by = (double)cs.O * cs.I * 0.75 + cs.O * (cs.I / 64) * 4.0;
+                    bench((nm + " int6 3 rows GEMV").c_str(), by, [&] { gemm(m, X, Y, 3, cs.I, cs.O); }, cs.O > 100000 ? 20 : 50);
+                    bench((nm + " int6 3 rows GEMM (before)").c_str(), by, [&] {
+                        gemm_i8_k<true><<<dim3((cs.O + 127) / 128, 1), 256>>>((const int8_t*)m.q6, m.s, X, Y, 3, cs.I, cs.O, m.q6h); }, cs.O > 100000 ? 20 : 50);
+                }
+                for (void* p : {(void*)X, (void*)Y, (void*)Yr}) CK(cudaFree(p));
+            }
             if (cs.O < 100000) {
                 const int S = 160;
                 std::vector<float> hx((size_t)S * cs.I); for (int t = 0; t < S; t++) for (int i = 0; i < cs.I; i++) hx[(size_t)t * cs.I + i] = xin[i] * (1.f + 0.03f * (t % 16));
