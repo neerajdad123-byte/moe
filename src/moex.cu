@@ -1400,6 +1400,7 @@ int main(int argc, char** argv) {
     if (argc > 1 && argv[1][0] != '-') { mode = argv[1]; argv++; argc--; }  // moex chat | moex serve
     std::vector<int> ids, stop;
     int n = 32, ctx = 2048;
+    bool ctx_set = false;  // --ctx given: chat/serve/bench keep it, even 2048
     std::string check, batch, trace_path, ahead_path;
     bool prof = false, f16 = false, use_prefill = true;
     std::string q4groups;
@@ -1420,7 +1421,7 @@ int main(int argc, char** argv) {
         else if (s == "--host") host = next();
         else if (s == "--allow-origin") allow_origins.push_back(next());
         else if (s == "--port") port = std::stoi(next());
-        else if (s == "--ctx") ctx = std::stoi(next());
+        else if (s == "--ctx") { ctx = std::stoi(next()); ctx_set = true; }
         else if (s == "--stop") stop = parse_ids(next());
         else if (s == "--check") check = next();
         else if (s == "--profile") prof = true;
@@ -1479,7 +1480,7 @@ int main(int argc, char** argv) {
     }
     if ((mode == "chat" || mode == "bench") && !samp_set) { samp.temp = 0.7f; samp.top_p = 0.8f; samp.top_k = 20; }  // Qwen non-thinking defaults
     if (mode == "chat" && think && !samp_set) { samp.temp = 1.0f; samp.top_p = 0.95f; samp.top_k = 20; }  // thinking defaults
-    if ((mode == "chat" || mode == "serve" || mode == "bench") && ctx == 2048) ctx = 8192;
+    if ((mode == "chat" || mode == "serve" || mode == "bench") && !ctx_set) ctx = 8192;
     if (mode == "bench") { warm = true; if (!samp.seed) samp.seed = 1; }  // what `moex chat --load` gets, same text every run
     if (mode == "download") return download_model(model, only);
     if (!std::filesystem::exists(std::filesystem::path(model) / "config.json")) {
