@@ -546,3 +546,8 @@ launch 6.0, cpu 2.7, gpu-wait 2.5. GPU per 1024-row chunk-layer at 4K (nsys, ~38
 gemm_wmma dn_in 16.8 ms per call (~3.1 TFLOPS), out/o/sh_d 3.0 each, qkv 8.3, sh_gu 1.5; **attn_decode_k 24 ms per
 attention layer** (row by row, grows with context); router + shared-gate GEMVs 4.3 ms in 2048 launches; export_route
 0.9, pairs_reduce 0.7.
+
+### S1a: router + shared-expert gate as one launch per chunk (gemv_f16 over `rows` via blockIdx.y)
+Same per-row math (bit-identical). 4K: 299 -> **373 tok/s** (enqueue 6.77 -> 0.01 s; the wait is now honest GPU time,
+gpu-wait 6.13 s, plus copier-wait 3.80). 16K: 224 -> **283** (gpu-wait 40.8 s: mostly row-by-row attention).
+`--check ref/eval1` PASS (mean KL 1.48e-3, top-1 98.6%, unchanged); test_kernels ALL PASS.

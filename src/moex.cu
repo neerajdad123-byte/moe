@@ -1001,7 +1001,7 @@ struct Engine {
                     gemm(w.out, oc, tmpc, T, DVH * DNV, D, cs);
                 }
                 rmsnorm(Xc, tmpc, w.post_ln, hc, D, EPS, T, cs);
-                for (int t = 0; t < T; t++) gemv_f16(w.router, hc + (size_t)t * D, lgc + (size_t)t * E, D, E, cs);  // fp32 routing, as decode
+                gemv_f16(w.router, hc, lgc, D, E, cs, T);  // fp32 routing, as decode
                 router_topk(lgc, E, TOPK, NORM_TOPK, ridxc, rwc, cs, T);
                 export_route_k<<<(T * D + 255) / 256, 256, 0, cs>>>(hc, ridxc, rwc, rows_d, ridxc_d, rwc_d, T * D, T * TOPK);
                 if (verify) {  // the host only needs the routing: signal it, then the shared expert overlaps the CPU work
@@ -1161,7 +1161,7 @@ struct Engine {
         gemm(w.sh_gu, hc, shgu, T, D, 2 * SI, cs);
         silu_mul_rows_k<<<dim3((SI + 255) / 256, T), 256, 0, cs>>>(shgu, sha, SI);
         gemm(w.sh_d, sha, shs, T, SI, D, cs);
-        for (int t = 0; t < T; t++) gemv_f16(w.sh_gate, hc + (size_t)t * D, shl + t, D, 1, cs);
+        gemv_f16(w.sh_gate, hc, shl, D, 1, cs, T);
     }
 
     // The MTP layer over T rows: row t gets the token at position pos+t (toks[t], the last row `last`) and the main

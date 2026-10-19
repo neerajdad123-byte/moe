@@ -61,12 +61,13 @@ inline void rmsnorm(float* x, const float* delta, const half* w, float* y, int D
 }
 
 // ---- K2: dense GEMV, y[O] = W[O,I] (F16 row-major) . x[I] (fp32) ----
-// One warp per row, 16-byte loads (8 halves) per lane. Requires I % 256 == 0.
+// One warp per row, 16-byte loads (8 halves) per lane. Requires I % 256 == 0. blockIdx.y: one of `rows` packed x / y.
 template <int WARPS>
 __global__ void gemv_f16_k(const half* __restrict__ W, const float* __restrict__ x,
                            float* __restrict__ y, int I, int O) {
     int row = blockIdx.x * WARPS + (threadIdx.x >> 5), lane = threadIdx.x & 31;
     if (row >= O) return;
+    x += (size_t)blockIdx.y * I; y += (size_t)blockIdx.y * O;
     const uint4* wr = reinterpret_cast<const uint4*>(W + (size_t)row * I);
     const float4* xv = reinterpret_cast<const float4*>(x);
     float acc = 0.f;
@@ -81,9 +82,9 @@ __global__ void gemv_f16_k(const half* __restrict__ W, const float* __restrict__
     if (lane == 0) y[row] = acc;
 }
 
-inline void gemv_f16(const half* W, const float* x, float* y, int I, int O, cudaStream_t st = 0) {
+inline void gemv_f16(const half* W, const float* x, float* y, int I, int O, cudaStream_t st = 0, int rows = 1) {
     constexpr int WARPS = 8;
-    gemv_f16_k<WARPS><<<(O + WARPS - 1) / WARPS, WARPS * 32, 0, st>>>(W, x, y, I, O);
+    gemv_f16_k<WARPS><<<dim3((O + WARPS - 1) / WARPS, rows), WARPS * 32, 0, st>>>(W, x, y, I, O);
 }
 
 // ---- K10: int8 dense GEMV, y[r] = s[r] * (Q[r,:] . x), per-row symmetric scale ----
