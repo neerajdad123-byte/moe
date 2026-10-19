@@ -170,6 +170,7 @@ struct Engine {
     }
     // admission: loader thread copies mmap -> pinned stage -> slot on the copy stream
     static constexpr int NSTAGE = 96;  // the step graph admits a whole token's misses at once (~75 at 1K)
+    int nstage = NSTAGE;               // stages in use (load())
     struct Stage {
         uint8_t* buf; cudaEvent_t after_compute, done, back_done; int slot = -1, key = -1; int back_io = -1; uint8_t *back_q, *back_s;
         std::atomic<int> back_ready{0};  // the backer thread has enqueued this victim's copy-back (back_done recorded)
@@ -585,7 +586,7 @@ struct Engine {
     void poll_admissions() {
         if (deterministic) {
             while (true) {  // the loader has taken and enqueued every job: each started stage is on `flying`
-                { std::lock_guard<std::mutex> g(mu); if (todo.empty() && free_st.size() + flying.size() == NSTAGE) break; }
+                { std::lock_guard<std::mutex> g(mu); if (todo.empty() && free_st.size() + flying.size() == (size_t)nstage) break; }
                 std::this_thread::yield();
             }
             CK(cudaStreamSynchronize(cp));
@@ -918,7 +919,10 @@ struct Engine {
         CK(cudaMalloc(&table_d, NKEY * sizeof(void*))); CK(cudaMemset(table_d, 0, NKEY * sizeof(void*)));
         CK(cudaEventCreateWithFlags(&ev_route, cudaEventDisableTiming));
         CK(cudaMalloc(&pos_d, 4));
-        for (int i = 0; i < NSTAGE; i++) {
+        // the step graph admits a whole token's misses at once: 96 stages; the MTP round admits per layer, and more
+        // stages there only add copy churn (32: -4% MTP tok/s at 96). MOEX_NSTAGE overrides (A/B).
+        nstage = getenv("MOEX_NSTAGE") ? std::clamp(atoi(getenv("MOEX_NSTAGE")), 8, NSTAGE) : has_mtp ? 32 : NSTAGE;
+        for (int i = 0; i < nstage; i++) {
             CK(cudaMallocHost(&stage[i].buf, EXPERT_BYTES));
             CK(cudaEventCreateWithFlags(&stage[i].after_compute, cudaEventDisableTiming));
             CK(cudaEventCreateWithFlags(&stage[i].done, cudaEventDisableTiming));
