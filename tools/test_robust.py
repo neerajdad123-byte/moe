@@ -67,6 +67,25 @@ check("JSON nested 100,000 deep: refused, server alive", " 400 " in r and alive(
 r = raw(b"POST /v1/chat/completions HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 99999999999\r\n\r\n{", timeout=20)
 check("Content-Length 100 GB: refused, server alive", " 413 " in r and alive(), r)
 
+# 3b. refused while the client is still sending (body over the cap, headers over 1 MB): the client must read the
+# status, not a connection reset (closing a socket with unread data resets it)
+def refused_while_sending(head, more):
+    s = socket.create_connection((u.hostname, u.port), timeout=30)
+    try:
+        s.sendall(head)
+        for _ in range(8): s.sendall(more)  # 2 MB more than the server reads before refusing
+    except OSError: pass
+    out = b""
+    try:
+        while chunk := s.recv(65536): out += chunk
+    except OSError as e: out += f" [{type(e).__name__}]".encode()
+    s.close()
+    return out.decode(errors="replace").split("\r\n")[0]
+r = refused_while_sending(b"POST /v1/chat/completions HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 100000000\r\n\r\n", b"x" * 262144)
+check("body over 64 MB, still sending: 413 read", " 413 " in r and "Error" not in r and alive(), r)
+r = refused_while_sending(b"GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\nX-Big: " + b"a" * (1 << 20), b"a" * 262144)
+check("headers over 1 MB, still sending: 431 read", " 431 " in r and "Error" not in r and alive(), r)
+
 # 4. an object with 200,000 keys parses quickly (it was quadratic)
 big = json.dumps({"messages": [{"role": "user", "content": "hi"}], "max_tokens": 1, **{f"k{i}": i for i in range(200000)}}).encode()
 t = time.time(); r = post(big); dt = time.time() - t

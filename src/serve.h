@@ -592,6 +592,19 @@ static void serve(Session& ss, Tokenizer& tk, const std::string& host, int port,
                             "\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: 0\r\n\r\n");
             if (refuse != 408 || too_slow)
                 fprintf(stderr, "[serve] refused a request: %s\n", refuse == 413 ? "body over 64 MB" : refuse == 431 ? "headers over 1 MB" : "sent too slowly");
+            // 413/431 come while the client may still be sending: closing with unread data would reset the
+            // connection and the client would see that instead of the reply. End our side, then read and discard
+            // what it still sends, for up to 2 s. (408: the client is idle or too slow, nothing to wait for.)
+#ifdef _WIN32
+            shutdown(c, SD_SEND);
+#else
+            shutdown(c, SHUT_WR);
+#endif
+            if (refuse != 408)
+            for (const double end = now() + 2; now() < end;) {
+                set_timeout(SO_RCVTIMEO, std::max(0.01, end - now()));
+                if (recv(c, buf, sizeof buf, 0) <= 0) break;
+            }
             closesocket(c);
             continue;
         }
