@@ -885,12 +885,12 @@ __global__ void gated_add_rows_k(float* __restrict__ out, const float* __restric
 // Writes the compacted slot pointers and weights, and their count. One warp.
 __global__ void route_hits_k(const int* __restrict__ idx, const float* __restrict__ w, int K, int key_base,
                              const uint8_t* const* __restrict__ table, const uint8_t** __restrict__ slots,
-                             float* __restrict__ hw, int* __restrict__ nh) {
+                             float* __restrict__ hw, int* __restrict__ nh, unsigned* hmask = nullptr) {
     int j = threadIdx.x;
     const uint8_t* p = j < K ? table[key_base + idx[j]] : nullptr;
     unsigned m = __ballot_sync(0xffffffffu, p != nullptr);
     if (p) { int o = __popc(m & ((1u << j) - 1)); slots[o] = p; hw[o] = w[j]; }
-    if (j == 0) *nh = __popc(m);
+    if (j == 0) { *nh = __popc(m); if (hmask) *hmask = m; }  // hmask (mapped host): which of the top-K the GPU takes
 }
 
 // ---- K5 helpers: shared expert ----

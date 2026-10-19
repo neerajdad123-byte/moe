@@ -152,6 +152,7 @@ struct Engine {
     float *h_hd, *w_hd, *y_hd;        // device views of the same memory
     int* ids_hd;
     int* ids_h;
+    unsigned *hmask_h, *hmask_hd;  // the GPU's hits among this layer's top-K (route_hits_k), so host and GPU always agree
     float* hw_d;
     int *nh_d, *pos_d;
     cudaEvent_t ev_route;
@@ -220,6 +221,11 @@ struct Engine {
             }
             CK(cudaStreamWaitEvent(cp, st.after_compute));  // nothing still reads the victim slot
             CK(cudaMemcpyAsync(arena + (size_t)st.slot * EXPERT_BYTES, st.buf, EXPERT_BYTES, cudaMemcpyHostToDevice, cp));
+            if (!deterministic) {  // the GPU may use it from the next layer on (the host follows the GPU's hit mask)
+                uint8_t** pub = (uint8_t**)(st.buf + EXPERT_BYTES);  // pinned, untouched until st.done
+                *pub = arena + (size_t)st.slot * EXPERT_BYTES;
+                CK(cudaMemcpyAsync(table_d + st.key, pub, sizeof(void*), cudaMemcpyHostToDevice, cp));
+            }
             CK(cudaEventRecord(st.done, cp));
             std::lock_guard<std::mutex> g(mu);
             flying.push_back(i);
@@ -597,7 +603,8 @@ struct Engine {
             if (cudaEventQuery(stage[i].done) == cudaSuccess) {
                 Stage& st = stage[i];
                 if (owner[st.slot] == st.key) {
-                    ready[st.slot] = 1; table_set(st.key, arena + (size_t)st.slot * EXPERT_BYTES);
+                    ready[st.slot] = 1;
+                    if (deterministic) table_set(st.key, arena + (size_t)st.slot * EXPERT_BYTES);  // else published by the copy
                     if (rc_victim) rc_drops.push_back(st.key);
                 }
                 inflight[st.slot] = 0;
@@ -914,6 +921,7 @@ struct Engine {
             CK(cudaHostAlloc((void**)hp, bytes, cudaHostAllocMapped));
             CK(cudaHostGetDevicePointer((void**)dp, *hp, 0));
         };
+        mapped(&hmask_h, &hmask_hd, 4);
         mapped(&h_h, &h_hd, D * 4); mapped(&y_h, &y_hd, D * 4); mapped(&w_h, &w_hd, TOPK * 4); mapped(&ids_h, &ids_hd, TOPK * 4);
         CK(cudaMalloc(&hw_d, TOPK * 4)); CK(cudaMalloc(&nh_d, 4));
         CK(cudaMalloc(&table_d, NKEY * sizeof(void*))); CK(cudaMemset(table_d, 0, NKEY * sizeof(void*)));
@@ -923,7 +931,7 @@ struct Engine {
         // stages there only add copy churn (32: -4% MTP tok/s at 96). MOEX_NSTAGE overrides (A/B).
         nstage = getenv("MOEX_NSTAGE") ? std::clamp(atoi(getenv("MOEX_NSTAGE")), 8, NSTAGE) : has_mtp ? 32 : NSTAGE;
         for (int i = 0; i < nstage; i++) {
-            CK(cudaMallocHost(&stage[i].buf, EXPERT_BYTES));
+            CK(cudaMallocHost(&stage[i].buf, EXPERT_BYTES + 64));  // + the slot pointer the copy publishes
             CK(cudaEventCreateWithFlags(&stage[i].after_compute, cudaEventDisableTiming));
             CK(cudaEventCreateWithFlags(&stage[i].done, cudaEventDisableTiming));
             CK(cudaEventCreateWithFlags(&stage[i].back_done, cudaEventDisableTiming));
@@ -968,13 +976,14 @@ struct Engine {
         rmsnorm(x, tmp, w.post_ln, h, D, EPS, 1, cs);
         gemv_f16(w.router, h, rlog, D, E + 1, cs);  // router logits + the shared expert's gate logit (rlog[E])
         router_topk(rlog, E, TOPK, NORM_TOPK, ridx, rw, cs);
+        // hits from the device slot table (the host runs exactly the others: hmask), then the hand-off
+        route_hits_k<<<1, 32, 0, cs>>>(ridx, rw, TOPK, l * E, table_d, slots_d, hw_d, nh_d, hmask_hd);
         if (full) export_signal_k<<<1, 256, 0, cs>>>(h, ridx, rw, h_hd, ids_hd, w_hd, D, TOPK, seq_d, rflag_hd + l);
         else {
             export_route_k<<<(D + 255) / 256, 256, 0, cs>>>(h, ridx, rw, h_hd, ids_hd, w_hd, D, TOPK);
             CK(cudaEventRecordWithFlags(ev_route, cs, cudaEventRecordExternal));  // host-visible even from a graph
         }
-        // hits from the device slot table, then resident experts + shared expert, no host in the loop
-        route_hits_k<<<1, 32, 0, cs>>>(ridx, rw, TOPK, l * E, table_d, slots_d, hw_d, nh_d);
+        // resident experts + shared expert, no host in the loop
         experts_forward(slots_d, hw_d, TOPK, h, act, moe, cs, nh_d);
         shared_expert_add(w.sh_gu, w.sh_d, rlog + E, h, moe, scr, D, SI, cs);
         if (full) wait_add_k<<<1, 256, 0, cs>>>(moe, y_hd, seq_d, dflag_hd + l, D, abort_hd, l, NL, spin_ns, waited_hd);
@@ -1683,7 +1692,7 @@ struct Engine {
                 int key = l * E + ids_h[j], sl = slot_of[key];
                 touch(key);
                 if (sl >= 0) last[sl] = clock;
-                if (sl >= 0 && ready[sl]) hits++;
+                if (*(volatile unsigned*)hmask_h >> j & 1) hits++;
                 else { mw[nm] = w_h[j]; mq[nm] = eq[key]; msc[nm++] = es[key]; misses++; if (sl < 0) adm_keys.push_back(key); }
             }
             if (nm) {
@@ -1695,6 +1704,20 @@ struct Engine {
             *(volatile int*)&dflag_h[l] = 2 * seq + (nm > 0);
             y_pending = nm > 0;
             hs[nm > 0][1] += w1 - w0; hs[nm > 0][4]++;
+            // Admit this layer's misses now (the GPU already has its flag): the loader's slow mmap -> pinned copies start
+            // half a token earlier than at the token's end (hit rate 60% -> per-layer path's ~67%). Safe mid-graph: the
+            // H2D copies wait for this graph (after_compute is recorded behind it on cs), a victim's table entry is
+            // cleared on cs before the next graph, and the host follows the GPU's hit mask, so a victim the GPU still
+            // takes later in this token stays consistent. Deterministic mode admits at the token's end (its poll waits
+            // for every copy, which would wait for this graph).
+            if (!deterministic && !adm_keys.empty()) {
+                const double a1 = now();
+                poll_admissions();
+                for (int key : adm_keys) if (slot_of[key] < 0) admit(key);
+                adm_keys.clear();
+                start_admissions();
+                ht[3] += now() - a1;
+            }
         }
         // the last layer's wait: passed, or timed out (then its CPU result is added here)
         for (const double w0 = now(); ((volatile int*)abort_h)[1] != seq && ((volatile int*)abort_h)[0] != seq; _mm_pause())
@@ -1746,7 +1769,7 @@ struct Engine {
                 int key = l * E + ids_h[j], sl = slot_of[key];
                 touch(key);
                 if (sl >= 0) last[sl] = clock;  // protects this step's experts (incl. in-flight) from eviction
-                if (sl >= 0 && ready[sl]) hits++;
+                if (*(volatile unsigned*)hmask_h >> j & 1) hits++;
                 else { mw[nm] = w_h[j]; mall[nm] = key; mkey[nm++] = sl < 0 ? key : -1; misses++; }
             }
             if (rc_n) { rc_poll(); rc_prefetch(l); rc_need(mall, nm); }
