@@ -1566,6 +1566,7 @@ int main(int argc, char** argv) {
                 reply += txt;
                 return true;
             });
+            fputs(us.held.c_str(), stdout); fflush(stdout);  // an incomplete UTF-8 sequence at the end (cut off by --n)
             reply += us.held;
             ss.remember(reply, out);
             eng.save_hot();
