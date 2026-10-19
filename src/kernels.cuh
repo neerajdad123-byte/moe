@@ -260,7 +260,10 @@ __global__ void router_topk_k(const float* __restrict__ logits, int E, int K, in
         if (e == 0) { idx[k] = bi; w[k] = bv; }
         total += bv;
     }
-    if (norm && e < K) { __syncthreads(); w[e] /= total; }
+    if (norm) {  // uniform: every thread reaches the barrier (a barrier inside `e < K` is undefined behavior)
+        __syncthreads();  // thread 0's w[] writes are visible
+        if (e < K) w[e] /= total;
+    }
 }
 
 // T tokens: logits [T][E] -> idx, w [T][K].
