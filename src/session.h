@@ -183,9 +183,10 @@ struct Session {
         while (common < ctx.size() && common < prompt.size() && ctx[common] == prompt[common]) common++;
         if ((int)prompt.size() >= eng.ctx) { fprintf(stderr, "[session] prompt (%zu tokens) exceeds --ctx %d\n", prompt.size(), eng.ctx); return {}; }
         int next;
-        if (common == ctx.size() && common < prompt.size()) {
+        if (common > 0 && common == ctx.size() && common < prompt.size()) {  // extends what the engine holds
             next = eng.prefill(prompt.data() + common, (int)(prompt.size() - common), (int)common);
-        } else {  // the history changed: start over (the DeltaNet state cannot be rewound)
+        } else {  // a new conversation (/reset leaves ctx empty) or a changed history: start over from a clean state
+                  // (the DeltaNet state cannot be rewound, and the engine may still hold an earlier conversation)
             eng.reset();
             next = eng.prefill(prompt.data(), (int)prompt.size(), 0);
         }
