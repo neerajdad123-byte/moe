@@ -794,3 +794,29 @@ output match), commit. Expected saving: ~0.19 x (lm_head 486 + dn_out 240 + attn
 - Agent state snapshots (original step 2): not started.
 - Possible issue: stopping a background shell here does not stop its moex children; check for stray moex/bash
   processes (and VRAM in use) before every benchmark.
+
+## Speed pass 2 (branch `speed2`, 2026-10-19)
+
+GPU runs go through the shared job queue (`C:\Users\neera\OneDrive\Desktop\gpu-queue\gpuq.py`): one job at a time,
+an A/B or a gate is one script = one job. Earlier runs that overlapped another agent's moex were discarded.
+Power: plugged in, Windows power mode "Balanced" (not "Best performance"): absolute tok/s may be a little low,
+A/B comparisons are alternating in the same job.
+
+### Step 1: 6-bit dense mix (a64c138)
+Three check sets (eval1 + code1 + agent1, 330 positions; `build/fq3.sh`), int8 baseline 1.85-2.11e-3 (noise ~+-0.15e-3):
+
+| mix | KL | added | top-1 |
+|---|---|---|---|
+| int8 (3 runs) | 2.11 / 1.85 / 2.05e-3 | - | 98.8% |
+| fake-quant dn_out + lm_head + sh_d + attn_qkv | 3.02e-3 | +1.04e-3 (over) | 99.4% |
+| fake-quant dn_out + lm_head + sh_d (2 runs) | 2.71 / 2.65e-3 | +0.70e-3 | 99.7% |
+| **real gemv_q6, dn_out + lm_head + sh_d** (same job as int8 2.05e-3) | 2.51e-3 | **+0.46e-3** | 99.7% |
+
+Default now `--q6 dn_out,lm_head,sh_d` (`--q6 none` = int8). lm_head 486 -> 394 MB; expert slots 1586 -> 1707 (ctx 2048).
+Prefill vs token-by-token (4K prompt, 48 tokens): identical up to the known near-tie at token 16 (two branches,
+int8 produces both run to run). A/B (`build/gate_s1.sh`, 1K prompt + 10 short prompts, 128 tokens, alternating):
+
+| tok/s | int8 (b577b69) | int6 mix |
+|---|---|---|
+| raw | 48.1 / 48.3 | **50.3 / 50.0** |
+| MTP | 57.1 / 58.4 | **59.2 / 60.3** |
