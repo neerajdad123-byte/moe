@@ -1470,6 +1470,10 @@ int main(int argc, char** argv) {
         return mode == "help" ? 0 : 2;
     }
     if (mode == "install") return install_moex();
+    if (mode == "serve") {  // before the 20 s load: a mistyped --host fails right away
+        uint8_t ip[4];
+        if (!parse_host(host, ip)) { fprintf(stderr, "--host %s is not an IPv4 address (e.g. 127.0.0.1, or 0.0.0.0 to open moex to your network)\n", host.c_str()); return 2; }
+    }
     if ((mode == "chat" || mode == "bench") && !samp_set) { samp.temp = 0.7f; samp.top_p = 0.8f; samp.top_k = 20; }  // Qwen non-thinking defaults
     if (mode == "chat" && think && !samp_set) { samp.temp = 1.0f; samp.top_p = 0.95f; samp.top_k = 20; }  // thinking defaults
     if ((mode == "chat" || mode == "serve" || mode == "bench") && ctx == 2048) ctx = 8192;

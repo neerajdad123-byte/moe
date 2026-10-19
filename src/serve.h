@@ -24,6 +24,23 @@ typedef int SOCKET;
 #include "json.h"
 #pragma comment(lib, "ws2_32.lib")
 
+// --host: an IPv4 address (four numbers 0-255) or "localhost". Anything else is refused: a typo must not end up
+// binding every interface (an unparsed address is 0.0.0.0).
+static bool parse_host(const std::string& h, uint8_t out[4]) {
+    if (h == "localhost") { out[0] = 127; out[1] = 0; out[2] = 0; out[3] = 1; return true; }
+    int n = 0; size_t p = 0;
+    while (n < 4) {
+        size_t q = p;
+        while (q < h.size() && isdigit((unsigned char)h[q]) && q - p < 3) q++;
+        if (q == p || (q < h.size() && isdigit((unsigned char)h[q]))) return false;
+        int v = atoi(h.substr(p, q - p).c_str());
+        if (v > 255) return false;
+        out[n++] = (uint8_t)v;
+        if (n < 4) { if (q >= h.size() || h[q] != '.') return false; p = q + 1; } else p = q;
+    }
+    return p == h.size();
+}
+
 // ---- HTTP ----
 static bool send_all(SOCKET c, const std::string& s) {
     for (size_t p = 0; p < s.size();) { int n = send(c, s.data() + p, (int)(s.size() - p), 0); if (n <= 0) return false; p += n; }
@@ -425,7 +442,9 @@ static void serve(Session& ss, Tokenizer& tk, const std::string& host, int port,
     const bool think_default = ss.think;  // `moex serve --think`
     SOCKET ls = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
     sockaddr_in a{}; a.sin_family = AF_INET; a.sin_port = htons((uint16_t)port);
-    inet_pton(AF_INET, host.c_str(), &a.sin_addr);
+    uint8_t ip[4];
+    if (!parse_host(host, ip)) { fprintf(stderr, "[serve] --host %s is not an IPv4 address (e.g. 127.0.0.1, or 0.0.0.0 for your network)\n", host.c_str()); return; }
+    memcpy(&a.sin_addr, ip, 4);
     int yes = 1; setsockopt(ls, SOL_SOCKET, SO_REUSEADDR, (const char*)&yes, sizeof yes);
     if (bind(ls, (sockaddr*)&a, sizeof a) || listen(ls, 16)) { fprintf(stderr, "[serve] cannot listen on %s:%d (port in use? choose another with --port)\n", host.c_str(), port); return; }
     const std::string base = "http://" + std::string(host == "0.0.0.0" ? "127.0.0.1" : host) + ":" + std::to_string(port);
