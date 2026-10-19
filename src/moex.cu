@@ -886,7 +886,7 @@ struct Engine {
     uint8_t* stage_p = nullptr;   // VRAM, NB * SB slots
     uint8_t* hstage = nullptr;    // pinned host, 2 * SB slots
     CpuPool cpool{4, false};      // staging copies, concurrent with the CPU experts on cpu.pool; sleeps when idle
-    cudaEvent_t ev_hfree[2];
+    cudaEvent_t ev_hfree[2], ev_dma0[2];  // a pinned half's DMA: start / end (timed: H2D busy time)
     cudaStream_t cpp;
     cudaEvent_t ev_copied[NB], ev_free[NB];
     // Streamer thread (one per prefill): takes per-layer expert lists in chunk_layer's call order and stages them
@@ -901,7 +901,8 @@ struct Engine {
     std::atomic<long long> st_copied{0}, st_freed{0};  // batches whose H2D copy is enqueued / whose compute is enqueued
     long long main_b = 0;                              // main thread's next batch
     std::deque<std::vector<int>> ahead_lists;          // main thread: lists queued ahead, in call order
-    double st_wait = 0, st_memcpy = 0;                 // streamer: waiting for a free pinned half, host memcpy
+    double st_wait = 0, st_memcpy = 0, st_dma = 0;     // streamer: waiting for a free pinned half, host memcpy; H2D busy
+    long long st_rows[6] = {};                         // streamed experts by the rows they got: 0, 1, 2, 3, 4, 5+
     void stream_push(int l, const std::vector<int>& v) { std::lock_guard<std::mutex> g(st_mu); st_q.push_back({l, v}); }
     void streamer_main() {
         for (long long b = 0;;) {
@@ -917,6 +918,7 @@ struct Engine {
                 uint8_t* hbase = hstage + (size_t)hb * SB * EXPERT_BYTES;
                 double q0 = now();
                 CK(cudaEventSynchronize(ev_hfree[hb]));  // the DMA out of this pinned half is done
+                if (b >= 2) { float ms; CK(cudaEventElapsedTime(&ms, ev_dma0[hb], ev_hfree[hb])); st_dma += ms / 1e3; }
                 double q1 = now();
                 std::function<void(int)> cp = [&](int i) {
                     int key = job.first * E + job.second[k0 + i];
@@ -926,6 +928,7 @@ struct Engine {
                 cpool.parallel_for(nb, cp);
                 st_wait += q1 - q0; st_memcpy += now() - q1;
                 if (b >= nring) CK(cudaStreamWaitEvent(cpp, ev_free[b % nring]));  // its previous batch is computed
+                CK(cudaEventRecord(ev_dma0[hb], cpp));
                 CK(cudaMemcpyAsync(stage_p + (size_t)(b % nring) * SB * EXPERT_BYTES, hbase, (size_t)nb * EXPERT_BYTES, cudaMemcpyHostToDevice, cpp));
                 CK(cudaEventRecord(ev_hfree[hb], cpp));
                 CK(cudaEventRecord(ev_copied[b % nring], cpp));
@@ -986,7 +989,7 @@ struct Engine {
             CK(cudaEventCreateWithFlags(&ev_free[i], cudaEventDisableTiming));
         }
         for (int i = 0; i < 2; i++) {
-            CK(cudaEventCreateWithFlags(&ev_hfree[i], cudaEventDisableTiming));
+            CK(cudaEventCreate(&ev_hfree[i])); CK(cudaEventCreate(&ev_dma0[i]));
             CK(cudaEventRecord(ev_hfree[i], cpp));
         }
     }
@@ -1003,7 +1006,8 @@ struct Engine {
         unsigned long pf0 = page_faults();
         long long sn0 = streamed_n;
         std::fill(cl[0], cl[0] + 10, 0.0);
-        st_copied = st_freed = 0; main_b = 0; st_stop = false; st_wait = st_memcpy = 0;
+        st_copied = st_freed = 0; main_b = 0; st_stop = false; st_wait = st_memcpy = st_dma = 0;
+        std::fill(st_rows, st_rows + 6, 0LL);
         streamer = std::thread([this] { streamer_main(); });
         for (int c0 = 0; c0 < n; c0 += CH) {
             const int T = std::min(CH, n - c0);
@@ -1033,6 +1037,7 @@ struct Engine {
         }
         { std::lock_guard<std::mutex> g(st_mu); st_stop = true; }
         streamer.join();
+        for (int i = 0; i < 2; i++) { float ms; CK(cudaEventSynchronize(ev_hfree[i])); if (st_copied.load() > i && cudaEventElapsedTime(&ms, ev_dma0[i], ev_hfree[i]) == cudaSuccess) st_dma += ms / 1e3; }
         pt[3] = st_wait; pt[4] = st_memcpy;
         release_prefill_slots();
         cpool.spin = false;
@@ -1040,6 +1045,9 @@ struct Engine {
                 " | copier: wait-dma %.2f  memcpy %.2f s | page faults %lu\n",
                 n, now() - pt0, n / (now() - pt0), pt[0], pt[1], pt[2], streamed_n - sn0, pt[3], pt[4], page_faults() - pf0);
         if (!quiet) print_cl(0, 1.0, "s", "prefill chunk-layers, host s");
+        if (!quiet) fprintf(stderr, "    streamed %.1f GB, H2D busy %.2f s (%.1f GB/s) | streamed experts by rows used: 0: %lld  1: %lld  2: %lld  3: %lld  4: %lld  5+: %lld\n",
+                            (streamed_n - sn0) * (double)EXPERT_BYTES / 1e9, st_dma, (streamed_n - sn0) * (double)EXPERT_BYTES / 1e9 / std::max(st_dma, 1e-9),
+                            st_rows[0], st_rows[1], st_rows[2], st_rows[3], st_rows[4], st_rows[5]);
         nvtxRangePop();
         return next;
     }
@@ -1159,6 +1167,7 @@ struct Engine {
                     if (!per[streamed[k]].empty()) add_item(streamed[k], stage_p + ((size_t)((b0 + k / SB) % nring) * SB + k % SB) * EXPERT_BYTES);
                 }
                 bi[nbat] = nitems;
+                for (int e : streamed) st_rows[std::min((int)per[e].size(), 5)]++;
                 main_b += nbat;
                 int launched = 0;
                 auto launch_streamed = [&](bool wait) {  // each batch's experts once its copy is enqueued

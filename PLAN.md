@@ -585,3 +585,8 @@ read-for-ownership). A cudaStreamQuery after each enqueue (WDDM batching): no ch
 SSD reads: no (~4 GB/s). Kept: `copy_nt` (AVX2 streaming stores, no RFO): memcpy 3.6 -> 2.9 s; A/B 4K 582/581 ->
 595/605 (+3%), 16K 595/574 -> 590/589 (flat). Same tokens; `--check` PASS (mean KL 1.72e-3); test_kernels ALL PASS;
 bench 49.7 / 49.0. 800+ needs fewer bytes over PCIe, not a cheaper copy (64.9 GB at 11.8 GB/s caps 4K at ~745).
+
+### S3: where the streamed bytes go (prefill line: GB, H2D busy from timing events, experts by rows used)
+4K: 36,360 streamed = 64.3 GB, H2D busy 6.70 s (9.6 GB/s). Rows each streamed expert ended up with: **0: 6,727 (18.5%)**,
+1: 2,402 (6.6%), 2: 1,774, 3: 1,417, 4: 1,169, 5+: 22,871. 16K: 145,440 = 257.4 GB, H2D 26.9 s; 0: 23,359, 1: 8,534,
+2: 6,173, 3: 4,938, 4: 4,213, 5+: 98,223. Routing is skewed: a quarter of stream-ahead's bytes (0 or 1 row) is waste.
