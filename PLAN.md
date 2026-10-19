@@ -864,3 +864,20 @@ Test: `--check ref/eval1` twice with the logits dumped (MOEX_CHECK_DUMP), plain 
 positions bit-identical in both. Cost: decode ~2.5 tok/s (every admission waited for at every layer): gates only; the
 default path is unchanged.
 Merge: independent; touches poll_admissions and the [load] line only.
+
+### A3: offline GPTQ / AWQ for the dense tensors (research, nothing ships from it)
+Pieces: `MOEX_CALIB=dir` (+ `MOEX_CALIB_EVERY=n`): prefill dumps every dense matrix's input rows (fp16, one file per
+group and layer); tools/calib_prompts.py: 200 calibration prompts (data/prompts.txt's 80 chat + 120 code windows of
+this repo under 8 instructions; the check sets and h2h are left out); tools/quant_dense.py: rtn, awq (per input
+channel s = rms^alpha, alpha grid on the output error tr(E H E^T), then per-group clip search; stored with s), gptq
+(static groups, `--act-order`, `--clip`), awq+gptq; int4 / int6, gs 32 / 64, `--asym` (zero points); output in the
+packed planes (q4 nibbles / q6 low + high planes, f32 scales, optional zeros and AWQ scales: src/dense_ovr.h).
+`MOEX_DENSE=dir` loads such a file (kept as F16 holding the exact dequantized values, so any variant screens without a
+kernel); tools/screen_dense.py --grid runs the per-tensor table (MOEX_FQ RTN column + MOEX_DENSE variants, eval1 /
+code1 / agent1, KL added and top-1 vs the int8 baseline).
+Tests: quant_dense.py --selftest (synthetic, int4 rel output err: rtn 1.25e-2, awq 7.1e-3, gptq 8.6e-3, gptq act-order
+8.8e-3, gptq clip 5.4e-3, awq+gptq 6.3e-3, gptq gs32 6.6e-3, gptq asym 5.8e-3); tests/test_dense.cpp: the C++ decoder
+gives Python's dequantized values bit for bit in 4 layouts (int4/int6, gs 64/32, sym/asym, with/without AWQ scales).
+Calibration dump done (queue job, 244 s): 200 prompts, every 12th prompt token, 161 files, 2.8 GB.
+Table: pending (queued after the n-gram follow-ups). Run: tools/screen_dense.py --grid (see its docstring).
+Merge: research tooling; the engine hooks are opt-in env switches (no effect unset).

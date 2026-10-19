@@ -32,6 +32,7 @@
 #include "kernels.cuh"
 #include "cpu_expert.h"
 #include "spec.h"
+#include "dense_ovr.h"
 #include <nvtx3/nvToolsExt.h>  // header-only; ranges show in Nsight Systems, no-ops otherwise
 #ifdef _WIN32
 #include <psapi.h>
@@ -704,8 +705,27 @@ struct Engine {
         std::string l = "," + q4groups + ",";
         return !f16 && l.find("," + std::string(g) + ",") != std::string::npos;
     }
+    // MOEX_DENSE=dir (research): matrices found there in tools/quant_dense.py's packed formats (src/dense_ovr.h: int4 /
+    // int6, gs 32 / 64, symmetric or with zero points, optional AWQ input scales) replace the container's; their group is
+    // kept as F16 holding the dequantized values, so any packed file screens without a kernel.
+    std::unique_ptr<Container> dense_ovr = getenv("MOEX_DENSE") ? std::make_unique<Container>(getenv("MOEX_DENSE")) : nullptr;
+    Mat dense_override(std::initializer_list<std::pair<std::string, int64_t>> parts, int64_t I) {
+        int64_t O = 0;
+        for (auto& [n, rows] : parts) O += rows;
+        std::vector<half> h((size_t)(O * I));
+        int64_t off = 0;
+        for (auto& [n, rows] : parts) {
+            half* dst = h.data() + off * I;
+            dequant_packed(*dense_ovr, n, rows, I, [&](int64_t k, float w) { dst[k] = __float2half(w); });
+            off += rows;
+        }
+        half* f; CK(cudaMalloc(&f, h.size() * 2));
+        CK(cudaMemcpy(f, h.data(), h.size() * 2, cudaMemcpyHostToDevice));
+        return {f, nullptr, nullptr, nullptr};
+    }
     // Row-concatenation of matrices with the same input width I, as F16, int8 + per-row scales, or int4 gs64.
     Mat wmat(std::initializer_list<std::pair<std::string, int64_t>> parts, int64_t I, const char* group) {
+        if (dense_ovr && !f16 && dense_ovr->has(parts.begin()->first + ".s")) return dense_override(parts, I);
         // research: MOEX_FQ=group:bits:gs:asym,... keeps that group as F16 holding fake-quantized values
         int fq[3] = {0, 0, 0};
         if (const char* e = getenv("MOEX_FQ")) {
@@ -1115,9 +1135,14 @@ struct Engine {
             for (int l = 0; l < NL; l++) chunk_layer(l, T, pt, false);
             if (has_mtp) {  // fill the MTP layer's cache for these positions; the last chunk also makes the first draft
                 rmsnorm(Xc, moec, norm, hc, D, EPS, T, cs);  // Xc = final hidden of every row, hc = normed
+                calib("lm_head", -1, hc, T, D);
                 if (c0 + T == n) { gemv(lm_head, hc + (size_t)(T - 1) * D, logits, D, V, cs); next = pick_token(); }
                 draft = mtp_forward(ids + c0 + 1, T, c0 + T < n ? ids[c0 + T] : next, pos0 + c0 + 1, pt, false);
                 if (c0 + T == n) choose_draft(draft, next);
+            } else if (calib_dir) {  // every row's normed final hidden state: lm_head's calibration input
+                rmsnorm(Xc, moec, norm, hc, D, EPS, T, cs);
+                calib("lm_head", -1, hc, T, D);
+                if (c0 + T == n) { gemv(lm_head, hc + (size_t)(T - 1) * D, logits, D, V, cs); next = pick_token(); }
             } else if (c0 + T == n) {  // the last prompt token: its logits pick the first generated token
                 rmsnorm(Xc + (size_t)(T - 1) * D, moec + (size_t)(T - 1) * D, norm, h, D, EPS, 1, cs);
                 gemv(lm_head, h, logits, D, V, cs);
@@ -1154,15 +1179,19 @@ struct Engine {
                 auto pre = [&] {
                 rmsnorm(Xc, l % NL ? moec : nullptr, w.in_ln, hc, D, EPS, T, cs);  // layers 0 and NL (MTP) start fresh
                 if (is_attn(l)) {
+                    calib("attn_qkv", l, hc, T, D);
                     gemm(w.attn_qkv, hc, qkvc, T, D, LQ, cs);
                     attn_decode(qkvc, qkvc + AH * 2 * AHD, qkvc + AH * 2 * AHD + AKV * AHD, w.qn, w.kn, qoc, w.kv, agc,
                                 AH, AKV, pos_d, ctx, ROT, THETA, EPS, T, LQ, cs, verify ? apart : nullptr, verify ? ASPLIT : 1);  // MTP round: split like decode
+                    calib("attn_o", l, agc, T, AH * AHD);
                     gemm(w.o, agc, tmpc, T, AH * AHD, D, cs);
                 } else {
+                    calib("dn_in", l, hc, T, D);
                     gemm(w.dn_in, hc, bigc, T, D, LB, cs);
                     deltanet_core(bigc, bigc + DC, bigc + DC + DVH * DNV, bigc + DC + DVH * DNV + DVH, LB, w.conv, w.alog, w.dtb, w.nw,
                                   w.ring, w.S, convc, oc, DC, CONVK, DVH, DKH, EPS, T, cs,
                                   verify ? snap_S(l) : nullptr, verify ? snap_S(l) + DVH * DNK * DNV : nullptr, SNAPROW);  // state after each row
+                    calib("dn_out", l, oc, T, DVH * DNV);
                     gemm(w.out, oc, tmpc, T, DVH * DNV, D, cs);
                 }
                 rmsnorm(Xc, tmpc, w.post_ln, hc, D, EPS, T, cs);
@@ -1340,9 +1369,32 @@ struct Engine {
     double vs[5] = {}, vt[2] = {};
     std::vector<int> admits_todo;
     cudaGraphExec_t vgraph[VT][NL + 1] = {};  // MTP round: per (rows - 1, layer), see chunk_layer
+    // MOEX_CALIB=dir (research): prefill appends each dense matrix's input rows (fp16) to dir/<group>.L<layer>.f16
+    // (lm_head: dir/lm_head.f16), the calibration data of tools/quant_dense.py; MOEX_CALIB_EVERY=n keeps every n-th
+    // prompt token (the same rows at every site; ~0.7 MB per kept row over all files). Chunks of <= 2 rows (the MTP
+    // round, possibly inside a graph capture) are skipped. Run with --no-mtp: the MTP layer isn't dumped.
+    const char* calib_dir = getenv("MOEX_CALIB");
+    const int calib_every = getenv("MOEX_CALIB_EVERY") ? std::max(1, atoi(getenv("MOEX_CALIB_EVERY"))) : 1;
+    void calib(const char* group, int l, const float* X, int T, int I) {
+        if (!calib_dir || T <= 2 || l >= NL) return;
+        std::vector<float> x((size_t)T * I);
+        CK(cudaMemcpyAsync(x.data(), X, x.size() * 4, cudaMemcpyDeviceToHost, cs));
+        CK(cudaStreamSynchronize(cs));
+        std::vector<half> h;
+        for (int t = 0; t < T; t++)  // row t is prompt token tokens - T + t (prefill counts the chunk first)
+            if ((tokens - T + t) % calib_every == 0)
+                for (int i = 0; i < I; i++) h.push_back(__float2half(x[(size_t)t * I + i]));
+        const std::string p = std::string(calib_dir) + "/" + group + (l < 0 ? "" : ".L" + std::to_string(l)) + ".f16";
+        FILE* f = fopen(p.c_str(), "ab");
+        if (!f || fwrite(h.data(), 2, h.size(), f) != h.size()) { fprintf(stderr, "cannot write %s\n", p.c_str()); exit(1); }
+        fclose(f);
+    }
     void shared_rows(LayerW& w, int T) {  // shared expert over T rows of hc -> shs, gate logits -> shl
+        const int l = int(&w - L.data());
+        calib("sh_gu", l, hc, T, D);
         gemm(w.sh_gu, hc, shgu, T, D, 2 * SI, cs);
         silu_mul_rows_k<<<dim3((SI + 255) / 256, T), 256, 0, cs>>>(shgu, sha, SI);
+        calib("sh_d", l, sha, T, SI);
         gemm(w.sh_d, sha, shs, T, SI, D, cs);
         gemv_f16(w.sh_gate, hc, shl, D, 1, cs, T);
     }
