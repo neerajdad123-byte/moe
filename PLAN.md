@@ -850,3 +850,17 @@ Merge: independent of A2 / A3; off by default. Default-path changes: the MTP acc
 unchanged; sampled: same distribution, other random draws for a seed); `gemm` int8 with 3..8 rows uses the GEMV
 (prefill tails too); VT 4 -> 9 (scratch +~1.6 MB, lg2 +5 MB). Open: int6 matrices (speed2's default for dn_out,
 lm_head, sh_d) have gemv_q6 for 1-2 rows only, so 3+ row rounds use the int6 tensor-core GEMM (fp16 activations).
+
+### A2: deterministic test mode (`MOEX_DETERMINISTIC=1`)
+Finding: the reductions are already in a fixed order. No float atomics on the GPU (the one atomicAdd compacts sampling
+candidates, which are then sorted with an id tie-break); attention splits combine in split order; pairs_reduce sums
+ranks in order; each CPU output element is one work item's fixed loop (no cross-thread sums). The run-to-run splits
+come from residency: whether an admission copy has landed by the next layer decides if an expert runs on the GPU or
+on the CPU (int8 activations, other rounding). In this mode poll_admissions waits until the loader has enqueued every
+job and the copy stream is idle, so residency (and every CPU/GPU split, prefill's too) depends only on the tokens. In
+this mode it also closes a window in claim_prefill_slots (the loader may have taken a job but not yet queued its copy).
+Shown in the `[load]` line. Not for the low-RAM mode (own RAM cache reads are timing-dependent).
+Test: `--check ref/eval1` twice with the logits dumped (MOEX_CHECK_DUMP), plain decode and MTP rounds: 72/72
+positions bit-identical in both. Cost: decode ~2.5 tok/s (every admission waited for at every layer): gates only; the
+default path is unchanged.
+Merge: independent; touches poll_admissions and the [load] line only.

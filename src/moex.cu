@@ -570,8 +570,21 @@ struct Engine {
                 got / 1e9, got >= total ? "" : " (below the expert total: some CPU misses will page-fault)");
     }
 
+    // MOEX_DETERMINISTIC=1 (greedy gates): every admission started so far is finished and published at each poll, so
+    // residency, and with it which experts run on the CPU (int8 activations, other rounding than the GPU), depends
+    // only on the tokens, not on copy timing: the run-to-run splits in PLAN.md. The kernels and the CPU pool already
+    // reduce in a fixed order (no float atomics; each output element is one work item's loop). Costs the overlap of
+    // admission copies with compute. Not for the low-RAM mode (own RAM cache reads are timing-dependent too).
+    const bool deterministic = getenv("MOEX_DETERMINISTIC") != nullptr;
     // Publish finished admissions (main thread).
     void poll_admissions() {
+        if (deterministic) {
+            while (true) {  // the loader has taken and enqueued every job: each started stage is on `flying`
+                { std::lock_guard<std::mutex> g(mu); if (todo.empty() && free_st.size() + flying.size() == NSTAGE) break; }
+                std::this_thread::yield();
+            }
+            CK(cudaStreamSynchronize(cp));
+        }
         std::lock_guard<std::mutex> g(mu);
         for (size_t n = flying.size(); n--;) {
             int i = flying.front(); flying.pop_front();
@@ -878,9 +891,9 @@ struct Engine {
         loader = std::thread([this] { loader_main(); });
         if (rc_victim) { CK(cudaStreamCreateWithFlags(&cb, cudaStreamNonBlocking)); backer = std::thread([this] { backer_main(); }); }
         capture_graphs();
-        fprintf(stderr, "[load] %.1f s, dense %s, %d expert slots (%.2f GB, %.1f%% of %d experts), ctx %d%s\n",
+        fprintf(stderr, "[load] %.1f s, dense %s, %d expert slots (%.2f GB, %.1f%% of %d experts), ctx %d%s%s\n",
                 now() - t0, f16 ? "F16" : ("int8" + (q6groups != "none" ? ", int6: " + q6groups : "") + (q4groups.empty() ? "" : ", int4: " + q4groups)).c_str(), nslots, nslots * (double)EXPERT_BYTES / 1e9, 100.0 * nslots / (NL * E), NL * E, ctx,
-                has_mtp ? ", MTP on" : "");
+                has_mtp ? ", MTP on" : "", deterministic ? ", deterministic" : "");
     }
 
     // New conversation: recurrent state back to zero (KV rows are overwritten position by position).
