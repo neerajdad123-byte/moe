@@ -5,6 +5,13 @@
 
 static const char* MODEL_REPO = "Kreuzzelg/qwen36-35b-a3b-colibri-i4-gs64";  // int4 gs64 container of Qwen3.6-35B-A3B (Apache-2.0)
 
+// s as one POSIX shell word: in single quotes, each ' written as '\'' (Linux passes URLs to curl through popen)
+static std::string shell_quote(const std::string& s) {
+    std::string q = "'";
+    for (char ch : s) q += ch == '\'' ? std::string("'\\''") : std::string(1, ch);
+    return q + "'";
+}
+
 #ifdef _WIN32
 #include <winhttp.h>
 #pragma comment(lib, "winhttp.lib")
@@ -51,7 +58,7 @@ static int http_get(const std::string& url, uint64_t from, const std::function<b
 #else
 // shortcut: curl's exit code stands in for the HTTP status (22 = HTTP error); `total` stays unset (no caller uses it)
 static int http_get(const std::string& url, uint64_t from, const std::function<bool(const char*, size_t)>& sink, uint64_t* = nullptr) {
-    std::string cmd = "curl -sSLf" + (from ? " -r " + std::to_string(from) + "-" : std::string()) + " '" + url + "'";
+    std::string cmd = "curl -sSLf" + (from ? " -r " + std::to_string(from) + "-" : std::string()) + " " + shell_quote(url);
     FILE* p = popen(cmd.c_str(), "r");
     if (!p) return 0;
     std::vector<char> buf(1 << 20);

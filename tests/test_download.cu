@@ -24,6 +24,11 @@ int main() {
     for (const char* bad : {"", ".", "..", "../evil.dll", "..\\evil.dll", "a/../../evil.dll", "a/..", "/etc/passwd", "\\evil.dll",
                             "C:\\Windows\\evil.dll", "C:evil.dll", "\\\\server\\share\\x", "config.json:stream", "a/b/../../../x"})
         check(std::string("refused:  ") + bad, !model_file_path(dir, bad, out));
+    // Linux hands the URL to curl through the shell: a ' in a file name must not end the quoted word
+    check("shell_quote: plain URL", shell_quote("https://h/a b.json") == "'https://h/a b.json'");
+    check("shell_quote: ' becomes '\\''", shell_quote("x';rm -rf ~;'") == "'x'\\'';rm -rf ~;'\\'''");
+    check("shell_quote: $() and backquotes stay literal", shell_quote("$(id)`id`") == "'$(id)`id`'");
+    check("shell_quote: empty", shell_quote("") == "''");
     printf(fails ? "%d FAILED\n" : "ALL PASS\n", fails);
     return fails ? 1 : 0;
 }
