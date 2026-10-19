@@ -1551,6 +1551,11 @@ int main(int argc, char** argv) {
             if (line == "/reset") { msgs.resize(system_prompt.empty() ? 0 : 1); ss.ctx.clear(); fprintf(stderr, "(new conversation)\n"); continue; }
             msgs.push_back({"user", line});
             auto prompt = ss.render(msgs);
+            if ((int)prompt.size() + 1 >= eng.ctx) {  // generate() would return nothing; an empty reply in msgs would break every later turn
+                msgs.pop_back();
+                fprintf(stderr, "(the conversation is longer than --ctx %d: /reset starts a new one, or restart with a larger --ctx)\n", eng.ctx);
+                continue;
+            }
             Utf8Stream us; std::string reply;
             double t0 = now(), t1 = 0; int ntok = 0;
             if (ss.think) { fputs("<think>\n", stdout); fflush(stdout); }  // the prompt ends with it (Qwen3.6 template)
