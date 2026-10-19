@@ -737,3 +737,60 @@ whole mix: KL +1e-3, top-1 -0.5:
 (dn_in also: Hadamard 64 1.24e-2 / 95.3%, 64 + MSE 1.26e-2, 256 + MSE 1.97e-2.) The closest, sh_d with Hadamard 256, adds
 +0.9e-3 but drops top-1 0.9 points. Stopped after two rotation tries. Not tried: GPTQ / AWQ with calibration data,
 6-bit dense with group scales (~0.78x the bytes of int8 per-row, ~2.4 ms/token if every tensor takes it).
+
+## State at the context compaction (2026-10-19, branch `speed`)
+
+Commits on `speed` since f28d388 (oldest first): 5e12c13 profiling; 5fab266 router/shared gate one launch; a4ecff6
+streamer thread; 8dd7290 int8 GEMM 18.8 TFLOPS; 71ca6f9 tensor-core GQA prefill attention; 5bc3f70 non-temporal
+copy; 3be0336 streamed-bytes counters; 83103d8 predicted stream-ahead; d6b63e9 CPU takes <= 2-row experts (prefill);
+3b4117c GQA decode attention + MTP-round splits; 7b85298 D1 verification; b9fd776 D2 re-profile; b577b69 CPU experts
+int8 + AVX-VNNI (decode + MTP round; new greedy baseline, binary build/moex_base.exe); d8909ab VRAM audit + Checkpoint 1;
+fc649fe int4 dense measured, not shipped.
+
+Where it stands (short prompts, ~1K context): 49.2 tok/s raw, ~58.5 with MTP (`moex bench` 49.9 / 53.5).
+Prefill 4K ~763 tok/s, 16K ~710. Decode at 26K: 42 raw / 45 MTP.
+
+### In the working tree, NOT committed (resume here)
+- `MOEX_FQ=group:bits:gs:asym,...` (research): wmat keeps that group as F16 holding fake-quantized values
+  (fakequant_rows_k in kernels.cuh): any format's quality end to end without a kernel.
+- `MOEX_CHECK_DUMP=1 moex --check DIR --f16`: writes the run's logits as DIR's reference. tools/make_check_set.py
+  builds check sets from a prompt file (chat template, `### assistant` / `### tool` turns) + a greedy continuation.
+  build/ref_code1 (code edit, 713-token prompt) and build/ref_agent1 (tool-use trace, 221) = 129 positions each, F16
+  reference (gitignored: 130 MB each). build/fq3.sh runs eval1 + code1 + agent1 per MOEX_FQ config.
+- Real int6 kernels (`--q6 groups`): low-4-bit plane in q4's nibble layout + 2-bit high plane, gs64 fp32 scales,
+  0.81x int8 bytes. gemv_q6_k (1 or 2 tokens: the MTP round reads W once), gemm_i8_k<true> for prefill,
+  quantize_rows_q6_k (same values as fakequant 6-bit). test_kernels K11b: ALL PASS vs F16 on the same values;
+  in_proj 0.145 -> 0.113 ms, out_proj 0.078 -> 0.066, lm_head 2.77 -> 2.36 (175 GB/s). Not yet default, not committed.
+
+### 6-bit screening (fake-quant, three sets: eval1 + code1 + agent1 = 330 positions)
+Noise: int8 baseline twice: mean KL 1.82e-3 / 2.09e-3 (agent1 3.44 / 4.19e-3), top-1 98.8% (4/330) both: ~+-0.15e-3.
+One tensor type 6-bit gs64 at a time (KL added vs ~1.96e-3; top-1):
+lm_head 2.32e-3 (+0.36) 99.1% | dn_out 2.21e-3 (+0.25) 99.7% | attn_qkv 2.36e-3 (+0.40) 99.7% | attn_o 2.94e-3 (+0.98)
+99.1% | sh_gu 2.64e-3 (+0.68) 98.5% | dn_in 3.32e-3 (+1.36) 98.5% | sh_d: pending.
+eval1 alone was misleading (dn_out +2.65e-3 there): 72 positions, a few dominate. Next: the mix lm_head + dn_out +
+attn_qkv (+ sh_d) end to end on the three sets (budget +1e-3, -0.5 top-1, judged against the noise), then make it
+the default with the real kernels and run the full gates (all three sets, test_kernels, A/B MTP on/off at 1K, prefill
+output match), commit. Expected saving: ~0.19 x (lm_head 486 + dn_out 240 + attn_qkv 180 MB) at ~176 GB/s ~ 1 ms/token.
+
+### Checkpoint 3 plan (next, before any more int4 work)
+1. nsys at 1K decode: every kernel per token with time, bytes, achieved GB/s; flag those under ~60% of 188 GB/s
+   (small GEMVs are latency-bound: out_proj 57%, in_proj 61%, shared down 32%).
+2. Fuse small GEMVs sharing an input (attn q/k/v + gate already one matrix; router + shared-expert gate; DeltaNet
+   in-projections already one; consider split-K / more blocks so small matrices fill all 20 SMs).
+3. Fuse norm + residual (+ routing export) and small elementwise kernels (add_k, silu_mul, gated_add, table_k...).
+4. CUDA graph for the whole decode step (today one graph per layer, 40 launches + host work between); report
+   launches/token before and after.
+5. CPU/GPU overlap: start CPU experts right after the router (shared expert + GPU experts meanwhile); GPU idle
+   wait -> ~0. P-core pinning of the CPU expert threads (C11), with/without E-cores.
+6. Re-measure; only if dense GEMVs are then bandwidth-bound, the int4 methods (asym g32, AWQ, GPTQ, int5),
+   time-boxed: GPTQ stops if not >= 2 tensor types under budget after two tries.
+
+### Parked, with reasons
+- CH 2048 prefill (design above): not built; prefill target met for now.
+- Lazy KV / dynamic expert cache / smaller driver reserve: +100 slots = +1.2% (below noise).
+- int4 dense RTN / MSE clip / Hadamard 256 & 1024: no tensor within budget (table above).
+- D3 variant hunt (int8 x vs int8 down input): skipped; D3 accepted on KL (+0.26e-3) and top-1.
+- Opt-in --fast miss skipping, n-gram + MTP hybrid drafts, frequency-ranked draft vocab: not started (later checkpoint).
+- Agent state snapshots (original step 2): not started.
+- Possible issue: stopping a background shell here does not stop its moex children; check for stray moex/bash
+  processes (and VRAM in use) before every benchmark.
