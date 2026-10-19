@@ -657,8 +657,9 @@ struct Engine {
         CK(cudaMemcpy(d, C.map(n), s.bytes, cudaMemcpyHostToDevice));
         return d;
     }
-    // Dense matrix groups stored int6 gs64 instead of int8 (--q6 groups; same names as --q4)
-    std::string q6groups;
+    // Dense matrix groups stored int6 gs64 instead of int8 (--q6 groups, "none" = all int8; same names as --q4).
+    // Default: the mix within the KL budget on eval1 + code1 + agent1 (PLAN.md "Step 1: 6-bit mix").
+    std::string q6groups = "dn_out,lm_head,sh_d";
     bool is_q6(const char* g) const {
         std::string l = "," + q6groups + ",";
         return !f16 && l.find("," + std::string(g) + ",") != std::string::npos;
@@ -821,7 +822,7 @@ struct Engine {
             const double MB = 1 << 20;
             const size_t kv = (size_t)(NL / 4) * (2 * (size_t)AKV * ctx * AHD + 2 * (size_t)AKV * ctx * 4);
             const size_t dn = (size_t)(NL - NL / 4) * ((size_t)DC * (CONVK - 1) + (size_t)DVH * DNK * DNV) * 4;
-            const size_t lmh = f16 ? (size_t)V * D * 2 : (size_t)V * D + (size_t)V * 4;
+            const size_t lmh = f16 ? (size_t)V * D * 2 : is_q6("lm_head") ? (size_t)V * D * 3 / 4 + (size_t)V * (D / 64) * 4 : (size_t)V * D + (size_t)V * 4;
             const size_t router = (size_t)(NL + has_mtp) * E * D * 2;
             const size_t weights = vf[0] - vf[1] - (f16 ? 0 : (size_t)V * D * 2) - kv - dn;  // minus the F16 staging
             const size_t snapb = has_mtp ? (size_t)(NL - NL / 4) * ((size_t)DVH * DNK * DNV + (size_t)DC * (CONVK - 1)) * 4 : 0;
@@ -857,7 +858,7 @@ struct Engine {
         if (rc_victim) { CK(cudaStreamCreateWithFlags(&cb, cudaStreamNonBlocking)); backer = std::thread([this] { backer_main(); }); }
         capture_graphs();
         fprintf(stderr, "[load] %.1f s, dense %s, %d expert slots (%.2f GB, %.1f%% of %d experts), ctx %d%s\n",
-                now() - t0, f16 ? "F16" : q4groups.empty() ? "int8" : ("int8, int4: " + q4groups).c_str(), nslots, nslots * (double)EXPERT_BYTES / 1e9, 100.0 * nslots / (NL * E), NL * E, ctx,
+                now() - t0, f16 ? "F16" : ("int8" + (q6groups != "none" ? ", int6: " + q6groups : "") + (q4groups.empty() ? "" : ", int4: " + q4groups)).c_str(), nslots, nslots * (double)EXPERT_BYTES / 1e9, 100.0 * nslots / (NL * E), NL * E, ctx,
                 has_mtp ? ", MTP on" : "");
     }
 
@@ -1692,7 +1693,8 @@ int main(int argc, char** argv) {
     if (interactive) mem_report("before load");
     Engine eng(model.c_str(), ctx);
     const bool mtp_head = std::filesystem::exists(std::filesystem::path(model) / "mtp.safetensors");
-    eng.f16 = f16; eng.q4groups = q4groups; eng.q6groups = q6groups; eng.samp = samp;
+    eng.f16 = f16; eng.q4groups = q4groups; eng.samp = samp;
+    if (!q6groups.empty()) eng.q6groups = q6groups;
     eng.want_mtp = mtp == 1 || (mtp < 0 && interactive && mtp_head && !low_ram_machine());
     eng.warm = warm || interactive;
     eng.quiet = interactive;
