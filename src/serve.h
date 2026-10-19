@@ -67,9 +67,11 @@ static std::string host_part(std::string s) {
     if (!s.empty() && s[0] == '[') return s.substr(1, s.find(']') - 1);
     return s.substr(0, s.find(':'));
 }
+// localhost, *.localhost, ::1 or a real IPv4 127.x.x.x (a name like 127.0.0.1.evil.com is someone's domain)
 static bool is_loopback_name(const std::string& h) {
     std::string l = h; for (auto& ch : l) ch = (char)tolower(ch);
-    return l == "localhost" || l == "::1" || starts_with(l, "127.") || ends_with(l, ".localhost");
+    uint8_t ip[4];
+    return l == "localhost" || l == "::1" || ends_with(l, ".localhost") || (parse_host(l, ip) && ip[0] == 127);
 }
 static void respond(SOCKET c, int code, const std::string& type, const std::string& body) {
     const char* msg = code == 200 ? "OK" : code == 400 ? "Bad Request" : code == 403 ? "Forbidden" : code == 404 ? "Not Found" : "Error";
