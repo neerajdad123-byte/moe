@@ -521,20 +521,40 @@ static void serve(Session& ss, Tokenizer& tk, const std::string& host, int port,
     while (true) {
         SOCKET c = accept(ls, nullptr, nullptr);
         if (c == INVALID_SOCKET) continue;
+        // One request at a time, so a client that stalls must not hold the server: 15 s per read, 60 s per write
+        // (a stream to a client that stopped reading).
+#ifdef _WIN32
+        DWORD rto = 15000, sto = 60000;
+#else
+        timeval rto{15, 0}, sto{60, 0};
+#endif
+        setsockopt(c, SOL_SOCKET, SO_RCVTIMEO, (const char*)&rto, sizeof rto);
+        setsockopt(c, SOL_SOCKET, SO_SNDTIMEO, (const char*)&sto, sizeof sto);
+        constexpr long long MAX_BODY = 64ll << 20, MAX_HEAD = 1 << 20;
         std::string req; char buf[65536];
-        size_t hdr_end = std::string::npos; long clen = 0;
+        size_t hdr_end = std::string::npos; long long clen = 0;
+        int refuse = 0;  // 413 body too large, 431 headers too large, 408 incomplete
         while (true) {  // headers, then Content-Length bytes of body
             int n = recv(c, buf, sizeof buf, 0);
-            if (n <= 0) break;
+            if (n <= 0) { if (hdr_end == std::string::npos || (long long)req.size() < (long long)hdr_end + 4 + clen) refuse = 408; break; }
             req.append(buf, n);
             if (hdr_end == std::string::npos && (hdr_end = req.find("\r\n\r\n")) != std::string::npos) {
                 std::string h = req.substr(0, hdr_end);
                 for (auto& ch : h) ch = (char)tolower(ch);
                 size_t k = h.find("content-length:");
-                clen = k == std::string::npos ? 0 : strtol(h.c_str() + k + 15, nullptr, 10);
+                clen = k == std::string::npos ? 0 : strtoll(h.c_str() + k + 15, nullptr, 10);
+                if (clen < 0 || clen > MAX_BODY) { refuse = 413; break; }
             }
-            if (hdr_end != std::string::npos && req.size() >= hdr_end + 4 + clen) break;
-            if (req.size() > (64u << 20)) break;  // refuse absurd requests
+            if (hdr_end == std::string::npos && (long long)req.size() > MAX_HEAD) { refuse = 431; break; }
+            if (hdr_end != std::string::npos && (long long)req.size() >= (long long)hdr_end + 4 + clen) break;
+        }
+        if (refuse) {
+            if (refuse != 408 || !req.empty())  // nothing at all: just close
+                send_all(c, "HTTP/1.1 " + std::to_string(refuse) + (refuse == 413 ? " Payload Too Large" : refuse == 431 ? " Request Header Fields Too Large" : " Request Timeout") +
+                            "\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: 0\r\n\r\n");
+            if (refuse != 408) fprintf(stderr, "[serve] refused a request: %s\n", refuse == 413 ? "body over 64 MB" : "headers over 1 MB");
+            closesocket(c);
+            continue;
         }
         std::string method = req.substr(0, req.find(' '));
         size_t ps = req.find(' ') + 1;

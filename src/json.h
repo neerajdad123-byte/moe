@@ -27,7 +27,7 @@ struct Json {
     std::vector<std::pair<std::string, Json>> o;
     const Json* get(const std::string& k) const {
         if (t != OBJ) return nullptr;
-        for (auto& kv : o) if (kv.first == k) return &kv.second;
+        for (auto it = o.rbegin(); it != o.rend(); ++it) if (it->first == k) return &it->second;  // a repeated key: the last wins
         return nullptr;
     }
     double num(const std::string& k, double def) const { auto v = get(k); return v && v->t == NUM ? v->n : def; }
@@ -54,7 +54,8 @@ struct Json {
 };
 
 struct JsonParser {
-    const std::string& j; size_t p = 0; bool ok = true;
+    static constexpr int MAX_DEPTH = 256;  // deeper nesting is refused: recursion must not overflow the stack
+    const std::string& j; size_t p = 0; bool ok = true; int depth = 0;
     explicit JsonParser(const std::string& s) : j(s) {}
     void ws() { while (p < j.size() && strchr(" \t\r\n", j[p])) p++; }
     bool done() { ws(); return ok && p == j.size(); }  // the whole text was one value
@@ -62,27 +63,30 @@ struct JsonParser {
         ws(); Json v;
         if (p >= j.size()) { ok = false; return v; }
         char c = j[p];
+        if ((c == '{' || c == '[') && ++depth > MAX_DEPTH) { ok = false; return v; }
         if (c == '{') {
             v.t = Json::OBJ; p++; ws();
-            if (p < j.size() && j[p] == '}') { p++; return v; }
+            if (p < j.size() && j[p] == '}') { p++; depth--; return v; }
             while (ok) {
                 ws(); if (p >= j.size() || j[p] != '"') { ok = false; break; }
                 std::string k = str(); ws();
                 if (p >= j.size() || j[p] != ':') { ok = false; break; }
-                p++; v.set(k, parse()); ws();
+                p++; v.o.push_back({std::move(k), parse()}); ws();  // push, not set(): set() scans every key (quadratic)
                 if (p < j.size() && j[p] == ',') { p++; continue; }
                 if (p < j.size() && j[p] == '}') { p++; break; }
                 ok = false;
             }
+            depth--;
         } else if (c == '[') {
             v.t = Json::ARR; p++; ws();
-            if (p < j.size() && j[p] == ']') { p++; return v; }
+            if (p < j.size() && j[p] == ']') { p++; depth--; return v; }
             while (ok) {
                 v.a.push_back(parse()); ws();
                 if (p < j.size() && j[p] == ',') { p++; continue; }
                 if (p < j.size() && j[p] == ']') { p++; break; }
                 ok = false;
             }
+            depth--;
         } else if (c == '"') { v.t = Json::STR; v.s = str(); }
         else if (!j.compare(p, 4, "true")) { v.t = Json::BOOL; v.b = true; p += 4; }
         else if (!j.compare(p, 5, "false")) { v.t = Json::BOOL; p += 5; }

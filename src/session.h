@@ -174,7 +174,14 @@ struct Session {
     static inline const std::string EMPTY_THINK = "<think>\n\n</think>\n\n";
     std::string gen_head() const { return think ? "<think>\n" : EMPTY_THINK; }
     // After generate(): key = key_of(the reply as the client will send it back, its tool calls).
-    void remember(const std::string& key, const std::vector<int>& out) { replies[key] = {gen_head(), out}; }
+    // Keeps the last MAX_REPLIES (a long-running server must not grow forever; an evicted reply only costs a re-prefill).
+    static constexpr size_t MAX_REPLIES = 512;
+    std::deque<std::string> reply_order;
+    void remember(const std::string& key, const std::vector<int>& out) {
+        if (!replies.count(key)) reply_order.push_back(key);
+        replies[key] = {gen_head(), out};
+        while (replies.size() > MAX_REPLIES) { replies.erase(reply_order.front()); reply_order.pop_front(); }
+    }
 
     // Runs `prompt` and streams up to max_new generated tokens to on_tok (return false to stop early). Stops at
     // <|im_end|> / <|endoftext|> (not emitted, not fed). Returns the generated ids.
