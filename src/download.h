@@ -187,10 +187,25 @@ static bool set_user_env(const wchar_t* name, const std::wstring& value) {
     RegCloseKey(k);
     return ok;
 }
-static std::wstring get_user_env(const wchar_t* name) {
-    wchar_t buf[32768]; DWORD sz = sizeof buf;
-    return RegGetValueW(HKEY_CURRENT_USER, L"Environment", name, RRF_RT_REG_SZ | RRF_RT_REG_EXPAND_SZ | RRF_NOEXPAND, nullptr, buf, &sz) == ERROR_SUCCESS ? buf : L"";
+// A user environment variable from the registry, any length. false = it could not be read (not "not set", which
+// is an empty value): the caller must then not write it back, or a failed read would wipe the user's PATH.
+static bool read_user_env(const wchar_t* name, std::wstring& out) {
+    out.clear();
+    const DWORD flags = RRF_RT_REG_SZ | RRF_RT_REG_EXPAND_SZ | RRF_NOEXPAND;
+    for (int attempt = 0; attempt < 3; attempt++) {  // the value may grow between the size query and the read
+        DWORD sz = 0;
+        LSTATUS r = RegGetValueW(HKEY_CURRENT_USER, L"Environment", name, flags, nullptr, nullptr, &sz);
+        if (r == ERROR_FILE_NOT_FOUND) return true;
+        if (r != ERROR_SUCCESS) return false;
+        std::vector<wchar_t> buf(sz / sizeof(wchar_t) + 2, 0);
+        sz = (DWORD)(buf.size() * sizeof(wchar_t));
+        r = RegGetValueW(HKEY_CURRENT_USER, L"Environment", name, flags, nullptr, buf.data(), &sz);
+        if (r == ERROR_SUCCESS) { out = buf.data(); return true; }
+        if (r != ERROR_MORE_DATA) return false;
+    }
+    return false;
 }
+static std::wstring get_user_env(const wchar_t* name) { std::wstring v; read_user_env(name, v); return v; }
 static int install_moex() {
     namespace fs = std::filesystem;
     wchar_t la[MAX_PATH];
@@ -208,7 +223,12 @@ static int install_moex() {
         if (fs::exists(model / "config.json") && get_user_env(L"MOEX_MODEL").empty() && set_user_env(L"MOEX_MODEL", model.wstring()))
             fprintf(stderr, "install: the model stays in %s (MOEX_MODEL)\n", model.string().c_str());
     }
-    std::wstring path = get_user_env(L"Path"), d = dst.wstring();
+    std::wstring path, d = dst.wstring();
+    if (!read_user_env(L"Path", path)) {
+        fprintf(stderr, "install: moex is in %s, but your PATH could not be read, so it was left unchanged.\n"
+                        "Add that folder to PATH by hand (Windows search: \"Edit environment variables for your account\").\n", dst.string().c_str());
+        return 1;
+    }
     bool present = false;
     for (size_t a = 0; a <= path.size();) {
         size_t b = path.find(L';', a); if (b == std::wstring::npos) b = path.size();
