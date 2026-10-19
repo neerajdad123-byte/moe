@@ -657,6 +657,12 @@ struct Engine {
         CK(cudaMemcpy(d, C.map(n), s.bytes, cudaMemcpyHostToDevice));
         return d;
     }
+    // Dense matrix groups stored int6 gs64 instead of int8 (--q6 groups; same names as --q4)
+    std::string q6groups;
+    bool is_q6(const char* g) const {
+        std::string l = "," + q6groups + ",";
+        return !f16 && l.find("," + std::string(g) + ",") != std::string::npos;
+    }
     // Dense matrix groups stored int4 gs64 instead of int8 (--q4 dn_in,dn_out,attn_qkv,attn_o,sh_gu,sh_d,lm_head).
     std::string q4groups;
     bool is_q4(const char* g) const {
@@ -665,7 +671,37 @@ struct Engine {
     }
     // Row-concatenation of matrices with the same input width I, as F16, int8 + per-row scales, or int4 gs64.
     Mat wmat(std::initializer_list<std::pair<std::string, int64_t>> parts, int64_t I, const char* group) {
+        // research: MOEX_FQ=group:bits:gs:asym,... keeps that group as F16 holding fake-quantized values
+        int fq[3] = {0, 0, 0};
+        if (const char* e = getenv("MOEX_FQ")) {
+            std::string l = std::string(",") + e;
+            size_t k = l.find("," + std::string(group) + ":");
+            if (k != std::string::npos) sscanf(l.c_str() + k + 2 + strlen(group), "%d:%d:%d", &fq[0], &fq[1], &fq[2]);
+        }
+        if (fq[0] && !f16) {
+            int64_t O = 0; for (auto& [n, rows] : parts) O += rows;
+            half* f; CK(cudaMalloc(&f, O * I * 2));
+            int64_t off = 0;
+            for (auto& [n, rows] : parts) { CK(cudaMemcpy(f + off * I, C.map(n), rows * I * 2, cudaMemcpyHostToDevice)); off += rows; }
+            fakequant_rows_k<<<(int)O, 64>>>(f, (int)I, fq[0], fq[1], fq[2]);
+            CK(cudaGetLastError());
+            return {f, nullptr, nullptr, nullptr};
+        }
         const bool q4 = is_q4(group);
+        if (is_q6(group) && !q4) {
+            int64_t O = 0; for (auto& [n, rows] : parts) O += rows;
+            uint8_t *lo, *hi; float* sc;
+            CK(cudaMalloc(&lo, O * I / 2)); CK(cudaMalloc(&hi, O * I / 4)); CK(cudaMalloc(&sc, O * (I / 64) * 4));
+            int64_t off = 0;
+            for (auto& [n, rows] : parts) {  // the synchronous copy orders qtmp's reuse after the previous quantize
+                CK(cudaMemcpy(qtmp, C.map(n), rows * I * 2, cudaMemcpyHostToDevice));
+                quantize_rows_q6_k<<<(int)rows, 64>>>(qtmp, lo + off * I / 2, hi + off * I / 4, sc + off * (I / 64), (int)I);
+                CK(cudaGetLastError());
+                off += rows;
+            }
+            Mat m; m.s = sc; m.q6 = lo; m.q6h = hi;
+            return m;
+        }
         int64_t O = 0;
         for (auto& [n, rows] : parts) {
             if ((int64_t)C.at(n).bytes != rows * I * 2) { fprintf(stderr, "shape mismatch %s\n", n.c_str()); exit(1); }
@@ -1551,7 +1587,7 @@ int main(int argc, char** argv) {
     bool ctx_set = false;  // --ctx given: chat/serve/bench keep it, even 2048
     std::string check, batch, trace_path, ahead_path;
     bool prof = false, f16 = false, use_prefill = true;
-    std::string q4groups;
+    std::string q4groups, q6groups;
     Engine::Sampling samp;  // default greedy
     for (int i = 1; i < argc; i++) {
         std::string s = argv[i];
@@ -1576,6 +1612,7 @@ int main(int argc, char** argv) {
         else if (s == "--f16") f16 = true;
         else if (s == "--no-prefill") use_prefill = false;
         else if (s == "--q4") q4groups = next();
+        else if (s == "--q6") q6groups = next();
         else if (s == "--temp") { samp.temp = std::stof(next()); samp_set = true; }
         else if (s == "--top-k") samp.top_k = std::stoi(next());
         else if (s == "--top-p") samp.top_p = std::stof(next());
@@ -1655,7 +1692,7 @@ int main(int argc, char** argv) {
     if (interactive) mem_report("before load");
     Engine eng(model.c_str(), ctx);
     const bool mtp_head = std::filesystem::exists(std::filesystem::path(model) / "mtp.safetensors");
-    eng.f16 = f16; eng.q4groups = q4groups; eng.samp = samp;
+    eng.f16 = f16; eng.q4groups = q4groups; eng.q6groups = q6groups; eng.samp = samp;
     eng.want_mtp = mtp == 1 || (mtp < 0 && interactive && mtp_head && !low_ram_machine());
     eng.warm = warm || interactive;
     eng.quiet = interactive;
@@ -1738,9 +1775,12 @@ int main(int argc, char** argv) {
         if (use_prefill) pos = np - 1;  // the prompt runs as one prefill; compare from its last position on
         std::vector<float> pend;  // MTP: the second row's logits of an accepted round, for the next position
         int pend_pos = -1, pend_id = -1;
+        // MOEX_CHECK_DUMP=1: write this run's logits as the reference files (with --f16: a reference for new prompts)
+        const bool dump = getenv("MOEX_CHECK_DUMP") != nullptr;
         for (;; pos++) {
-            auto ref = read_f32(check + "/p" + std::string(pos < 10 ? "00" : pos < 100 ? "0" : "") + std::to_string(pos) + "_logits.bin");
-            if (ref.empty()) break;
+            const std::string rpath = check + "/p" + std::string(pos < 10 ? "00" : pos < 100 ? "0" : "") + std::to_string(pos) + "_logits.bin";
+            auto ref = dump ? std::vector<float>() : read_f32(rpath);
+            if (dump ? pos >= (int)ids.size() : ref.empty()) break;
             std::vector<float> got(V);
             int id;
             if (pend_pos == pos) { got = pend; id = pend_id; }
@@ -1758,6 +1798,7 @@ int main(int argc, char** argv) {
                 id = use_prefill && pos == np - 1 ? eng.prefill(ids.data(), np, 0) : eng.step(tok, pos, true);
                 CK(cudaMemcpy(got.data(), eng.logits, V * 4, cudaMemcpyDeviceToHost));
             }
+            if (dump) { ref = got; FILE* fo = fopen(rpath.c_str(), "wb"); if (!fo) { fprintf(stderr, "cannot write %s\n", rpath.c_str()); return 1; } fwrite(ref.data(), 4, V, fo); fclose(fo); }
             double mx = 0, err = 0;
             for (int i = 0; i < V; i++) { mx = std::max(mx, (double)fabsf(ref[i])); err = std::max(err, (double)fabsf(got[i] - ref[i])); }
             int rid = int(std::max_element(ref.begin(), ref.end()) - ref.begin());

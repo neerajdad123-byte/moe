@@ -338,6 +338,43 @@ int main(int argc, char** argv) {
         }
     }
 
+    if (want(filt, "K11b")) {
+        printf("K11b gemv_q6 (int6 gs64 dense) vs F16 GEMV on the same values (fakequant 6-bit); 2 tokens; GEMM int6 vs GEMV\n");
+        struct Case { const char* name; int O, I; } cases[] = {
+            {"model.layers.0.linear_attn.in_proj_qkv.weight", 8192, D}, {"model.layers.0.linear_attn.out_proj.weight", D, 4096},
+            {"model.layers.0.mlp.shared_expert.down_proj.weight", D, 512}, {"lm_head.weight", 248320, D}};
+        auto hh = golden(P + "L00_moe_in");
+        for (auto& cs : cases) {
+            half* W = wup(C, cs.name);
+            uint8_t *lo, *hi; float* s;
+            CK(cudaMalloc(&lo, (size_t)cs.O * cs.I / 2)); CK(cudaMalloc(&hi, (size_t)cs.O * cs.I / 4)); CK(cudaMalloc(&s, (size_t)cs.O * (cs.I / 64) * 4));
+            quantize_rows_q6_k<<<cs.O, 64>>>(W, lo, hi, s, cs.I);
+            fakequant_rows_k<<<cs.O, 64>>>(W, cs.I, 6, 64, 0);  // W now holds the same int6 values in F16
+            std::vector<float> xin((size_t)2 * cs.I);
+            for (int i = 0; i < 2 * cs.I; i++) xin[i] = hh[i % D] * ((i / D) & 1 ? -1.f : 1.f) * (i >= cs.I ? 0.7f : 1.f);
+            float *xd = up(xin), *y = dalloc((size_t)2 * cs.O), *yr = dalloc((size_t)2 * cs.O);
+            Mat m; m.q6 = lo; m.q6h = hi; m.s = s;
+            gemv(m, xd, y, cs.I, cs.O);
+            gemv_f16(W, xd, yr, cs.I, cs.O);
+            std::string nm = std::string(cs.name).substr(std::string(cs.name).rfind('.', strlen(cs.name) - 8) + 1);
+            check((nm + " gemv_q6 vs F16").c_str(), down(y, cs.O), down(yr, cs.O), 1e-3f);  // F16 rounding of scale * q
+            gemm(m, xd, y, 2, cs.I, cs.O);  // the MTP round's 2 tokens in one pass
+            gemv_f16(W, xd + cs.I, yr + cs.O, cs.I, cs.O);
+            check((nm + " gemv_q6 2 tokens").c_str(), down(y, (size_t)2 * cs.O), down(yr, (size_t)2 * cs.O), 1e-3f);
+            bench((nm + " int6").c_str(), (double)cs.O * cs.I * 0.75 + cs.O * (cs.I / 64) * 4.0, [&] { gemv(m, xd, y, cs.I, cs.O); }, cs.O > 100000 ? 20 : 50);
+            if (cs.O < 100000) {
+                const int S = 160;
+                std::vector<float> hx((size_t)S * cs.I); for (int t = 0; t < S; t++) for (int i = 0; i < cs.I; i++) hx[(size_t)t * cs.I + i] = xin[i] * (1.f + 0.03f * (t % 16));
+                float *X = up(hx), *Y = dalloc((size_t)S * cs.O), *Yr = dalloc((size_t)S * cs.O);
+                gemm(m, X, Y, S, cs.I, cs.O);
+                for (int t = 0; t < S; t++) gemv(m, X + (size_t)t * cs.I, Yr + (size_t)t * cs.O, cs.I, cs.O);
+                check((nm + " gemm int6 vs gemv").c_str(), down(Y, (size_t)S * cs.O), down(Yr, (size_t)S * cs.O), 5e-3f);
+                for (void* p : {(void*)X, (void*)Y, (void*)Yr}) CK(cudaFree(p));
+            }
+            for (void* p : {(void*)W, (void*)lo, (void*)hi, (void*)s, (void*)xd, (void*)y, (void*)yr}) CK(cudaFree(p));
+        }
+    }
+
     if (want(filt, "PF1")) {
         printf("PF1 prefill MoE on tensor cores vs pairs_forward (layer 0 experts, T=256 rows, top-8 of NE)\n");
         const int T = 256, K = 8;

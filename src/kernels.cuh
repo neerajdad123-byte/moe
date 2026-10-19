@@ -148,6 +148,31 @@ __global__ void quantize_rows_i8_k(const half* __restrict__ W, int8_t* __restric
     if (threadIdx.x == 0) s[blockIdx.x] = sc;
 }
 
+// Research (MOEX_FQ): quantize F16 rows to `bits` per `gs`-group and write the dequantized values back, so a format's
+// quality can be measured end to end before it has a kernel. Symmetric: scale = absmax / (2^(bits-1) - 1); asymmetric:
+// fp16 scale and zero point over [min, max]. One thread per group.
+__global__ void fakequant_rows_k(half* __restrict__ W, int I, int bits, int gs, int asym) {
+    half* wr = W + (size_t)blockIdx.x * I;
+    for (int g = threadIdx.x; g < I / gs; g += blockDim.x) {
+        half* w = wr + g * gs;
+        float lo = INFINITY, hi = -INFINITY;
+        for (int i = 0; i < gs; i++) { const float v = __half2float(w[i]); lo = fminf(lo, v); hi = fmaxf(hi, v); }
+        if (asym) {
+            const int qm = (1 << bits) - 1;
+            const float sc = __half2float(__float2half(hi > lo ? (hi - lo) / qm : 1.f)), z = rintf(-lo / sc);
+            for (int i = 0; i < gs; i++) {
+                const float q = fminf((float)qm, fmaxf(0.f, rintf(__half2float(w[i]) / sc) + z));
+                w[i] = __float2half((q - z) * sc);
+            }
+        } else {
+            const int qm = (1 << (bits - 1)) - 1;
+            const float m = fmaxf(-lo, hi), sc = m > 0.f ? m / qm : 1.f;
+            for (int i = 0; i < gs; i++)
+                w[i] = __float2half(sc * fminf((float)qm, fmaxf((float)-(qm + 1), rintf(__half2float(w[i]) / sc))));
+        }
+    }
+}
+
 // A dense matrix in whichever form it was loaded: F16 (exact), int8 + row scales, or int4 gs64 + group scales
 // (the experts' format: low nibble first, s is [O][I/64]).
 struct Mat {
@@ -155,16 +180,25 @@ struct Mat {
     const int8_t* q = nullptr;
     const float* s = nullptr;
     const uint8_t* q4 = nullptr;
+    const uint8_t *q6 = nullptr, *q6h = nullptr;  // int6 gs64: low 4 bits (q4's nibble layout) and high 2 bits planes
 };
 
 template <int WARPS>
 __global__ void gemv_q4_k(const uint8_t* __restrict__ Q, const float* __restrict__ s, const float* __restrict__ x,
                           float* __restrict__ y, int I, int O);
 inline int persistent_blocks();
+template <int WARPS, int NT>
+__global__ void gemv_q6_k(const uint8_t* __restrict__ Q, const uint8_t* __restrict__ Qh, const float* __restrict__ s,
+                          const float* __restrict__ x, float* __restrict__ y, int I, int O);
+template <int NT>
+inline void gemv_q6(const Mat& m, const float* x, float* y, int I, int O, cudaStream_t st) {
+    gemv_q6_k<8, NT><<<std::min(persistent_blocks(), (O + 7) / 8), 256, NT * (I + I / 8) * 4, st>>>(m.q6, m.q6h, m.s, x, y, I, O);
+}
 
 inline void gemv(const Mat& m, const float* x, float* y, int I, int O, cudaStream_t st = 0) {
     constexpr int WARPS = 8;
     if (m.q4) gemv_q4_k<WARPS><<<std::min(persistent_blocks(), (O + WARPS - 1) / WARPS), WARPS * 32, (I + I / 8) * 4, st>>>(m.q4, m.s, x, y, I, O);
+    else if (m.q6) gemv_q6<1>(m, x, y, I, O, st);
     else if (m.q) gemv_i8<WARPS, 1>(m.q, m.s, x, y, I, O, st);
     else gemv_f16(m.f16, x, y, I, O, st);
 }
@@ -219,8 +253,11 @@ __global__ void gemm_wmma_k(const WT* __restrict__ W, const float* __restrict__ 
 
 // int8 weights, the common case: block tile 128 weight rows x 128 tokens x 32 K, 8 warps of 32 rows x 64 tokens,
 // 16-byte loads, the next K step's loads in flight during the MMAs. Same operands as gemm_wmma_k (fp16, fp32 sums).
+// Q6: W is the int6 low plane, Wh the high plane, s the group scales (applied while the tile is dequantized).
+template <bool Q6 = false>
 __global__ void __launch_bounds__(256) gemm_i8_k(const int8_t* __restrict__ W, const float* __restrict__ s,
-                                                 const float* __restrict__ X, float* __restrict__ Y, int S, int I, int O) {
+                                                 const float* __restrict__ X, float* __restrict__ Y, int S, int I, int O,
+                                                 const uint8_t* __restrict__ Wh = nullptr) {
     using namespace nvcuda;
     constexpr int BM = 128, BN = 128, BK = 32, LD = BK + 8;
     __shared__ __align__(32) half As[BM * LD], Bs[BN * LD];
@@ -230,7 +267,15 @@ __global__ void __launch_bounds__(256) gemm_i8_k(const int8_t* __restrict__ W, c
     wmma::fragment<wmma::accumulator, 16, 16, 16, float> c[2][4];
     for (int i = 0; i < 2; i++) for (int j = 0; j < 4; j++) wmma::fill_fragment(c[i][j], 0.f);
     uint4 wv; float4 xv[4];
+    uint2 lv; uint32_t hv; float sv;  // Q6: 16 low nibbles, 16 x 2 high bits, the group scale
     auto load = [&](int k0) {
+        if constexpr (Q6) {
+            const bool in = o0 + wr < O;
+            const size_t r = (size_t)(o0 + wr), k = (size_t)(k0 + wc);
+            lv = in ? *reinterpret_cast<const uint2*>(reinterpret_cast<const uint8_t*>(W) + r * (I / 2) + k / 2) : make_uint2(0, 0);
+            hv = in ? *reinterpret_cast<const uint32_t*>(Wh + r * (I / 4) + k / 4) : 0u;
+            sv = in ? s[r * (I / 64) + k / 64] : 0.f;
+        } else
         wv = o0 + wr < O ? *reinterpret_cast<const uint4*>(W + (size_t)(o0 + wr) * I + k0 + wc) : make_uint4(0, 0, 0, 0);
         for (int j = 0; j < 4; j++) {
             const int x = tid + 256 * j, r = x >> 3, k = (x & 7) * 4;
@@ -239,9 +284,15 @@ __global__ void __launch_bounds__(256) gemm_i8_k(const int8_t* __restrict__ W, c
     };
     load(0);
     for (int k0 = 0; k0 < I; k0 += BK) {
-        const int8_t* b = reinterpret_cast<const int8_t*>(&wv);
         half2* a = reinterpret_cast<half2*>(As + wr * LD + wc);
-        for (int i = 0; i < 8; i++) a[i] = __halves2half2(__int2half_rn(b[2 * i]), __int2half_rn(b[2 * i + 1]));
+        if constexpr (Q6) {
+            const uint64_t lo = (uint64_t)lv.x | ((uint64_t)lv.y << 32);
+            auto w6 = [&](int e) { return (float)((int)(((lo >> (4 * e)) & 15) | (((hv >> (2 * e)) & 3) << 4)) - 32) * sv; };
+            for (int i = 0; i < 8; i++) a[i] = __floats2half2_rn(w6(2 * i), w6(2 * i + 1));
+        } else {
+            const int8_t* b = reinterpret_cast<const int8_t*>(&wv);
+            for (int i = 0; i < 8; i++) a[i] = __halves2half2(__int2half_rn(b[2 * i]), __int2half_rn(b[2 * i + 1]));
+        }
         for (int j = 0; j < 4; j++) {
             const int x = tid + 256 * j, r = x >> 3, k = (x & 7) * 4;
             half2* bp = reinterpret_cast<half2*>(Bs + r * LD + k);
@@ -264,7 +315,7 @@ __global__ void __launch_bounds__(256) gemm_i8_k(const int8_t* __restrict__ W, c
         __syncwarp();
         for (int e = lane; e < 256; e += 32) {
             const int o = o0 + wm + 16 * i + (e & 15), t = s0 + wn + 16 * j + (e >> 4);
-            if (o < O && t < S) Y[(size_t)t * O + o] = cs[e] * s[o];
+            if (o < O && t < S) Y[(size_t)t * O + o] = Q6 ? cs[e] : cs[e] * s[o];
         }
         __syncwarp();
     }
@@ -274,12 +325,14 @@ __global__ void __launch_bounds__(256) gemm_i8_k(const int8_t* __restrict__ W, c
 inline void gemm(const Mat& m, const float* X, float* Y, int S, int I, int O, cudaStream_t st = 0) {
     if (S <= 2) {  // the MTP round: tensor-core tiles of 64 tokens would waste 62 of them; GEMV reads W once for both
         if (S == 2 && m.q) gemv_i8<8, 1, 2>(m.q, m.s, X, Y, I, O, st);
+        else if (S == 2 && m.q6) gemv_q6<2>(m, X, Y, I, O, st);
         else for (int t = 0; t < S; t++) gemv(m, X + (size_t)t * I, Y + (size_t)t * O, I, O, st);
         return;
     }
     dim3 grid((O + 63) / 64, (S + 63) / 64);
     if (m.q4) gemm_wmma_k<uint8_t, true><<<grid, 128, 0, st>>>(m.q4, m.s, X, Y, S, I, O);
     else if (m.q) gemm_i8_k<<<dim3((O + 127) / 128, (S + 127) / 128), 256, 0, st>>>(m.q, m.s, X, Y, S, I, O);
+    else if (m.q6) gemm_i8_k<true><<<dim3((O + 127) / 128, (S + 127) / 128), 256, 0, st>>>((const int8_t*)m.q6, m.s, X, Y, S, I, O, m.q6h);
     else gemm_wmma_k<half><<<grid, 128, 0, st>>>(m.f16, nullptr, X, Y, S, I, O);
 }
 
@@ -373,6 +426,69 @@ __global__ void gemv_q4_k(const uint8_t* __restrict__ Q, const float* __restrict
         for (int c = lane; c < I / 32; c += 32) acc += dot32_i4(__ldcs(wr + c), xs + 36 * c) * sr[c >> 1];
         acc = warp_sum(acc);
         if (lane == 0) y[row] = acc;
+    }
+}
+
+// ---- K11b: int6 gs64 dense GEMV (as K11, plus the high-bit plane: 8 bytes per 32 weights). NT vectors at once
+// (the MTP round's 2 tokens: each weight read once). u = low nibble | high 2 bits << 4, weight = (u - 32) * scale.
+__device__ __forceinline__ float dot32_q6(uint4 u, uint2 h, const float* __restrict__ x) {
+    const uint32_t lo[4] = {u.x, u.y, u.z, u.w}, hw[4] = {h.x & 0xFFFFu, h.x >> 16, h.y & 0xFFFFu, h.y >> 16};
+    const float4* xv = reinterpret_cast<const float4*>(x);
+    float acc = 0.f;
+#pragma unroll
+    for (int j = 0; j < 4; j++) {
+        float4 a = xv[2 * j], b = xv[2 * j + 1];
+        const float xs[8] = {a.x, a.y, a.z, a.w, b.x, b.y, b.z, b.w};
+#pragma unroll
+        for (int n = 0; n < 8; n++)
+            acc += (__int_as_float(0x4B000000u | ((lo[j] >> (4 * n)) & 0xFu) | (((hw[j] >> (2 * n)) & 3u) << 4)) - 8388640.f) * xs[n];
+    }
+    return acc;
+}
+template <int WARPS, int NT>
+__global__ void gemv_q6_k(const uint8_t* __restrict__ Q, const uint8_t* __restrict__ Qh, const float* __restrict__ s,
+                          const float* __restrict__ x, float* __restrict__ y, int I, int O) {
+    extern __shared__ __align__(16) float xs[];  // NT x [xpad_size(I)]
+    for (int t = 0; t < NT; t++)
+        for (int i = threadIdx.x; i < I; i += blockDim.x) xs[t * xpad_size(I) + xpad(i)] = x[(size_t)t * I + i];
+    __syncthreads();
+    const int lane = threadIdx.x & 31, G = I / 64;
+    for (int row = blockIdx.x * WARPS + (threadIdx.x >> 5); row < O; row += gridDim.x * WARPS) {
+        const uint4* wr = reinterpret_cast<const uint4*>(Q + (size_t)row * (I / 2));
+        const uint2* hr = reinterpret_cast<const uint2*>(Qh + (size_t)row * (I / 4));
+        const float* sr = s + (size_t)row * G;
+        float acc[NT] = {};
+#pragma unroll 2
+        for (int c = lane; c < I / 32; c += 32) {
+            const uint4 u = __ldcs(wr + c);
+            const uint2 h = __ldcs(hr + c);
+            const float sc = sr[c >> 1];
+#pragma unroll
+            for (int t = 0; t < NT; t++) acc[t] += dot32_q6(u, h, xs + t * xpad_size(I) + 36 * c) * sc;
+        }
+#pragma unroll
+        for (int t = 0; t < NT; t++) { const float v = warp_sum(acc[t]); if (lane == 0) y[(size_t)t * O + row] = v; }
+    }
+}
+// F16 [O,I] -> int6 gs64 symmetric (scale = group absmax / 31, values in [-32, 31]; the same values as
+// fakequant_rows_k(W, I, 6, 64, 0)). One thread per group.
+__global__ void quantize_rows_q6_k(const half* __restrict__ W, uint8_t* __restrict__ Q, uint8_t* __restrict__ Qh,
+                                   float* __restrict__ s, int I) {
+    const half* wr = W + (size_t)blockIdx.x * I;
+    for (int g = threadIdx.x; g < I / 64; g += blockDim.x) {
+        float m = 0.f;
+        for (int i = 0; i < 64; i++) m = fmaxf(m, fabsf(__half2float(wr[g * 64 + i])));
+        const float sc = m > 0.f ? m / 31.f : 1.f;
+        uint8_t* lo = Q + (size_t)blockIdx.x * (I / 2) + g * 32;
+        uint8_t* hi = Qh + (size_t)blockIdx.x * (I / 4) + g * 16;
+        int u[4];
+        for (int i = 0; i < 64; i += 4) {
+            for (int k = 0; k < 4; k++) u[k] = (int)fminf(31.f, fmaxf(-32.f, rintf(__half2float(wr[g * 64 + i + k]) / sc))) + 32;
+            lo[i / 2] = (uint8_t)((u[0] & 15) | ((u[1] & 15) << 4));
+            lo[i / 2 + 1] = (uint8_t)((u[2] & 15) | ((u[3] & 15) << 4));
+            hi[i / 4] = (uint8_t)((u[0] >> 4) | ((u[1] >> 4) << 2) | ((u[2] >> 4) << 4) | ((u[3] >> 4) << 6));
+        }
+        s[(size_t)blockIdx.x * (I / 64) + g] = sc;
     }
 }
 
