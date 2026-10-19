@@ -551,3 +551,12 @@ attention layer** (row by row, grows with context); router + shared-gate GEMVs 4
 Same per-row math (bit-identical). 4K: 299 -> **373 tok/s** (enqueue 6.77 -> 0.01 s; the wait is now honest GPU time,
 gpu-wait 6.13 s, plus copier-wait 3.80). 16K: 224 -> **283** (gpu-wait 40.8 s: mostly row-by-row attention).
 `--check ref/eval1` PASS (mean KL 1.48e-3, top-1 98.6%, unchanged); test_kernels ALL PASS.
+
+### S1b: stream ahead (one streamer thread per prefill, VRAM ring of 8 x 24 experts)
+At >= 256 rows per chunk ~every expert of a layer is used (~32 rows each), so the chunk's start queues every layer's
+non-resident experts and the copies run under the GPU's earlier work (no wait for the routing; the per-layer copier
+thread is gone; experts with 1 row are now GPU work too). Smaller chunks queue each layer's list after its routing as
+before. The ring borrows ~250 MB more cache during prefill; GPUs whose cache would be < 3x the borrow keep 2 batches.
+4K: 373 -> **525 tok/s** (copier-wait 3.80 -> 0.72 s; streamer busy 6.3 of 7.8 s: memcpy 3.5 + DMA wait 2.8; streamed
+26.7K -> 36.4K experts: the bigger ring leaves fewer resident). 16K: 283 -> **344** (gpu-wait 43.4 s = attention + GEMMs).
+Small cache (520 slots, 2 batches): 335 tok/s. Same greedy tokens; `--check` PASS (mean KL 1.49e-3, top-1 98.6%).

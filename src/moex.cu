@@ -764,6 +764,7 @@ struct Engine {
         nslots = (int)((fr - std::min(fr, reserve)) / EXPERT_BYTES);
         nslots = std::min(nslots, NKEY + (int)((carve_prefill(nullptr) + EXPERT_BYTES - 1) / EXPERT_BYTES));  // big GPUs: every expert fits
         nres = (int)((carve_prefill(nullptr) + EXPERT_BYTES - 1) / EXPERT_BYTES);
+        if (nslots < 3 * nres) { nring = 2; nres = (int)((carve_prefill(nullptr) + EXPERT_BYTES - 1) / EXPERT_BYTES); }  // small GPUs
         if (nslots < nres + 2 * TOPK) { fprintf(stderr, "only %d expert slots fit; need >= %d\n", nslots, 2 * TOPK); exit(1); }
         CK(cudaMalloc(&arena, (size_t)nslots * EXPERT_BYTES));
         carve_prefill(arena + (size_t)(nslots - nres) * EXPERT_BYTES);
@@ -870,14 +871,60 @@ struct Engine {
     // a pinned host ring, and each batch goes over PCIe as one DMA, double-buffered. (Page-locking the map itself
     // for direct DMA was measured: 12.2 GB/s, but on WDDM it comes out of the GPU's shared-memory budget, and
     // locking/unlocking layers evicted the pages from the working set: decode CPU misses went 3 -> 79 ms/token.)
-    static constexpr int SB = 24;   // experts per staging batch; 2 * SB staging slots
+    static constexpr int SB = 24;   // experts per staging batch
+    static constexpr int NB = 8;    // staging batches in VRAM: the streamer runs up to NB batches (~1 layer) ahead
+    int nring = NB;                 // batches in use: 2 on GPUs whose cache would be small
     static constexpr int STREAM_MIN = 2;  // an expert used by one token is cheaper on the CPU than over PCIe
-    uint8_t* stage_p = nullptr;   // VRAM, 2 * SB slots
+    uint8_t* stage_p = nullptr;   // VRAM, NB * SB slots
     uint8_t* hstage = nullptr;    // pinned host, 2 * SB slots
     CpuPool cpool{4, false};      // staging copies, concurrent with the CPU experts on cpu.pool; sleeps when idle
     cudaEvent_t ev_hfree[2];
     cudaStream_t cpp;
-    cudaEvent_t ev_copied[2], ev_free[2];
+    cudaEvent_t ev_copied[NB], ev_free[NB];
+    // Streamer thread (one per prefill): takes per-layer expert lists in chunk_layer's call order and stages them
+    // batch by batch into the VRAM ring (global batch b -> ring batch b % NB). Chunks of >= AHEAD_T rows queue
+    // every layer's non-resident experts at the chunk's start (~all are used: ~32 rows per expert), so the copies run
+    // under the GPU's earlier work; smaller chunks queue each layer's list after its routing.
+    static constexpr int AHEAD_T = 256;
+    std::thread streamer;
+    std::mutex st_mu;
+    std::deque<std::pair<int, std::vector<int>>> st_q;  // (layer, experts), guarded by st_mu
+    bool st_stop = false;
+    std::atomic<long long> st_copied{0}, st_freed{0};  // batches whose H2D copy is enqueued / whose compute is enqueued
+    long long main_b = 0;                              // main thread's next batch
+    std::deque<std::vector<int>> ahead_lists;          // main thread: lists queued ahead, in call order
+    double st_wait = 0, st_memcpy = 0;                 // streamer: waiting for a free pinned half, host memcpy
+    void stream_push(int l, const std::vector<int>& v) { std::lock_guard<std::mutex> g(st_mu); st_q.push_back({l, v}); }
+    void streamer_main() {
+        for (long long b = 0;;) {
+            std::pair<int, std::vector<int>> job;
+            while (true) {
+                { std::lock_guard<std::mutex> g(st_mu); if (!st_q.empty()) { job = std::move(st_q.front()); st_q.pop_front(); break; } if (st_stop) return; }
+                std::this_thread::yield();
+            }
+            const int n = (int)job.second.size();
+            for (int k0 = 0; k0 < n; k0 += SB, b++) {
+                while (b >= nring && st_freed.load() <= b - nring) std::this_thread::yield();  // ring batch b % nring still in use
+                const int hb = b & 1, nb = std::min(SB, n - k0);
+                uint8_t* hbase = hstage + (size_t)hb * SB * EXPERT_BYTES;
+                double q0 = now();
+                CK(cudaEventSynchronize(ev_hfree[hb]));  // the DMA out of this pinned half is done
+                double q1 = now();
+                std::function<void(int)> cp = [&](int i) {
+                    int key = job.first * E + job.second[k0 + i];
+                    memcpy(hbase + (size_t)i * EXPERT_BYTES, eq[key], EXPERT_Q_BYTES);
+                    memcpy(hbase + (size_t)i * EXPERT_BYTES + EXPERT_Q_BYTES, es[key], EXPERT_BYTES - EXPERT_Q_BYTES);
+                };
+                cpool.parallel_for(nb, cp);
+                st_wait += q1 - q0; st_memcpy += now() - q1;
+                if (b >= nring) CK(cudaStreamWaitEvent(cpp, ev_free[b % nring]));  // its previous batch is computed
+                CK(cudaMemcpyAsync(stage_p + (size_t)(b % nring) * SB * EXPERT_BYTES, hbase, (size_t)nb * EXPERT_BYTES, cudaMemcpyHostToDevice, cpp));
+                CK(cudaEventRecord(ev_hfree[hb], cpp));
+                CK(cudaEventRecord(ev_copied[b % nring], cpp));
+                st_copied.store(b + 1);
+            }
+        }
+    }
     template <class T> static void mapped_alloc(T** hp, T** dp, size_t n) {
         CK(cudaHostAlloc((void**)hp, n * sizeof(T), cudaHostAllocMapped));
         CK(cudaHostGetDevicePointer((void**)dp, *hp, 0));
@@ -899,7 +946,7 @@ struct Engine {
         float* ri; f(ri, (size_t)ch * TOPK); if (base) ridxc = (int*)ri;
         if (ch != CH) return off;  // the MTP round streams nothing
         if (base) stage_p = base + off;
-        return off + (size_t)2 * SB * EXPERT_BYTES;
+        return off + (size_t)nring * SB * EXPERT_BYTES;
     }
     void claim_prefill_slots() {
         while (true) {  // no admission copy may still be on its way into these slots
@@ -926,10 +973,11 @@ struct Engine {
         ypair_cpu.resize((size_t)CH * TOPK * D);
         CK(cudaMallocHost(&hstage, (size_t)2 * SB * EXPERT_BYTES));
         CK(cudaStreamCreateWithFlags(&cpp, cudaStreamNonBlocking));
-        for (int i = 0; i < 2; i++) {
+        for (int i = 0; i < NB; i++) {
             CK(cudaEventCreateWithFlags(&ev_copied[i], cudaEventDisableTiming));
             CK(cudaEventCreateWithFlags(&ev_free[i], cudaEventDisableTiming));
-            CK(cudaEventRecord(ev_free[i], cs));
+        }
+        for (int i = 0; i < 2; i++) {
             CK(cudaEventCreateWithFlags(&ev_hfree[i], cudaEventDisableTiming));
             CK(cudaEventRecord(ev_hfree[i], cpp));
         }
@@ -947,8 +995,17 @@ struct Engine {
         unsigned long pf0 = page_faults();
         long long sn0 = streamed_n;
         std::fill(cl[0], cl[0] + 10, 0.0);
+        st_copied = st_freed = 0; main_b = 0; st_stop = false; st_wait = st_memcpy = 0;
+        streamer = std::thread([this] { streamer_main(); });
         for (int c0 = 0; c0 < n; c0 += CH) {
             const int T = std::min(CH, n - c0);
+            if (T >= AHEAD_T)
+                for (int l = 0; l < NL + has_mtp; l++) {  // the call order of chunk_layer below (+ the MTP layer)
+                    std::vector<int> v;
+                    for (int e = 0; e < E; e++) { int sl = slot_of[l * E + e]; if (!(sl >= 0 && ready[sl])) v.push_back(e); }
+                    stream_push(l, v);
+                    ahead_lists.push_back(std::move(v));
+                }
             tokens += T;
             for (int t = 0; t < T; t++) note(ids[c0 + t]);
             for (int t = 0; t < T; t++)
@@ -966,6 +1023,9 @@ struct Engine {
                 next = pick_token();
             }
         }
+        { std::lock_guard<std::mutex> g(st_mu); st_stop = true; }
+        streamer.join();
+        pt[3] = st_wait; pt[4] = st_memcpy;
         release_prefill_slots();
         cpool.spin = false;
         if (!quiet) fprintf(stderr, "[prefill] %d tok in %.2f s = %.1f tok/s | host: gpu-wait %.2f  streaming-wait %.2f  cpu-experts %.2f s | streamed %lld experts"
@@ -1040,7 +1100,9 @@ struct Engine {
                 int nitems = 0, npairs = 0, job_of[E];
                 std::fill(job_of, job_of + E, -1);
                 std::vector<CpuExperts::Job> jobs;
-                std::vector<int> streamed;
+                std::vector<int> streamed;  // in the streamer's order
+                const bool listed = !verify && !ahead_lists.empty();  // queued at the chunk's start: all non-resident
+                if (listed) { streamed = std::move(ahead_lists.front()); ahead_lists.pop_front(); }
                 auto add_item = [&](int e, const uint8_t* slot) {
                     items_h[nitems] = {slot, npairs, (int)per[e].size()};
                     for (auto& pr : per[e]) pairs_h[npairs++] = pr;
@@ -1055,11 +1117,13 @@ struct Engine {
                     if (vs_on) vs[per[e].size() == 2 ? 4 : per[e][0].t == 0 ? 2 : 3]++;
                     misses += per[e].size();
                     if (verify && sl < 0) admits_todo.push_back(key);
+                    if (listed) continue;
                     if (!verify && (int)per[e].size() >= STREAM_MIN) { streamed.push_back(e); continue; }
                     job_of[e] = (int)jobs.size();
                     jobs.push_back({eq[key], es[key], {}, {}, {}});
                     for (auto& pr : per[e]) { jobs.back().toks.push_back(pr.t); jobs.back().pids.push_back(pr.p); jobs.back().ws.push_back(pr.w); }
                 }
+                if (!listed && !streamed.empty()) stream_push(l, streamed);
                 lap(2);
                 {
                     std::vector<int> pk;
@@ -1078,36 +1142,29 @@ struct Engine {
                 };
                 moe_pairs(items_d, nres);
                 if (!verify) shared_rows(w, T);
-                // streamed experts: items point at their staging slot (batch bi uses half bi&1)
-                for (int k = 0; k < (int)streamed.size(); k++)
-                    add_item(streamed[k], stage_p + ((size_t)((k / SB) & 1) * SB + k % SB) * EXPERT_BYTES);
-                // a copier thread stages + transfers + launches the streamed batches (it alone enqueues on cs
-                // until joined) while this thread computes the CPU experts
-                std::thread copier;
-                if (!streamed.empty()) copier = std::thread([&] {
-                    for (int b0 = 0, bi = 0; b0 < (int)streamed.size(); b0 += SB, bi++) {
-                        const int half_ = bi & 1, nb = std::min(SB, (int)streamed.size() - b0);
-                        uint8_t* base = stage_p + (size_t)half_ * SB * EXPERT_BYTES;
-                        uint8_t* hbase = hstage + (size_t)half_ * SB * EXPERT_BYTES;
-                        double q0 = now();
-                        CK(cudaEventSynchronize(ev_hfree[half_]));  // the DMA out of this host half is done
-                        double q1 = now();
-                        std::function<void(int)> cp = [&](int i) {
-                            int key = l * E + streamed[b0 + i];
-                            memcpy(hbase + (size_t)i * EXPERT_BYTES, eq[key], EXPERT_Q_BYTES);
-                            memcpy(hbase + (size_t)i * EXPERT_BYTES + EXPERT_Q_BYTES, es[key], EXPERT_BYTES - EXPERT_Q_BYTES);
-                        };
-                        cpool.parallel_for(nb, cp);
-                        pt[3] += q1 - q0; pt[4] += now() - q1;
-                        CK(cudaStreamWaitEvent(cpp, ev_free[half_]));  // the previous batch in this VRAM half is computed
-                        CK(cudaMemcpyAsync(base, hbase, (size_t)nb * EXPERT_BYTES, cudaMemcpyHostToDevice, cpp));
-                        CK(cudaEventRecord(ev_hfree[half_], cpp));
-                        CK(cudaEventRecord(ev_copied[half_], cpp));
-                        CK(cudaStreamWaitEvent(cs, ev_copied[half_]));
-                        moe_pairs(items_d + nres + b0, nb);
-                        CK(cudaEventRecord(ev_free[half_], cs));
+                // streamed experts: items point at their ring slot; batch k of this list is global batch b0 + k
+                const long long b0 = main_b;
+                const int nbat = ((int)streamed.size() + SB - 1) / SB;
+                std::vector<int> bi(nbat + 1);
+                for (int k = 0; k < (int)streamed.size(); k++) {
+                    if (k % SB == 0) bi[k / SB] = nitems;
+                    if (!per[streamed[k]].empty()) add_item(streamed[k], stage_p + ((size_t)((b0 + k / SB) % nring) * SB + k % SB) * EXPERT_BYTES);
+                }
+                bi[nbat] = nitems;
+                main_b += nbat;
+                int launched = 0;
+                auto launch_streamed = [&](bool wait) {  // each batch's experts once its copy is enqueued
+                    for (; launched < nbat; launched++) {
+                        const long long b = b0 + launched;
+                        if (!wait && st_copied.load() <= b) return;
+                        while (st_copied.load() <= b) std::this_thread::yield();
+                        CK(cudaStreamWaitEvent(cs, ev_copied[b % nring]));
+                        if (bi[launched + 1] > bi[launched]) moe_pairs(items_d + bi[launched], bi[launched + 1] - bi[launched]);
+                        CK(cudaEventRecord(ev_free[b % nring], cs));
+                        st_freed.store(b + 1);
                     }
-                });
+                };
+                launch_streamed(false);
                 streamed_n += streamed.size();
                 lap(4);
                 // CPU: non-resident experts, each read once for all of its tokens, overlapped with the above
@@ -1129,7 +1186,7 @@ struct Engine {
                 pt[2] += now() - c1;
                 lap(6);
                 double j0 = now();
-                if (copier.joinable()) copier.join();
+                launch_streamed(true);
                 pt[1] += now() - j0;  // time the main thread waited on the streaming
                 lap(7);
                 pairs_reduce_k<<<dim3((D + 255) / 256, T), 256, 0, cs>>>(ypair, ycpu_d, moec, TOPK, D);
