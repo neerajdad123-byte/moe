@@ -8,6 +8,13 @@ import bisect, collections, sqlite3, sys
 db = sqlite3.connect(sys.argv[1])
 ranges = sorted(db.execute("select start, end, text, globalTid from NVTX_EVENTS where text is not null and end is not null"))
 starts = [r[0] for r in ranges]
+# decode / mtp ranges are labelled with the prompt they follow ("decode @2" = after the 3rd prefill) when there are several
+npf = sum(r[2] == "prefill" for r in ranges)
+if npf > 1:
+    k = -1
+    for j, r in enumerate(ranges):
+        if r[2] == "prefill": k += 1
+        else: ranges[j] = (r[0], r[1], f"{r[2]} @{k}", r[3])
 call = {cid: (s, tid) for s, tid, cid in db.execute("select start, globalTid, correlationId from CUPTI_ACTIVITY_KIND_RUNTIME")}
 names = dict(db.execute("select id, value from StringIds"))
 

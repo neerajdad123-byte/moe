@@ -655,3 +655,19 @@ Decode after a long prompt (`--batch` 1K / 16K / 26K prompts, 128 greedy tokens;
 Same greedy tokens (one old-binary MTP run split in late tokens: the known run-to-run near-tie). `--check` PASS (mean
 KL 1.26e-3, top-1 98.6%); test_kernels ALL PASS. `moex bench` (short prompts, unchanged): MTP on 49.3 / 49.1 / 50.2 /
 49.4, off 47.4 / 47.4 / 47.6 / 47.7 (old, new, old, new).
+
+### D1 verification (same session): per-prompt A/B, acceptance, nsys
+`build/abd.sh`: 1 warm-up, then old (d6b63e9) / new (3b4117c) alternating, 2 rounds, 1K / 16K / 26K prompts, 128 tokens.
+
+| tok/s | 1K | 16K | 26K | MTP acceptance 1K / 16K / 26K |
+|---|---|---|---|---|
+| MTP off, old | 44.5 / 44.9 | 39.3 / 39.2 | 36.6 / 36.6 | - |
+| MTP off, new | 45.4 / 45.4 | 42.8 / 43.2 | 42.4 / 41.0 | - |
+| MTP on, old | 49.0 / 49.5 | 33.8 / 33.7 | 26.9 / 26.3 | 86.8 / 89.6 / 86.8-81.4% |
+| MTP on, new | 50.3 / 49.8 | 46.7 / 49.2 | 44.9 / 45.9 | 86.8 / 89.6 / 84.1-86.8% |
+
+Attention GPU ms (nsys, `tools/nsys_breakdown.py` now groups decode / MTP ranges by prompt): per decode token, MTP off,
+old 0.30 / 3.92 / 6.18 -> new 0.18 / 1.58 / 2.49; per MTP round, old 1.36 / **20.3 / 32.3** (the 2-token chunk path ran
+32 unsplit blocks over the whole context) -> new 0.29 / 2.34 / 3.62. MTP round wall at 26K: 72.4 -> 45.0 ms.
+Greedy tokens: 1K identical in every run; 16K / 26K hashes vary run to run in the old binary alone too (16K: 50edb1,
+b043d3, b480a0 across its runs), the known near-tie; the new binary produces the same hashes as old runs.

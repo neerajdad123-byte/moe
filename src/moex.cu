@@ -1819,12 +1819,15 @@ int main(int argc, char** argv) {
         for (size_t i = 0; i < prompts.size(); i++) {
             eng.reset();
             eng.trace_prompt = (int)i;
+            const long long mr0 = eng.mtp_rounds, ma0 = eng.mtp_acc;
             std::vector<int> out;
             Stats st = generate(prompts[i], out, false);
             for (size_t j = 0; j < out.size(); j++) printf(j ? ",%d" : "%d", out[j]);
             printf("\n"); fflush(stdout);
             char tag[32]; snprintf(tag, sizeof tag, "prompt %zu", i);
             report(tag, st);
+            if (eng.mtp_rounds > mr0)
+                fprintf(stderr, "    mtp: %lld rounds, draft accepted %.1f%%\n", eng.mtp_rounds - mr0, 100.0 * (eng.mtp_acc - ma0) / (eng.mtp_rounds - mr0));
             tot.dec += st.dec; tot.sec += st.sec; tot.hits += st.hits; tot.misses += st.misses; tot.admits += st.admits; tot.cpu += st.cpu;
             for (int k = 0; k < 4; k++) tot.ht[k] += st.ht[k];
         }
