@@ -76,3 +76,16 @@ for line in urllib.request.urlopen(req, timeout=600):
     line = line.decode().strip()
     if line.startswith("data: {"): txt += json.loads(line[6:])["choices"][0]["text"]
 print(f"[completions stream] {txt!r} | {'PASS' if 'Paris' in txt else 'FAIL'}")
+# the prompt as token ids ("The capital of France is"), and as an array of one string; several prompts: 400
+def completions(body):
+    req = urllib.request.Request(BASE + "/v1/completions", data=json.dumps(body).encode(), headers={"Content-Type": "application/json"})
+    try: return 200, json.loads(urllib.request.urlopen(req, timeout=600).read())
+    except urllib.error.HTTPError as e: return e.code, json.loads(e.read() or b"{}")
+for prompt in ([760, 6511, 314, 9338, 369], [[760, 6511, 314, 9338, 369]], ["The capital of France is"]):
+    st, r = completions({"prompt": prompt, "max_tokens": 8, "temperature": 0, "echo": True})
+    txt = r.get("choices", [{}])[0].get("text", "")
+    ok = st == 200 and txt.startswith("The capital of France is") and "Paris" in txt[24:] and r["usage"]["prompt_tokens"] == 5
+    print(f"[completions prompt {json.dumps(prompt)[:40]}] {st} {txt!r} | {'PASS' if ok else 'FAIL'}")
+for prompt in (["one", "two"], [[1, 2], [3, 4]], [760, -1], [760, 1.5], [760, 99999999], [760, "x"]):
+    st, r = completions({"prompt": prompt, "max_tokens": 4})
+    print(f"[completions prompt {json.dumps(prompt)}] {st} {r.get('error', {}).get('message')!r} | {'PASS' if st == 400 else 'FAIL'}")

@@ -417,10 +417,24 @@ static void anthropic_serve(SOCKET c, Session& ss, Tokenizer& tk, const Json& r,
 
 // ---- OpenAI legacy: POST /v1/completions (raw text in, raw continuation out; editor autocomplete uses it) ----
 static void completions_serve(SOCKET c, Session& ss, Tokenizer& tk, const Json& r, const std::string& model_id) {
+    // prompt: a string, token ids, or an array holding one of those (one prompt per request: no batching)
     const Json* pj = r.get("prompt");
-    std::string prompt_text = pj && pj->t == Json::ARR && !pj->a.empty() ? pj->a[0].s : pj && pj->t == Json::STR ? pj->s : "";
-    if (prompt_text.empty()) { respond(c, 400, "application/json", "{\"error\":{\"message\":\"prompt missing\"}}"); return; }
-    std::vector<int> prompt = tk.encode(prompt_text);
+    auto fail = [&](const std::string& m) { respond(c, 400, "application/json", "{\"error\":{\"message\":\"" + jesc(m) + "\"}}"); };
+    if (pj && pj->t == Json::ARR && !pj->a.empty() && (pj->a[0].t == Json::STR || pj->a[0].t == Json::ARR)) {
+        if (pj->a.size() > 1) return fail("only one prompt per request");
+        pj = &pj->a[0];
+    }
+    std::string prompt_text;
+    std::vector<int> prompt;
+    if (pj && pj->t == Json::STR) prompt = tk.encode(prompt_text = pj->s);
+    else if (pj && pj->t == Json::ARR)
+        for (auto& x : pj->a) {
+            if (x.t != Json::NUM || x.n != std::floor(x.n) || x.n < 0 || x.n >= V)
+                return fail("prompt: token ids must be whole numbers from 0 to " + std::to_string(V - 1));
+            prompt.push_back((int)x.n);
+            prompt_text += tk.piece(prompt.back());
+        }
+    if (prompt.empty()) return fail("prompt missing");
     if ((int)prompt.size() + 1 >= ss.eng.ctx) {
         respond(c, 400, "application/json", "{\"error\":{\"message\":\"the prompt is " + std::to_string(prompt.size()) +
                 " tokens, more than the context (" + std::to_string(ss.eng.ctx) + "): restart moex serve with a larger --ctx\"}}");
