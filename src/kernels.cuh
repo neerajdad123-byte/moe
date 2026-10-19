@@ -887,14 +887,127 @@ __global__ void attn_combine_k(const float* __restrict__ part, const float* __re
     out[((size_t)tok * H + h) * AHD + tid] = acc / l / (1.f + __expf(-g));
 }
 
+// ---- K7P: prefill chunk attention (flash style, tensor cores, GQA) ----
+// Block = (kv head, PR / G tokens): its G query heads x those tokens = PR query rows share every K/V tile of PK keys,
+// read once. S = Q.K^T and O += P.V on wmma (fp16 operands: int8 K/V are exact; P carries V's row scale), online
+// softmax in fp32, O in shared memory. Causal per row. Needs H / KV to divide PR.
+constexpr int PR = 32, PK = 32, PLD = AHD + 8, PSL = PK + 4, PPL = PK + 8;
+constexpr int ATTN_PF_SMEM = (PR + 2 * PK) * PLD * 2 + PR * PSL * 4 + PR * PPL * 2 + PR * PLD * 4 + 3 * PR * 4;
+__global__ void __launch_bounds__(256) attn_prefill_k(const float* __restrict__ qo, const float* __restrict__ q_gate, KVCache kv,
+                                                      float* __restrict__ out, int H, int KV, const int* __restrict__ pos_d,
+                                                      int max_t, int ld, int T) {
+    using namespace nvcuda;
+    extern __shared__ __align__(32) unsigned char sm[];
+    half* Qs = reinterpret_cast<half*>(sm);     // [PR][PLD]
+    half* Ks = Qs + PR * PLD;                    // [PK][PLD]
+    half* Vs = Ks + PK * PLD;                    // [PK][PLD]
+    float* Ss = reinterpret_cast<float*>(Vs + PK * PLD);  // [PR][PSL] scores
+    half* Ps = reinterpret_cast<half*>(Ss + PR * PSL);    // [PR][PPL] probabilities * V scale
+    float* Os = reinterpret_cast<float*>(Ps + PR * PPL);  // [PR][PLD]
+    float *mrow = Os + PR * PLD, *lrow = mrow + PR, *crow = lrow + PR;
+    const int G = H / KV, TT = PR / G, kvh = blockIdx.x, t0 = blockIdx.y * TT, tid = threadIdx.x, warp = tid >> 5;
+    const int pos0 = *pos_d, nt = min(TT, T - t0), hi = pos0 + t0 + nt;  // keys [0, hi)
+    for (int e = tid; e < PR * AHD; e += 256) {  // row r = token r / G, head kvh * G + r % G
+        const int r = e / AHD, d = e % AHD, t = t0 + r / G;
+        Qs[r * PLD + d] = __float2half(t < T ? qo[((size_t)t * H + kvh * G + r % G) * AHD + d] : 0.f);
+        Os[r * PLD + d] = 0.f;
+    }
+    if (tid < PR) { mrow[tid] = -INFINITY; lrow[tid] = 0.f; }
+    const int8_t *K = kv.k + (size_t)kvh * max_t * AHD, *V = kv.v + (size_t)kvh * max_t * AHD;
+    const float *Ksc = kv.ks + (size_t)kvh * max_t, *Vsc = kv.vs + (size_t)kvh * max_t;
+    const float scale = rsqrtf((float)AHD);
+    const int r_sm = tid >> 3, q_sm = tid & 7;  // softmax: 8 threads per row, 4 keys each
+    const int rpos = pos0 + t0 + min(r_sm / G, nt - 1);  // padding rows copy the last token's position
+    for (int k0 = 0; k0 < hi; k0 += PK) {
+        __syncthreads();  // the previous tile is done with Ks / Vs / Ps
+        {
+            const int key = tid >> 3, c = (tid & 7) * 32, t = k0 + key;
+            uint4 a[2] = {}, b[2] = {};
+            if (t < hi) for (int u = 0; u < 2; u++) {
+                a[u] = reinterpret_cast<const uint4*>(K + (size_t)t * AHD + c)[u];
+                b[u] = reinterpret_cast<const uint4*>(V + (size_t)t * AHD + c)[u];
+            }
+            const int8_t *ka = reinterpret_cast<const int8_t*>(a), *vb = reinterpret_cast<const int8_t*>(b);
+            for (int i = 0; i < 32; i++) { Ks[key * PLD + c + i] = __int2half_rn(ka[i]); Vs[key * PLD + c + i] = __int2half_rn(vb[i]); }
+        }
+        __syncthreads();
+        if (warp < 4) {  // S [PR][PK]: 2 x 2 fragments
+            const int i = warp >> 1, j = warp & 1;
+            wmma::fragment<wmma::accumulator, 16, 16, 16, float> s;
+            wmma::fill_fragment(s, 0.f);
+            for (int kk = 0; kk < AHD; kk += 16) {
+                wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> fa;
+                wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::col_major> fb;
+                wmma::load_matrix_sync(fa, Qs + 16 * i * PLD + kk, PLD);
+                wmma::load_matrix_sync(fb, Ks + 16 * j * PLD + kk, PLD);
+                wmma::mma_sync(s, fa, fb, s);
+            }
+            wmma::store_matrix_sync(Ss + 16 * i * PSL + 16 * j, s, PSL, wmma::mem_row_major);
+        }
+        __syncthreads();
+        {
+            float sv[4], mx = -INFINITY;
+            for (int u = 0; u < 4; u++) {
+                const int kk = q_sm * 4 + u, t = k0 + kk;
+                sv[u] = t <= rpos ? Ss[r_sm * PSL + kk] * Ksc[t] * scale : -INFINITY;
+                mx = fmaxf(mx, sv[u]);
+            }
+            for (int o = 1; o < 8; o <<= 1) mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, o));
+            const float mo = mrow[r_sm], mn = fmaxf(mo, mx), c = __expf(mo - mn);  // key 0 is in tile 0: mn is finite
+            float sum = 0.f;
+            for (int u = 0; u < 4; u++) {
+                const int kk = q_sm * 4 + u, t = k0 + kk;
+                const float p = __expf(sv[u] - mn);
+                sum += p;
+                Ps[r_sm * PPL + kk] = __float2half(t < hi ? p * Vsc[t] : 0.f);
+            }
+            for (int o = 1; o < 8; o <<= 1) sum += __shfl_xor_sync(0xffffffffu, sum, o);
+            __syncwarp();
+            if (q_sm == 0) { mrow[r_sm] = mn; lrow[r_sm] = lrow[r_sm] * c + sum; crow[r_sm] = c; }
+        }
+        __syncthreads();
+        for (int e = tid; e < PR * AHD; e += 256) Os[(e / AHD) * PLD + e % AHD] *= crow[e / AHD];
+        __syncthreads();
+        for (int i = 0; i < 2; i++)  // O [PR][AHD] += P . V: warp w owns column tiles 2w, 2w+1
+            for (int j = 2 * warp; j < 2 * warp + 2; j++) {
+                wmma::fragment<wmma::accumulator, 16, 16, 16, float> o;
+                wmma::load_matrix_sync(o, Os + 16 * i * PLD + 16 * j, PLD, wmma::mem_row_major);
+                for (int kk = 0; kk < PK; kk += 16) {
+                    wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> fa;
+                    wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::row_major> fb;
+                    wmma::load_matrix_sync(fa, Ps + 16 * i * PPL + kk, PPL);
+                    wmma::load_matrix_sync(fb, Vs + kk * PLD + 16 * j, PLD);
+                    wmma::mma_sync(o, fa, fb, o);
+                }
+                wmma::store_matrix_sync(Os + 16 * i * PLD + 16 * j, o, PLD, wmma::mem_row_major);
+            }
+    }
+    __syncthreads();
+    for (int e = tid; e < PR * AHD; e += 256) {
+        const int r = e / AHD, d = e % AHD, tl = r / G, t = t0 + tl, h = kvh * G + r % G;
+        if (tl >= nt) continue;
+        const float g = q_gate[(size_t)t * ld + h * 2 * AHD + AHD + d];
+        out[((size_t)t * H + h) * AHD + d] = Os[r * PLD + d] / lrow[r] / (1.f + __expf(-g));
+    }
+}
+
+inline void attn_prefill(const float* qo, const float* q, KVCache kv, float* out, int H, int KV, const int* pos_d, int max_t,
+                         int ld, int T, cudaStream_t st) {
+    static bool once = [] { CK(cudaFuncSetAttribute(attn_prefill_k, cudaFuncAttributeMaxDynamicSharedMemorySize, ATTN_PF_SMEM)); return true; }();
+    (void)once;
+    const int tt = PR / (H / KV);
+    attn_prefill_k<<<dim3(KV, (T + tt - 1) / tt), 256, ATTN_PF_SMEM, st>>>(qo, q, kv, out, H, KV, pos_d, max_t, ld, T);
+}
+
 // pos_d: device int, the position of the first token, so the same launch can be replayed from a graph at any position.
 // T tokens (a prefill chunk): q/k/v rows have stride ld; all K/V are appended before any token attends.
-// ns > 1 needs part = T * H * ns * (AHD + 2) floats.
-// shortcut: one block per (head, token) re-reads K/V per token; a flash-style tile for long prompts.
+// ns > 1 needs part = T * H * ns * (AHD + 2) floats. Chunks of > 2 rows: attn_prefill_k (the MTP round's 2 rows and
+// decode keep attn_decode_k).
 inline void attn_decode(const float* q, const float* k, const float* v, const half* qn, const half* kn,
                         float* qo, KVCache kv, float* out, int H, int KV, const int* pos_d, int max_t,
                         int rot, float theta, float eps, int T, int ld, cudaStream_t st = 0, float* part = nullptr, int ns = 1) {
     qk_norm_rope_k<<<dim3(H + KV, T), AHD, 0, st>>>(q, k, v, qn, kn, qo, kv, H, KV, pos_d, max_t, rot, theta, eps, ld);
+    if (T > 2 && ns == 1 && PR % (H / KV) == 0) { attn_prefill(qo, q, kv, out, H, KV, pos_d, max_t, ld, T, st); return; }
     attn_decode_k<<<dim3(H, T, ns), AHD, 0, st>>>(qo, q, kv, out, H, KV, pos_d, max_t, ld, part);
     if (ns > 1) attn_combine_k<<<dim3(H, T), AHD, 0, st>>>(part, q, out, H, ns, ld);
 }

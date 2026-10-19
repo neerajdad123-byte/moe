@@ -3,6 +3,7 @@
 #include <cuda_runtime.h>
 #include <algorithm>
 #include <cmath>
+#include <random>
 #include <cstdio>
 #include <functional>
 #include <string>
@@ -626,6 +627,39 @@ int main(int argc, char** argv) {
             bench(ns == 1 ? "attn core T=4096, 1 split" : "attn core T=4096, 16 splits", 2.0 * KV * 4096 * AHD, [&] {
                 attn_decode_k<<<dim3(H, 1, ns), AHD>>>(qo, q, kvc, ag, H, KV, pos_d, MAXT, 0, part);
                 if (ns > 1) attn_combine_k<<<H, AHD>>>(part, q, ag, H, ns, 0); });
+    }
+
+    if (want(filt, "K7P")) {
+        printf("K7P prefill chunk attention (tensor cores, GQA) vs attn_decode_k per row; random int8 cache\n");
+        const int H = 16, KV = 2, MAXT = 17408, LDQ = H * 2 * AHD;
+        std::mt19937 rng(7);
+        std::uniform_real_distribution<float> U(-1.f, 1.f);
+        std::vector<int8_t> hk((size_t)KV * MAXT * AHD), hv(hk.size());
+        std::vector<float> hks((size_t)KV * MAXT), hvs(hks.size());
+        for (auto& x : hk) x = (int8_t)(127 * U(rng)); for (auto& x : hv) x = (int8_t)(127 * U(rng));
+        for (auto& x : hks) x = 0.02f * (1.5f + U(rng)); for (auto& x : hvs) x = 0.01f * (1.5f + U(rng));
+        KVCache kvc = kv_alloc(KV, MAXT);
+        CK(cudaMemcpy(kvc.k, hk.data(), hk.size(), cudaMemcpyHostToDevice)); CK(cudaMemcpy(kvc.v, hv.data(), hv.size(), cudaMemcpyHostToDevice));
+        CK(cudaMemcpy(kvc.ks, hks.data(), hks.size() * 4, cudaMemcpyHostToDevice)); CK(cudaMemcpy(kvc.vs, hvs.data(), hvs.size() * 4, cudaMemcpyHostToDevice));
+        const int TM = 1024;
+        std::vector<float> hq((size_t)TM * H * AHD), hg((size_t)TM * LDQ);
+        for (auto& x : hq) x = 3.f * U(rng); for (auto& x : hg) x = U(rng);
+        float *qo = up(hq), *qg = up(hg), *o1 = dalloc((size_t)TM * H * AHD), *o2 = dalloc((size_t)TM * H * AHD);
+        int* pos_d; CK(cudaMalloc(&pos_d, 4));
+        for (auto [T, p0] : {std::pair{37, 0}, std::pair{37, 1000}, std::pair{1024, 3072}}) {
+            set_int_k<<<1, 1>>>(pos_d, p0);
+            attn_decode_k<<<dim3(H, T, 1), AHD>>>(qo, qg, kvc, o1, H, KV, pos_d, MAXT, LDQ, nullptr);
+            attn_prefill(qo, qg, kvc, o2, H, KV, pos_d, MAXT, LDQ, T, 0);
+            char lbl[64]; snprintf(lbl, sizeof lbl, "T=%d at pos %d vs per-row", T, p0);
+            check(lbl, down(o2, (size_t)T * H * AHD), down(o1, (size_t)T * H * AHD), 5e-3f);  // fp16 Q and P
+        }
+        for (int p0 : {3072, 15360}) {
+            set_int_k<<<1, 1>>>(pos_d, p0);
+            char lbl[64]; snprintf(lbl, sizeof lbl, "1024 rows at pos %d: per-row", p0);
+            bench(lbl, 2.0 * KV * (p0 + 512) * AHD, [&] { attn_decode_k<<<dim3(H, TM, 1), AHD>>>(qo, qg, kvc, o1, H, KV, pos_d, MAXT, LDQ, nullptr); }, 3);
+            snprintf(lbl, sizeof lbl, "1024 rows at pos %d: prefill", p0);
+            bench(lbl, 2.0 * KV * (p0 + 512) * AHD, [&] { attn_prefill(qo, qg, kvc, o2, H, KV, pos_d, MAXT, LDQ, TM, 0); }, 3);
+        }
     }
 
     if (want(filt, "K8")) {

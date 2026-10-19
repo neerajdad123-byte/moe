@@ -566,3 +566,13 @@ Small cache (520 slots, 2 batches): 335 tok/s. Same greedy tokens; `--check` PAS
 S=1024 **1.83 ms = 18.8 TFLOPS** (old gemm_wmma_k: ~3.7 TFLOPS; S=256 2.35 -> 0.70 ms). Prefill 4K: 525 -> **644 tok/s**
 (gpu-wait 6.72 -> 3.73 s; now the streamer is the limit: memcpy 3.73 + DMA wait 1.80 of 6.36 s). 16K: 344 -> **362**
 (gpu-wait 32.8 s: attention). Same greedy tokens; `--check` PASS (mean KL 1.48e-3, top-1 98.6%); test_kernels ALL PASS.
+
+### S1d: prefill chunk attention on tensor cores, GQA (attn_prefill_k)
+One block per (kv head, 4 tokens) = 32 query rows (8 heads x 4 tokens) sharing each 32-key K/V tile; S = Q.K^T and
+O += P.V on wmma (int8 K/V exact in fp16, P carries V's scale), online softmax fp32, O in shared memory (90 KB).
+Chunks of > 2 rows only (decode and the MTP round keep attn_decode_k). test_kernels K7P vs per-row kernel: rel <= 1.9e-3;
+1024 rows at pos 3072: 57.1 -> 9.4 ms; at pos 15360: 259 -> 39.6 ms (~6.7 TFLOPS, room left).
+A/B alternating (old, new, old, new; laptop warm, so lower than single runs): 4K 593 / 584 / 551 / 575 (no change: little
+attention at 4K); **16K 367 / 576 / 354 / 575 (+60%)**. Single runs: 4K 712, 16K 600. Same greedy tokens in all runs.
+`--check` PASS: mean KL 1.48e-3 -> **1.71e-3** (fp16 Q and P), worst 1.79e-2, top-1 98.6%. test_kernels ALL PASS.
+`moex bench` decode: 49.1 (old) / 48.7 (new) avg, unchanged.
