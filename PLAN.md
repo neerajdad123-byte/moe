@@ -599,3 +599,34 @@ for >= 2 rows; real routing decides (unpredicted >= 2 rows: on demand; 1 row: CP
 16K: 257.4 -> 211.7 GB, H2D 26.9 -> 22.2 s. A/B alternating: **4K 612 / 727 / 598 / 723**, **16K 589 / 679 / 594 / 681**
 (+20% / +15%). Same greedy tokens; `--check` PASS (mean KL 1.71e-3, top-1 98.6%); test_kernels ALL PASS; bench 49.3 / 48.2,
 rerun in reverse order 48.4 (new) / 48.3 (old): unchanged (the second run of a pair is the warmer one).
+
+### S5: CPU threshold for prefill experts (STREAM_MIN 2 -> 3: experts with <= 2 rows run on the CPU)
+Sweep, single runs at 4K: CPU <= 1 row 503 (taken while the machine was disturbed: CPU experts 2.68 s vs 0.45 normal),
+<= 2 rows 803 (48.0 GB, H2D 4.76 s), <= 3 rows 798, <= 4 rows 821; stopped there (16K points not run). Kept <= 2.
+A/B alternating (old, new, old, new): 4K 748 / 765 / 728 / 761, 16K 681 / 709 / 682 / 710 (+3-4%). Same greedy tokens;
+`--check` PASS (mean KL 1.26e-3, worst 2.99e-2: more singletons on the CPU's fp32 path, top-1 98.6%); test_kernels ALL
+PASS. Power: on AC; Windows reported the Balanced plan with no performance overlay during these runs.
+
+### Parked: CH 2048 (not built)
+Each expert would cross PCIe once per 2048 rows instead of 1024 (the remaining limit: H2D busy ~= the prefill wall).
+Design: alias the scratch that is never live at once in stream order: the mixer buffers (attention: qkvc, qoc, agc;
+DeltaNet: bigc, convc, oc) and the MoE pair buffers (actp, ypair) share one region of max(17408, 24640, 20480) floats
+per row; per-row scratch ~298 KB -> ~147 KB, so 2048 rows borrow what 1024 rows borrow today. Make CH a runtime value
+(2048; 1024 when the cache would be < 3x the borrow, like the ring), mtp_cat allocated for 2048. Check pairs_forward_tc
+with ~64 rows per expert and the K12 GEMM at S=2048.
+
+### Prefill summary (`--batch build/pf_N.txt --n 4 --ctx 17000 --load --no-mtp`)
+Single runs unless marked A/B (A/B = the new side of alternating runs; the laptop runs slower when warm).
+
+| commit | change | 4K tok/s | 16K tok/s | mean KL |
+|---|---|---|---|---|
+| f28d388 | baseline | 299 | 224 | 1.48e-3 |
+| 5e12c13 | profiling (NVTX, per-kernel / per-phase breakdown) | - | - | - |
+| 5fab266 | router + shared gate: one launch per chunk | 373 | 283 | 1.48e-3 |
+| a4ecff6 | one streamer thread, stream ahead | 525 | 344 | 1.49e-3 |
+| 8dd7290 | int8 GEMM 128x128 tiles (18.8 TFLOPS) | 644 | 362 | 1.48e-3 |
+| 71ca6f9 | tensor-core GQA prefill attention | 712 (A/B ~580, flat) | 600 (A/B 575, +60%) | 1.71e-3 |
+| 5bc3f70 | non-temporal copy into the pinned ring | A/B 595-605 (+3%) | A/B 589-590 | 1.72e-3 |
+| 3be0336 | counters: GB streamed, H2D busy, rows per expert | - | - | - |
+| 83103d8 | predicted stream-ahead (layer l+1's router) | A/B 723-727 (+20%) | A/B 679-681 (+15%) | 1.71e-3 |
+| (this) | CPU takes experts with <= 2 rows | A/B 761-765 (+4%) | A/B 709-710 (+4%) | 1.26e-3 |

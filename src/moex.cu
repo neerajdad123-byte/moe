@@ -882,7 +882,7 @@ struct Engine {
     static constexpr int SB = 24;   // experts per staging batch
     static constexpr int NB = 8;    // staging batches in VRAM: the streamer runs up to NB batches (~1 layer) ahead
     int nring = NB;                 // batches in use: 2 on GPUs whose cache would be small
-    static constexpr int STREAM_MIN = 2;  // an expert used by one token is cheaper on the CPU than over PCIe
+    static constexpr int STREAM_MIN = 3;  // experts with <= 2 rows are cheaper on the CPU than 1.77 MB over PCIe (sweep: PLAN.md S5)
     uint8_t* stage_p = nullptr;   // VRAM, NB * SB slots
     uint8_t* hstage = nullptr;    // pinned host, 2 * SB slots
     CpuPool cpool{4, false};      // staging copies, concurrent with the CPU experts on cpu.pool; sleeps when idle
