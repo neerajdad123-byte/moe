@@ -31,6 +31,7 @@
 #include "st.h"
 #include "kernels.cuh"
 #include "cpu_expert.h"
+#include "spec.h"
 #include <nvtx3/nvToolsExt.h>  // header-only; ranges show in Nsight Systems, no-ops otherwise
 #ifdef _WIN32
 #include <psapi.h>
@@ -97,7 +98,27 @@ struct Engine {
     half *mtp_ne = nullptr, *mtp_nh = nullptr, *mtp_norm = nullptr;
     float *mtp_cat = nullptr, *lg2 = nullptr, *snap = nullptr, *dlog = nullptr;
     uint8_t* vbuf = nullptr;  // the 2-token round's scratch (the prefill scratch lives in expert slots)
-    int draft = -1;
+    int draft = -1;  // the MTP head's draft
+    // MOEX_NGRAM=n (opt-in, n = 2..4): prompt-lookup drafts (src/spec.h). When the context's last n..4 tokens occurred
+    // earlier in it, the round drafts up to MOEX_NGRAM_MAX (default 4, max VT - 1) continuation tokens instead of the
+    // head's one; the length adapts to the recent acceptance (DraftLen). The head still runs every round (it keeps
+    // its own KV rows filled) and drafts when there is no match. Greedy drafts the most frequent continuation;
+    // sampling draws from the continuation counts. Every draft is verified with p/q speculative sampling.
+    NgramDrafter ngram{getenv("MOEX_NGRAM") ? std::max(0, atoi(getenv("MOEX_NGRAM"))) : 0};
+    DraftLen dlen{getenv("MOEX_NGRAM_MAX") ? std::max(1, std::min(VT - 1, atoi(getenv("MOEX_NGRAM_MAX")))) : 4};
+    std::vector<int> drafts;                // this round's drafts
+    std::vector<std::vector<TokP>> dqs;     // the distribution each was drawn from (one-hot: head, greedy, --check)
+    long long ng_rounds = 0, ng_acc = 0, ng_drafted = 0;
+    bool ng_draft = false;
+    void choose_draft(int head, int last) {
+        draft = head;
+        if (ngram.nmin) ngram.chain(last, dlen.k(), samp.temp <= 0.f, rng, drafts, dqs); else drafts.clear();
+        if (!(ng_draft = !drafts.empty())) { drafts = {head}; dqs = {{{head, 1.0}}}; }
+    }
+    void set_drafts(const std::vector<int>& d) {  // --check: teacher-forced drafts
+        drafts = d; dqs.clear(); ng_draft = false;
+        for (int t : d) dqs.push_back({{t, 1.0}});
+    }
     // scratch
     float *x, *h, *tmp, *moe, *big, *q, *k, *v, *qo, *ag, *apart, *z, *a, *b, *conv, *o, *act, *scr, *logits, *rw, *amv;
     int *ridx, *ams;
@@ -790,12 +811,12 @@ struct Engine {
         amv = falloc(ARGMAX_BLOCKS + 1);
         CK(cudaMalloc(&ridx, TOPK * 4)); CK(cudaMalloc(&ams, ARGMAX_BLOCKS * 4));
         CK(cudaMalloc(&slots_d, TOPK * sizeof(void*)));
-        apart = falloc(2 * AH * ASPLIT * (AHD + 2));  // decode, or the MTP round's 2 tokens
+        apart = falloc(VT * AH * ASPLIT * (AHD + 2));  // decode, or the MTP round's rows
         alloc_prefill();
         if (has_mtp) {
             CK(cudaMalloc(&vbuf, carve_prefill(nullptr, VT)));
             mtp_cat = falloc((size_t)CH * 2 * D); lg2 = falloc((size_t)VT * V); dlog = falloc(V);
-            snap = falloc((size_t)(NL - NL / 4) * (DVH * DNK * DNV + DC * (CONVK - 1)));
+            snap = falloc(SNAPROW * (ngram.nmin ? dlen.kmax : 1));  // ~66 MB per draft token a round may hold
         }
         eq.assign(NKEY, nullptr); es.assign(NKEY, nullptr);
         for (int l = 0; l < NL + has_mtp; l++) for (int e = 0; e < E; e++) {
@@ -864,7 +885,7 @@ struct Engine {
 
     // New conversation: recurrent state back to zero (KV rows are overwritten position by position).
     void reset() {
-        recent.clear();
+        recent.clear(); ngram.reset();
         for (int l = 0; l < NL; l++) if (!is_attn(l)) {
             CK(cudaMemsetAsync(L[l].ring, 0, (size_t)DC * (CONVK - 1) * 4, cs));
             CK(cudaMemsetAsync(L[l].S, 0, (size_t)DVH * DNK * DNV * 4, cs));
@@ -1005,7 +1026,7 @@ struct Engine {
     // they are ordinary cache slots, a prefill evicts them first (measured: as separate allocations they cost
     // ~90 slots and decode 54 -> 52 tok/s). base == nullptr only measures.
     int nres = 0;
-    static constexpr int VT = 4;  // rows of the MTP round's scratch
+    static constexpr int VT = 9;  // rows of the MTP round's scratch: the token + up to 8 drafts
     size_t carve_prefill(uint8_t* base, int ch = CH) {
         const int LQ = AH * 2 * AHD + 2 * AKV * AHD, LB = DC + DVH * DNV + 2 * DVH;
         size_t off = 0;
@@ -1083,6 +1104,7 @@ struct Engine {
                 rmsnorm(Xc, moec, norm, hc, D, EPS, T, cs);  // Xc = final hidden of every row, hc = normed
                 if (c0 + T == n) { gemv(lm_head, hc + (size_t)(T - 1) * D, logits, D, V, cs); next = pick_token(); }
                 draft = mtp_forward(ids + c0 + 1, T, c0 + T < n ? ids[c0 + T] : next, pos0 + c0 + 1, pt, false);
+                if (c0 + T == n) choose_draft(draft, next);
             } else if (c0 + T == n) {  // the last prompt token: its logits pick the first generated token
                 rmsnorm(Xc + (size_t)(T - 1) * D, moec + (size_t)(T - 1) * D, norm, h, D, EPS, 1, cs);
                 gemv(lm_head, h, logits, D, V, cs);
@@ -1127,7 +1149,7 @@ struct Engine {
                     gemm(w.dn_in, hc, bigc, T, D, LB, cs);
                     deltanet_core(bigc, bigc + DC, bigc + DC + DVH * DNV, bigc + DC + DVH * DNV + DVH, LB, w.conv, w.alog, w.dtb, w.nw,
                                   w.ring, w.S, convc, oc, DC, CONVK, DVH, DKH, EPS, T, cs,
-                                  verify ? snap_S(l) : nullptr, verify ? snap_S(l) + DVH * DNK * DNV : nullptr);  // state after the real token
+                                  verify ? snap_S(l) : nullptr, verify ? snap_S(l) + DVH * DNK * DNV : nullptr, SNAPROW);  // state after each row
                     gemm(w.out, oc, tmpc, T, DVH * DNV, D, cs);
                 }
                 rmsnorm(Xc, tmpc, w.post_ln, hc, D, EPS, T, cs);
@@ -1304,7 +1326,7 @@ struct Engine {
     // only, both; host time building the work before the CPU starts, and after it (launches + admissions)
     double vs[5] = {}, vt[2] = {};
     std::vector<int> admits_todo;
-    cudaGraphExec_t vgraph[2][NL + 1] = {};  // MTP round: per (rows - 1, layer), see chunk_layer
+    cudaGraphExec_t vgraph[VT][NL + 1] = {};  // MTP round: per (rows - 1, layer), see chunk_layer
     void shared_rows(LayerW& w, int T) {  // shared expert over T rows of hc -> shs, gate logits -> shl
         gemm(w.sh_gu, hc, shgu, T, D, 2 * SI, cs);
         silu_mul_rows_k<<<dim3((SI + 255) / 256, T), 256, 0, cs>>>(shgu, sha, SI);
@@ -1336,52 +1358,59 @@ struct Engine {
 
     // snap: per linear-attention layer, its DeltaNet state + conv ring after the real token of the MTP round (written
     // by the kernels as they go). A wrong draft copies it back: the state as if only the real token had been fed.
-    float* snap_S(int l) { return snap + (size_t)(l - (l + 1) / 4) * (DVH * DNK * DNV + DC * (CONVK - 1)); }
-    void dn_rollback() {
+    // snap row r (rows 0 .. drafts - 1): every DeltaNet layer's state and conv ring after the round's row r
+    static constexpr size_t SNAPROW = (size_t)(NL - NL / 4) * (DVH * DNK * DNV + DC * (CONVK - 1));
+    float* snap_S(int l, int r = 0) { return snap + r * SNAPROW + (size_t)(l - (l + 1) / 4) * (DVH * DNK * DNV + DC * (CONVK - 1)); }
+    void dn_rollback(int r) {
         const size_t nS = (size_t)DVH * DNK * DNV, nR = (size_t)DC * (CONVK - 1);
         for (int l = 0; l < NL; l++) if (!is_attn(l)) {
-            CK(cudaMemcpyAsync(L[l].S, snap_S(l), nS * 4, cudaMemcpyDeviceToDevice, cs));
-            CK(cudaMemcpyAsync(L[l].ring, snap_S(l) + nS, nR * 4, cudaMemcpyDeviceToDevice, cs));
+            CK(cudaMemcpyAsync(L[l].S, snap_S(l, r), nS * 4, cudaMemcpyDeviceToDevice, cs));
+            CK(cudaMemcpyAsync(L[l].ring, snap_S(l, r) + nS, nR * 4, cudaMemcpyDeviceToDevice, cs));
         }
     }
 
-    // One MTP decode round: feeds y at position p and the draft at p+1 together. Returns the new tokens: [t1] if the
-    // draft was wrong (only y was kept), [t1, t2] if right (y and the draft kept). The last one is not yet fed.
-    long long mtp_rounds = 0, mtp_acc = 0;
+    // One MTP decode round: feeds y at position p and the K drafts at p+1.. together (K = 1: the head's draft). Returns
+    // the new tokens: the accepted drafts (fed), then one more (not yet fed): the residual draw at the first rejection
+    // or the token after the last draft.
+    long long mtp_rounds = 0, mtp_acc = 0, mtp_drafted = 0;  // rounds, drafts accepted, drafts verified
     double vpt[2] = {};  // in the 40 layers: waiting for the GPU's routing, CPU experts
     double mt[5] = {};  // MTP round time: snapshot, 40 layers, lm_head+pick, mtp layer, rejected-draft redo
     std::vector<int> mtp_round(int y, int p) {
-        const int d = draft;
+        if (drafts.empty()) set_drafts({draft});
+        // snap holds kmax rows; the KV cache ends at ctx
+        const int K = std::max(0, std::min({(int)drafts.size(), ngram.nmin ? dlen.kmax : 1, ctx - 1 - p})), T = K + 1;
+        drafts.resize(K); dqs.resize(K);
         double pt[5] = {}, t0 = now();
         mtp_rounds++;
         nvtxRangePushA("mtp round");
         carve_prefill(vbuf, VT);
-        for (int i = 0; i < D; i++) { rows_h[i] = __half2float(embed[(size_t)y * D + i]); rows_h[D + i] = __half2float(embed[(size_t)d * D + i]); }
-        copy_k<<<(2 * D + 255) / 256, 256, 0, cs>>>(Xc, rows_d, 2 * D);
+        for (int t = 0; t < T; t++) {
+            const int tok = t ? drafts[t - 1] : y;
+            for (int i = 0; i < D; i++) rows_h[(size_t)t * D + i] = __half2float(embed[(size_t)tok * D + i]);
+        }
+        copy_k<<<(T * D + 255) / 256, 256, 0, cs>>>(Xc, rows_d, T * D);
         set_int_k<<<1, 1, 0, cs>>>(pos_d, p);
-        for (int l = 0; l < NL; l++) chunk_layer(l, 2, pt, true);
+        for (int l = 0; l < NL; l++) chunk_layer(l, T, pt, true);
         CK(cudaStreamSynchronize(cs)); mt[1] += now() - t0; t0 = now();
         vpt[0] += pt[0]; vpt[1] += pt[2];
-        rmsnorm(Xc, moec, norm, hc, D, EPS, 2, cs);  // Xc = final hidden at p, p+1
-        gemm(lm_head, hc, lg2, 2, D, V, cs);
-        auto pick_row = [&](int r) { float* sv = logits; logits = lg2 + (size_t)r * V; int t = pick_token(); logits = sv; return t; };
-        const int t1 = pick_row(0);
-        std::vector<int> out{t1};
-        if (t1 == d) {
-            out.push_back(pick_row(1));
-            mt[2] += now() - t0; t0 = now();
-            mtp_acc++;
-            tokens += 2; note(y); note(d);
-            draft = mtp_forward(&d, 2, out[1], p + 1, pt, true);
-            mt[3] += now() - t0;
-        } else {
-            mt[2] += now() - t0; t0 = now();
-            dn_rollback();  // keep y only (KV row p+1 holds the draft; it is overwritten when p+1 is fed)
-            tokens++; note(y);
+        rmsnorm(Xc, moec, norm, hc, D, EPS, T, cs);  // Xc = final hidden at p .. p+K
+        gemm(lm_head, hc, lg2, T, D, V, cs);
+        // greedy: p and q one-hot, a draft is kept iff it is its row's argmax
+        auto row_dist = [&](int r) { float* sv = logits; logits = lg2 + (size_t)r * V; auto d = token_dist(); logits = sv; return d; };
+        const std::vector<int> out = spec_verify(drafts, dqs, row_dist, rng);
+        const int a = (int)out.size() - 1;  // drafts accepted
+        mt[2] += now() - t0; t0 = now();
+        mtp_acc += a; mtp_drafted += K;
+        if (ng_draft) { ng_rounds++; ng_acc += a; ng_drafted += K; dlen.update(K, a); }
+        tokens += a + 1; note(y);
+        for (int t = 0; t < a; t++) note(drafts[t]);
+        if (a < K) {  // keep rows 0..a (KV rows after p+a hold rejected drafts; they are overwritten when fed)
+            dn_rollback(a);
             CK(cudaStreamSynchronize(cs)); mt[4] += now() - t0; t0 = now();
-            draft = mtp_forward(nullptr, 1, t1, p + 1, pt, true);
-            mt[3] += now() - t0;
         }
+        const std::vector<int> kept(drafts.begin(), drafts.begin() + a);
+        choose_draft(mtp_forward(kept.data(), a + 1, out.back(), p + 1, pt, true), out.back());
+        mt[3] += now() - t0;
         carve_prefill(arena + (size_t)(nslots - nres) * EXPERT_BYTES);
         nvtxRangePop();
         return out;
@@ -1395,16 +1424,25 @@ struct Engine {
     static constexpr int CAND_CAP = 8192;
     Cand *cand_d = nullptr, *cand_h = nullptr;
     int *cnt_d = nullptr, *cnt_h = nullptr;
-    void note(int tok) { recent.push_back(tok); if ((int)recent.size() > TokList::N) recent.pop_front(); }
+    void note(int tok) {
+        recent.push_back(tok); if ((int)recent.size() > TokList::N) recent.pop_front();
+        if (ngram.nmin) ngram.push(tok);
+    }
     // logits[] is being computed on cs; returns the next token.
     int pick_token() {
+        std::vector<TokP> p = token_dist();
+        return samp.temp <= 0.f ? p[0].id : sample_from(p, rng);
+    }
+    // The distribution the next token is drawn from: greedy {argmax: 1}; sampled: the candidates top-k / top-p keep,
+    // renormalized.
+    std::vector<TokP> token_dist() {
         if (samp.rep != 1.f && !recent.empty()) {
             TokList tl;
             for (int t : recent) if (std::find(tl.id, tl.id + tl.n, t) == tl.id + tl.n) tl.id[tl.n++] = t;
             repeat_penalty_k<<<1, TokList::N, 0, cs>>>(logits, tl, samp.rep);
         }
         argmax(logits, V, amv, ams, ids_hd, cs);  // the greedy id lands in mapped host memory; the max in amv[BLOCKS]
-        if (samp.temp <= 0.f) { CK(cudaStreamSynchronize(cs)); return ids_h[0]; }
+        if (samp.temp <= 0.f) { CK(cudaStreamSynchronize(cs)); return {{ids_h[0], 1.0}}; }
         if (!cand_d) {
             CK(cudaMalloc(&cand_d, CAND_CAP * sizeof(Cand))); CK(cudaMallocHost(&cand_h, CAND_CAP * sizeof(Cand)));
             CK(cudaMalloc(&cnt_d, 4)); CK(cudaMallocHost(&cnt_h, 4));
@@ -1427,9 +1465,9 @@ struct Engine {
         double z = 0; for (size_t i = 0; i < c.size(); i++) z += p[i] = exp((c[i].v - c[0].v) / samp.temp);
         size_t keep = c.size(); double cum = 0;
         for (size_t i = 0; i < c.size(); i++) { cum += p[i] / z; if (cum >= samp.top_p) { keep = i + 1; break; } }
-        double r = std::uniform_real_distribution<double>(0.0, cum >= samp.top_p ? cum : 1.0)(rng) * z, acc = 0;
-        for (size_t i = 0; i < keep; i++) { acc += p[i]; if (acc >= r) return c[i].id; }
-        return c[keep - 1].id;
+        std::vector<TokP> d(keep);
+        for (size_t i = 0; i < keep; i++) d[i] = {c[i].id, p[i] / z / (cum >= samp.top_p ? cum : 1.0)};
+        return d;
     }
 
     // Router-ahead prediction study: layer l+k's router on layer l's residual stream (normed with l+k's post norm),
@@ -1775,8 +1813,11 @@ int main(int argc, char** argv) {
             if (k != std::string::npos) np = std::stoi(m.substr(m.find(':', k) + 1));
         }
         if (use_prefill) pos = np - 1;  // the prompt runs as one prefill; compare from its last position on
-        std::vector<float> pend;  // MTP: the second row's logits of an accepted round, for the next position
-        int pend_pos = -1, pend_id = -1;
+        // MTP: the logits of an accepted round's later rows, for the next positions (pend_pos, pend_pos + 1, ..)
+        std::vector<std::vector<float>> pend; std::vector<int> pend_id;
+        int pend_pos = -1;
+        // teacher-forced drafts per round: 1 (the head's slot), or MOEX_NGRAM_MAX with MOEX_NGRAM set (multi-token rounds)
+        const int KCHK = eng.ngram.nmin ? eng.dlen.kmax : 1;
         // MOEX_CHECK_DUMP=1: write this run's logits as the reference files (with --f16: a reference for new prompts)
         const bool dump = getenv("MOEX_CHECK_DUMP") != nullptr;
         for (;; pos++) {
@@ -1785,16 +1826,17 @@ int main(int argc, char** argv) {
             if (dump ? pos >= (int)ids.size() : ref.empty()) break;
             std::vector<float> got(V);
             int id;
-            if (pend_pos == pos) { got = pend; id = pend_id; }
+            if (pend_pos >= 0 && pos - pend_pos < (int)pend.size()) { got = pend[pos - pend_pos]; id = pend_id[pos - pend_pos]; }
             else if (eng.has_mtp && pos > np - 1 && pos + 1 < (int)ids.size()) {
-                // MTP rounds, teacher-forced: the true next token is the draft, so both rows are checked (row 1 when
-                // the model agrees with it); a disagreement exercises the rollback
+                // MTP rounds, teacher-forced: the true next tokens are the drafts, so every row up to the model's first
+                // disagreement is checked; a disagreement exercises the rollback
                 {
-                    eng.draft = ids[pos + 1];
+                    eng.set_drafts(std::vector<int>(ids.begin() + pos + 1, ids.begin() + std::min(pos + 1 + KCHK, (int)ids.size())));
                     auto ts = eng.mtp_round(tok, pos);
                     CK(cudaMemcpy(got.data(), eng.lg2, V * 4, cudaMemcpyDeviceToHost));
                     id = ts[0];
-                    if (ts.size() == 2) { pend.resize(V); CK(cudaMemcpy(pend.data(), eng.lg2 + V, V * 4, cudaMemcpyDeviceToHost)); pend_pos = pos + 1; pend_id = ts[1]; }
+                    pend.assign(ts.size() - 1, std::vector<float>(V)); pend_id.assign(ts.begin() + 1, ts.end()); pend_pos = pos + 1;
+                    for (size_t r = 1; r < ts.size(); r++) CK(cudaMemcpy(pend[r - 1].data(), eng.lg2 + r * V, V * 4, cudaMemcpyDeviceToHost));
                 }
             } else {
                 id = use_prefill && pos == np - 1 ? eng.prefill(ids.data(), np, 0) : eng.step(tok, pos, true);
@@ -1884,7 +1926,7 @@ int main(int argc, char** argv) {
         for (size_t i = 0; i < prompts.size(); i++) {
             eng.reset();
             eng.trace_prompt = (int)i;
-            const long long mr0 = eng.mtp_rounds, ma0 = eng.mtp_acc;
+            const long long mr0 = eng.mtp_rounds, ma0 = eng.mtp_acc, md0 = eng.mtp_drafted;
             std::vector<int> out;
             Stats st = generate(prompts[i], out, false);
             for (size_t j = 0; j < out.size(); j++) printf(j ? ",%d" : "%d", out[j]);
@@ -1892,7 +1934,11 @@ int main(int argc, char** argv) {
             char tag[32]; snprintf(tag, sizeof tag, "prompt %zu", i);
             report(tag, st);
             if (eng.mtp_rounds > mr0)
-                fprintf(stderr, "    mtp: %lld rounds, draft accepted %.1f%%\n", eng.mtp_rounds - mr0, 100.0 * (eng.mtp_acc - ma0) / (eng.mtp_rounds - mr0));
+                fprintf(stderr, "    mtp: %lld rounds, draft accepted %.1f%%, %.2f tokens/round\n", eng.mtp_rounds - mr0,
+                        100.0 * (eng.mtp_acc - ma0) / (eng.mtp_drafted - md0), 1.0 + (double)(eng.mtp_acc - ma0) / (eng.mtp_rounds - mr0));
+            if (eng.ng_rounds) fprintf(stderr, "    n-gram drafts (run so far): %lld rounds (%.1f%%), %.2f drafts/round, accepted %.1f%%, draft length now %d\n",
+                                       eng.ng_rounds, 100.0 * eng.ng_rounds / eng.mtp_rounds, (double)eng.ng_drafted / eng.ng_rounds,
+                                       100.0 * eng.ng_acc / eng.ng_drafted, eng.dlen.k());
             tot.dec += st.dec; tot.sec += st.sec; tot.hits += st.hits; tot.misses += st.misses; tot.admits += st.admits; tot.cpu += st.cpu;
             for (int k = 0; k < 4; k++) tot.ht[k] += st.ht[k];
         }
@@ -1915,7 +1961,7 @@ int main(int argc, char** argv) {
         if (eng.mtp_rounds) {
             const double r = (double)eng.mtp_rounds;
             fprintf(stderr, "[mtp] %lld rounds, draft accepted %.1f%% | ms/round: snapshot %.2f  40 layers %.2f  lm_head+pick %.2f  mtp layer %.2f  redo %.2f | layers: gpu-wait %.2f  cpu-experts %.2f\n",
-                    eng.mtp_rounds, 100.0 * eng.mtp_acc / r, 1e3 * eng.mt[0] / r, 1e3 * eng.mt[1] / r, 1e3 * eng.mt[2] / r, 1e3 * eng.mt[3] / r, 1e3 * eng.mt[4] / r,
+                    eng.mtp_rounds, 100.0 * eng.mtp_acc / eng.mtp_drafted, 1e3 * eng.mt[0] / r, 1e3 * eng.mt[1] / r, 1e3 * eng.mt[2] / r, 1e3 * eng.mt[3] / r, 1e3 * eng.mt[4] / r,
                     1e3 * eng.vpt[0] / r, 1e3 * eng.vpt[1] / r);
             const double* v = eng.vs;
             fprintf(stderr, "[mtp] per round, 40 layers: %.0f experts needed, %.0f in VRAM | CPU misses: real token only %.0f, draft only %.0f, both %.0f"

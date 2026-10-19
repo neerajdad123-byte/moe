@@ -820,3 +820,33 @@ int8 produces both run to run). A/B (`build/gate_s1.sh`, 1K prompt + 10 short pr
 |---|---|---|
 | raw | 48.1 / 48.3 | **50.3 / 50.0** |
 | MTP | 57.1 / 58.4 | **59.2 / 60.3** |
+
+## agent2 (branch `agent2`): n-gram drafts, deterministic mode, GPTQ / AWQ research
+
+### A1: prompt-lookup n-gram drafts in the MTP round (opt-in: `MOEX_NGRAM=2`, needs the MTP head)
+What: when the context's last 2..4 tokens occurred earlier in it (prompt + generated), the round drafts up to
+`MOEX_NGRAM_MAX` (default 4, max 8) tokens continuing the earlier occurrence instead of the head's one; no match: the
+head's draft as before. The head still runs every round (its own KV rows). Draft length adapts: alpha = EMA of the
+per-token acceptance, length = 1 + alpha / (1 - alpha) within [1, max]. Verification is exact speculative sampling
+(src/spec.h `spec_verify`: accept d with min(1, p(d) / q(d)), else draw from norm(max(0, p - q)); greedy: p and q
+one-hot = keep a draft iff it is its row's argmax); sampled drafts are drawn from the continuation counts. The round
+is K + 1 rows (VT 4 -> 9): the DeltaNet kernels snapshot the state after every row but the last (~66 MB per draft
+token, allocated only for the n-gram max: 4 drafts = 111 fewer expert slots), rollback copies row a's state; int8
+dense GEMV over up to 8 rows reads W once (`gemm` S <= 8, each row summed exactly as decode's GEMV); CPU pair kernel up
+to 9 rows; session/serve and `--check` take rounds of any length; `--check` with `MOEX_NGRAM` teacher-forces
+`MOEX_NGRAM_MAX` drafts per round.
+Tests: tests/test_spec.cpp (CPU) ALL PASS: drafter, chains, adaptive length, p/q over 5 draft distributions (TV(out,
+p) <= 0.0021, acceptance = sum min(p, q) +- 0.0008), a 3-draft round over a Markov target (TV of the first two tokens
+0.0025 fixed / 0.0024 sampled drafts). test_kernels ALL PASS. `--check` (MTP on): eval1 1.53e-3 / 98.6% (as before);
+code1 1 draft 3.87e-4 / 100%, 4 drafts teacher-forced 3.73e-4 / 100% (rows 1..4 and the rollbacks checked).
+Greedy (MOEX_DETERMINISTIC=1, prompts of eval1 / code1 / agent1, 128 tokens): code1 and agent1 identical to plain decode
+with MTP and with MTP + n-gram; eval1: both split from plain at token 61 (the verify rows' expert kernels round
+differently from decode's, as plain MTP already did), n-gram vs MTP at token 100. So "identical to plain decode"
+holds except at near-ties, exactly as for MTP today.
+Tokens per round (greedy): code1 1.98 (head) -> **3.46** (n-gram drafts in 37% of rounds, 3.05 drafts, 73.8% kept);
+eval1 1.83 -> 1.78 (7% of rounds); agent1 1.88 -> 1.84 (30%, 68%). Sampled (temp 0.7, one correctness run in the queue,
+not a benchmark): 52.1 vs 52.4 tok/s overall, code1 60.1 vs 55.5. Speed needs the GPU owner's A/B.
+Merge: independent of A2 / A3; off by default. Default-path changes: the MTP accept goes through spec_verify (greedy
+unchanged; sampled: same distribution, other random draws for a seed); `gemm` int8 with 3..8 rows uses the GEMV
+(prefill tails too); VT 4 -> 9 (scratch +~1.6 MB, lg2 +5 MB). Open: int6 matrices (speed2's default for dn_out,
+lm_head, sh_d) have gemv_q6 for 1-2 rows only, so 3+ row rounds use the int6 tensor-core GEMM (fp16 activations).

@@ -210,7 +210,7 @@ struct Session {
             ctx.push_back(t);
             if (eng.has_mtp) {
                 auto ts = eng.mtp_round(t, pos);
-                if (ts.size() == 2) ctx.push_back(ts[0]);
+                ctx.insert(ctx.end(), ts.begin(), ts.end() - 1);  // accepted drafts are fed; the last token is not
                 q.insert(q.end(), ts.begin(), ts.end());
             } else q.push_back(eng.step(t, pos, true));
         }
