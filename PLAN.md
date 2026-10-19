@@ -515,3 +515,34 @@ Open: agents send side requests (titles, small checks) with other prompts betwee
 replaces the engine state, so the next main turn re-prefills its whole prompt (20K tokens ~ 70 s at ~300 tok/s).
 Fix idea: snapshot the state (DeltaNet states ~63 MB + the KV rows) at the end of the longest recent prompt into
 pinned RAM, restore it when a request extends that prefix.
+
+## Speed pass (branch `speed`, 2026-10-19): full time breakdown first
+
+Instrumentation: NVTX ranges (`decode`, `mtp round`, `prefill`) + `tools/nsys_breakdown.py` (GPU time per kernel and
+grid per range kind, GPU busy vs host wall); `--batch` now prints decode layers split by "all hits in VRAM" vs "with a
+CPU miss", MTP layers the same, and prefill's chunk_layer host timeline (enqueue / gpu-wait / group / prefetch /
+launch / cpu-experts / cpu-sum / copier-wait / tail).
+
+Baseline (f28d388 + instrumentation), 10 short prompts x 128 greedy tokens (`--batch build/dec10.txt --n 128 --load`):
+
+| | no MTP | MTP |
+|---|---|---|
+| tok/s | 46.8 (21.4 ms/tok) | 53.7 (37 ms/round, 1.92 tok) |
+| expert hit | 67.9% | 61.5% |
+| layers with >= 1 CPU miss | 89.1% | 97.5% |
+| host us/layer, miss layer | launch 21, wait-routing 253, CPU 178, admissions 25 | gpu-wait 284, CPU 347, rest ~80 |
+| host us/layer, all-hit layer | launch 20, wait-routing 274 | gpu-wait 372, rest ~50 |
+| GPU busy (nsys) | 16.0 ms/tok of 23.1 wall (69%) | 25.8 ms/round of 39.7 (65%) |
+
+Decode GPU per token (nsys, no MTP): gemv_i8 dn_in 4.32 (30x, ~175 GB/s), lm_head 2.89, out+o+shared-down 2.48 (80x),
+qkv 1.08, shared gate_up 0.53 => dense int8 11.3 ms at the roofline; experts gate_up 1.56 + down 0.88; dn_recur 0.52;
+rmsnorm 0.32, add 0.31, router gemv 0.28 + topk 0.18 + export 0.27; attention 0.08 (short ctx); rest < 0.1 each.
+MTP round: lm_head x2 5.74, pairs_gate_up 4.61 + pairs_down 3.57 (GEMV over 2 rows), dense as above.
+
+Prefill 4K (299 tok/s, 13.71 s): chunk_layer host time 13.55 s = **enqueue 6.77** (host blocked in launches: the
+queue fills with 1024 router GEMVs + 1024 shared-gate GEMVs per layer, so it waits for the GPU's pre-routing work),
+copier-wait 3.84, launch 1.57, cpu-experts 0.69, gpu-wait 0.54. 16K (224 tok/s, 73.2 s): enqueue **44.6**, copier-wait 16.2,
+launch 6.0, cpu 2.7, gpu-wait 2.5. GPU per 1024-row chunk-layer at 4K (nsys, ~38 ms, busy 33% under tracing):
+gemm_wmma dn_in 16.8 ms per call (~3.1 TFLOPS), out/o/sh_d 3.0 each, qkv 8.3, sh_gu 1.5; **attn_decode_k 24 ms per
+attention layer** (row by row, grows with context); router + shared-gate GEMVs 4.3 ms in 2048 launches; export_route
+0.9, pairs_reduce 0.7.

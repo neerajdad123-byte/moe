@@ -31,6 +31,7 @@
 #include "st.h"
 #include "kernels.cuh"
 #include "cpu_expert.h"
+#include <nvtx3/nvToolsExt.h>  // header-only; ranges show in Nsight Systems, no-ops otherwise
 #ifdef _WIN32
 #include <psapi.h>
 #pragma comment(lib, "psapi.lib")
@@ -104,6 +105,8 @@ struct Engine {
     long long hits = 0, misses = 0, admits = 0;
     double cpu_s = 0;
     double ht[4] = {};  // host time per phase: launch (poll+flush+graph), wait for routing, CPU misses, admissions
+    // the same per layer, split by whether the layer had a CPU miss: [0] all experts in VRAM, [1] >= 1 miss; [.][4] = layers
+    double hs[2][5] = {};
     std::vector<const uint8_t*> eq;  // mmapped expert blobs [NL*E]
     std::vector<const float*> es;    // and their scales
     // CPU side of the MoE
@@ -937,11 +940,13 @@ struct Engine {
     int prefill(const int* ids, int n, int pos0) {
         const int LQ = AH * 2 * AHD + 2 * AKV * AHD, LB = DC + DVH * DNV + 2 * DVH;
         int next = -1;
+        nvtxRangePushA("prefill");
         claim_prefill_slots();
         cpool.spin = true;  // the copy pool is hot for the length of the prefill
         double pt0 = now(), pt[5] = {};
         unsigned long pf0 = page_faults();
         long long sn0 = streamed_n;
+        std::fill(cl[0], cl[0] + 10, 0.0);
         for (int c0 = 0; c0 < n; c0 += CH) {
             const int T = std::min(CH, n - c0);
             tokens += T;
@@ -966,6 +971,8 @@ struct Engine {
         if (!quiet) fprintf(stderr, "[prefill] %d tok in %.2f s = %.1f tok/s | host: gpu-wait %.2f  streaming-wait %.2f  cpu-experts %.2f s | streamed %lld experts"
                 " | copier: wait-dma %.2f  memcpy %.2f s | page faults %lu\n",
                 n, now() - pt0, n / (now() - pt0), pt[0], pt[1], pt[2], streamed_n - sn0, pt[3], pt[4], page_faults() - pf0);
+        if (!quiet) print_cl(0, 1.0, "s", "prefill chunk-layers, host s");
+        nvtxRangePop();
         return next;
     }
 
@@ -975,6 +982,8 @@ struct Engine {
                 const int LQ = AH * 2 * AHD + 2 * AKV * AHD, LB = DC + DVH * DNV + 2 * DVH;
                 LayerW& w = L[l];
                 if (verify) { poll_admissions(); flush_table(); clock++; }
+                double ct = now(), cv[9];  // chunk_layer host timeline (cl[] below)
+                auto lap = [&](int i) { double n = now(); cv[i] = n - ct; ct = n; };
                 // everything up to the routing (+ the shared expert, which doesn't depend on it). In the MTP round the
                 // shapes and buffers are fixed, so it is captured once per (layer, rows) and replayed as one graph launch.
                 auto pre = [&] {
@@ -1012,9 +1021,11 @@ struct Engine {
                     }
                     CK(cudaGraphLaunch(g, cs));
                 } else pre();
+                lap(0);
                 double w0 = now();
                 if (verify) CK(cudaEventSynchronize(ev_route)); else CK(cudaStreamSynchronize(cs));
                 pt[0] += now() - w0;
+                lap(1);
                 const double hb0 = now();
                 const bool vs_on = verify && T == 2 && l < NL;
                 // group the chunk's (token, expert) pairs by expert: resident -> GPU, non-resident with
@@ -1049,12 +1060,14 @@ struct Engine {
                     jobs.push_back({eq[key], es[key], {}, {}, {}});
                     for (auto& pr : per[e]) { jobs.back().toks.push_back(pr.t); jobs.back().pids.push_back(pr.p); jobs.back().ws.push_back(pr.w); }
                 }
+                lap(2);
                 {
                     std::vector<int> pk;
                     for (int e = 0; e < E; e++) if (job_of[e] >= 0) pk.push_back(l * E + e);
                     for (int e : streamed) pk.push_back(l * E + e);
                     prefetch_experts(pk.data(), (int)pk.size());
                 }
+                lap(3);
                 // GPU: resident experts and the shared expert first (all async)
                 CK(cudaMemsetAsync(ypair, 0, (size_t)T * TOPK * D * 4, cs));
                 const int nres = nitems;
@@ -1096,10 +1109,12 @@ struct Engine {
                     }
                 });
                 streamed_n += streamed.size();
+                lap(4);
                 // CPU: non-resident experts, each read once for all of its tokens, overlapped with the above
                 double c1 = now();
                 if (vs_on) vt[0] += c1 - hb0;
                 cpu.run_pairs(jobs, rows_h, T, T * TOPK, ypair_cpu.data());
+                lap(5);
                 for (int t = 0; t < T; t++) {
                     float* y = ycpu_h + (size_t)t * D;
                     std::fill(y, y + D, 0.f);
@@ -1112,13 +1127,30 @@ struct Engine {
                 }
                 cpu_s += now() - c1;
                 pt[2] += now() - c1;
+                lap(6);
                 double j0 = now();
                 if (copier.joinable()) copier.join();
                 pt[1] += now() - j0;  // time the main thread waited on the streaming
+                lap(7);
                 pairs_reduce_k<<<dim3((D + 255) / 256, T), 256, 0, cs>>>(ypair, ycpu_d, moec, TOPK, D);
                 gated_add_rows_k<<<dim3((D + 255) / 256, T), 256, 0, cs>>>(moec, shs, shl, D);
                 if (verify) { for (int key : admits_todo) admit(key); admits_todo.clear(); start_admissions(); }
                 if (vs_on) vt[1] += now() - j0;
+                lap(8);
+                double* c = cl[verify ? 1 + !jobs.empty() : 0];
+                for (int i = 0; i < 9; i++) c[i] += cv[i];
+                c[9]++;
+    }
+    // chunk_layer host time [prefill | MTP round, layer without CPU miss | with]: enqueue up to routing, wait for the
+    // routing, group pairs, prefetch, launch resident + shared + copier start, CPU experts, CPU sum, wait copier, tail; count
+    double cl[3][10] = {};
+    void print_cl(int which, double per, const char* unit, const char* tag) {
+        static const char* nm[] = {"enqueue", "gpu-wait", "group", "prefetch", "launch", "cpu-experts", "cpu-sum", "copier-wait", "tail"};
+        const double* c = cl[which];
+        double tot = 0; for (int i = 0; i < 9; i++) tot += c[i];
+        fprintf(stderr, "    %s (%.0f layer runs, %.2f %s):", tag, c[9], tot / per, unit);
+        for (int i = 0; i < 9; i++) fprintf(stderr, " %s %.2f", nm[i], c[i] / per);
+        fprintf(stderr, "\n");
     }
     // MTP round profile, main layers only: unique experts needed, hits, misses used by the real token only, the draft
     // only, both; host time building the work before the CPU starts, and after it (launches + admissions)
@@ -1174,6 +1206,7 @@ struct Engine {
         const int d = draft;
         double pt[5] = {}, t0 = now();
         mtp_rounds++;
+        nvtxRangePushA("mtp round");
         carve_prefill(vbuf, VT);
         for (int i = 0; i < D; i++) { rows_h[i] = __half2float(embed[(size_t)y * D + i]); rows_h[D + i] = __half2float(embed[(size_t)d * D + i]); }
         copy_k<<<(2 * D + 255) / 256, 256, 0, cs>>>(Xc, rows_d, 2 * D);
@@ -1202,6 +1235,7 @@ struct Engine {
             mt[3] += now() - t0;
         }
         carve_prefill(arena + (size_t)(nslots - nres) * EXPERT_BYTES);
+        nvtxRangePop();
         return out;
     }
 
@@ -1272,6 +1306,7 @@ struct Engine {
     }
 
     int step(int tok, int pos, bool want_logits) {
+        struct Range { Range() { nvtxRangePushA("decode"); } ~Range() { nvtxRangePop(); } } range;
         tokens++;
         note(tok);
         double t = now();
@@ -1317,7 +1352,9 @@ struct Engine {
                 for (int j = 0; j < nm; j++) if (mkey[j] >= 0) admit(mkey[j]);
                 start_admissions();
                 ht[3] += now() - c1;
+                hs[1][2] += c1 - c0; hs[1][3] += now() - c1;
             }
+            hs[nm > 0][0] += h1 - h0; hs[nm > 0][1] += h2 - h1; hs[nm > 0][4]++;
             mark(1, t);
         }
         const float* pending = moe;
@@ -1703,6 +1740,13 @@ int main(int argc, char** argv) {
             for (int k = 0; k < 4; k++) tot.ht[k] += st.ht[k];
         }
         report("batch total", tot);
+        for (int m = 0; m < 2; m++) if (eng.hs[m][4]) {
+            const double* s = eng.hs[m]; const double nl = s[4];
+            fprintf(stderr, "    decode layers %s: %.0f (%.1f%%) | us/layer: launch %.0f  wait-routing %.0f  cpu-misses %.0f  admissions %.0f\n",
+                    m ? "with a CPU miss " : "all hits in VRAM", nl, 100 * nl / (eng.hs[0][4] + eng.hs[1][4]),
+                    1e6 * s[0] / nl, 1e6 * s[1] / nl, 1e6 * s[2] / nl, 1e6 * s[3] / nl);
+        }
+        for (int m = 1; m < 3; m++) if (eng.cl[m][9]) eng.print_cl(m, eng.cl[m][9] / 1e6, "us/layer", m == 1 ? "MTP layers, all hits in VRAM" : "MTP layers, with a CPU miss ");
         eng.rc_report(tot.dec);
         if (eng.mtp_rounds) {
             const double r = (double)eng.mtp_rounds;
