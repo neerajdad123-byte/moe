@@ -662,6 +662,49 @@ int main(int argc, char** argv) {
         }
     }
 
+    if (want(filt, "K7G")) {
+        printf("K7G decode attention, GQA (K/V read once per kv head) vs attn_decode_k; random int8 cache\n");
+        const int H = 16, KV = 2, MAXT = 26624, LDQ = H * 2 * AHD;
+        std::mt19937 rng(11);
+        std::uniform_real_distribution<float> U(-1.f, 1.f);
+        std::vector<int8_t> hk((size_t)KV * MAXT * AHD), hv(hk.size());
+        std::vector<float> hks((size_t)KV * MAXT), hvs(hks.size());
+        for (auto& x : hk) x = (int8_t)(127 * U(rng)); for (auto& x : hv) x = (int8_t)(127 * U(rng));
+        for (auto& x : hks) x = 0.02f * (1.5f + U(rng)); for (auto& x : hvs) x = 0.01f * (1.5f + U(rng));
+        KVCache kvc = kv_alloc(KV, MAXT);
+        CK(cudaMemcpy(kvc.k, hk.data(), hk.size(), cudaMemcpyHostToDevice)); CK(cudaMemcpy(kvc.v, hv.data(), hv.size(), cudaMemcpyHostToDevice));
+        CK(cudaMemcpy(kvc.ks, hks.data(), hks.size() * 4, cudaMemcpyHostToDevice)); CK(cudaMemcpy(kvc.vs, hvs.data(), hvs.size() * 4, cudaMemcpyHostToDevice));
+        std::vector<float> hq((size_t)2 * H * AHD), hg((size_t)2 * LDQ);
+        for (auto& x : hq) x = 3.f * U(rng); for (auto& x : hg) x = U(rng);
+        const int NS = 64;
+        float *qo = up(hq), *qg = up(hg), *o1 = dalloc((size_t)2 * H * AHD), *o2 = dalloc((size_t)2 * H * AHD), *part = dalloc((size_t)2 * H * NS * (AHD + 2));
+        int* pos_d; CK(cudaMalloc(&pos_d, 4));
+        auto old_k = [&](int T, int ns) {
+            attn_decode_k<<<dim3(H, T, ns), AHD>>>(qo, qg, kvc, o1, H, KV, pos_d, MAXT, LDQ, part);
+            attn_combine_k<<<dim3(H, T), AHD>>>(part, qg, o1, H, ns, LDQ);
+        };
+        auto new_k = [&](int T, int ns) {
+            attn_gqa_k<<<dim3(KV, T, ns), GT>>>(qo, kvc, H, KV, pos_d, MAXT, part);
+            attn_combine_k<<<dim3(H, T), AHD>>>(part, qg, o2, H, ns, LDQ);
+        };
+        for (auto [p0, T, ns] : {std::tuple{0, 1, 16}, std::tuple{3, 1, 16}, std::tuple{1000, 2, 16}, std::tuple{26000, 1, 64}}) {
+            set_int_k<<<1, 1>>>(pos_d, p0);
+            old_k(T, ns); new_k(T, ns);
+            char lbl[64]; snprintf(lbl, sizeof lbl, "pos %d, %d token(s), %d splits", p0, T, ns);
+            check(lbl, down(o2, (size_t)T * H * AHD), down(o1, (size_t)T * H * AHD), 1e-4f);  // same fp32 math, other order
+        }
+        for (int p0 : {1023, 16383, 26111}) {
+            set_int_k<<<1, 1>>>(pos_d, p0);
+            const double bytes = 2.0 * KV * (p0 + 1) * AHD;
+            char lbl[64]; snprintf(lbl, sizeof lbl, "ctx %d: per q head, 16 splits", p0 + 1);
+            bench(lbl, bytes, [&] { old_k(1, 16); }, 20);
+            for (int ns : {16, 32, 64}) {
+                snprintf(lbl, sizeof lbl, "ctx %d: GQA, %d splits", p0 + 1, ns);
+                bench(lbl, bytes, [&] { new_k(1, ns); }, 20);
+            }
+        }
+    }
+
     if (want(filt, "K8")) {
         printf("K8 Gated DeltaNet (L00, chained over %d positions)\n", NPOS);
         const int C8 = 8192, VH = 32, KH = 16;

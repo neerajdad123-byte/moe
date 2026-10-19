@@ -630,3 +630,28 @@ Single runs unless marked A/B (A/B = the new side of alternating runs; the lapto
 | 3be0336 | counters: GB streamed, H2D busy, rows per expert | - | - | - |
 | 83103d8 | predicted stream-ahead (layer l+1's router) | A/B 723-727 (+20%) | A/B 679-681 (+15%) | 1.71e-3 |
 | (this) | CPU takes experts with <= 2 rows | A/B 761-765 (+4%) | A/B 709-710 (+4%) | 1.26e-3 |
+
+## Decode (speed pass, 2026-10-19)
+
+### D0: breakdown re-measured (d6b63e9, MTP off, nsys)
+46.4 tok/s = 21.5 ms/token. GPU kernels 16.1 ms of 23.4 traced: dense int8 GEMVs 11.25 (dn_in 4.30, lm_head 2.87,
+out/o/shared-down 2.47, qkv 1.07, shared gate_up 0.53), GPU experts 2.44, other ~2.4; GPU idle on CPU misses ~6.
+87% of layers have a CPU miss (host: wait-routing 256 us + CPU 181 us + admissions 26 us per such layer).
+
+### D1: GQA decode attention (attn_gqa_k)
+One block per (kv head, token, split) for all 8 query heads: thread i scores key i for the 8 heads (K read once),
+warp h runs head h's online softmax, thread d does dim d of P.V for the 8 heads (V read once); attn_combine_k merges.
+Splits 16 -> 32 per kv head (ASPLIT). The MTP round's 2-token attention now splits too (it ran 32 unsplit blocks).
+test_kernels K7G vs attn_decode_k: rel ~1e-6; per layer: 1K 0.047 -> 0.037 ms, 16K 0.468 -> 0.192, 26K 0.738 -> 0.295.
+Decode after a long prompt (`--batch` 1K / 16K / 26K prompts, 128 greedy tokens; 26K = the 16K text repeated):
+
+| tok/s | 1K | 16K | 26K |
+|---|---|---|---|
+| MTP off, before | 45.2 | 40.3 | 37.4 |
+| MTP off, after | 45.8 | 43.9 | 42.7 |
+| MTP on, before | 49.9 | 33.8 | 27.2 |
+| MTP on, after | 50.2 | **49.1** | **45.4** |
+
+Same greedy tokens (one old-binary MTP run split in late tokens: the known run-to-run near-tie). `--check` PASS (mean
+KL 1.26e-3, top-1 98.6%); test_kernels ALL PASS. `moex bench` (short prompts, unchanged): MTP on 49.3 / 49.1 / 50.2 /
+49.4, off 47.4 / 47.4 / 47.6 / 47.7 (old, new, old, new).

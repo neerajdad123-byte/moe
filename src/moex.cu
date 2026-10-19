@@ -54,7 +54,7 @@ static double now() { return std::chrono::duration<double>(std::chrono::steady_c
 
 // Qwen3.6-35B-A3B geometry (checked against the container shapes at load).
 constexpr int D = 2048, NL = 40, E = 256, TOPK = 8, SI = 512, V = 248320;
-constexpr int AH = 16, AKV = 2, ROT = 64, ASPLIT = 16;  // attention; ASPLIT: decode attention splits (16 blocks alone leave SMs idle)
+constexpr int AH = 16, AKV = 2, ROT = 64, ASPLIT = 32;  // attention; ASPLIT: decode attention splits per kv head (test_kernels K7G)
 constexpr int DC = 8192, DVH = 32, DKH = 16, CONVK = 4;  // DeltaNet
 constexpr float EPS = 1e-6f, THETA = 1e7f;
 // Top-8 router weights renormalized to sum to 1: the HF config omits norm_topk_prob, the Qwen3.5-MoE default is
@@ -749,7 +749,7 @@ struct Engine {
         amv = falloc(ARGMAX_BLOCKS + 1);
         CK(cudaMalloc(&ridx, TOPK * 4)); CK(cudaMalloc(&ams, ARGMAX_BLOCKS * 4));
         CK(cudaMalloc(&slots_d, TOPK * sizeof(void*)));
-        apart = falloc(AH * ASPLIT * (AHD + 2));
+        apart = falloc(2 * AH * ASPLIT * (AHD + 2));  // decode, or the MTP round's 2 tokens
         alloc_prefill();
         if (has_mtp) {
             CK(cudaMalloc(&vbuf, carve_prefill(nullptr, VT)));
@@ -1063,7 +1063,7 @@ struct Engine {
                 if (is_attn(l)) {
                     gemm(w.attn_qkv, hc, qkvc, T, D, LQ, cs);
                     attn_decode(qkvc, qkvc + AH * 2 * AHD, qkvc + AH * 2 * AHD + AKV * AHD, w.qn, w.kn, qoc, w.kv, agc,
-                                AH, AKV, pos_d, ctx, ROT, THETA, EPS, T, LQ, cs);
+                                AH, AKV, pos_d, ctx, ROT, THETA, EPS, T, LQ, cs, verify ? apart : nullptr, verify ? ASPLIT : 1);  // MTP round: split like decode
                     gemm(w.o, agc, tmpc, T, AH * AHD, D, cs);
                 } else {
                     gemm(w.dn_in, hc, bigc, T, D, LB, cs);

@@ -999,6 +999,75 @@ inline void attn_prefill(const float* qo, const float* q, KVCache kv, float* out
     attn_prefill_k<<<dim3(KV, (T + tt - 1) / tt), 256, ATTN_PF_SMEM, st>>>(qo, q, kv, out, H, KV, pos_d, max_t, ld, T);
 }
 
+// ---- K7G: decode attention, GQA: one block per (kv head, token, split) for all 8 query heads of the group ----
+// K and V are read once per kv head instead of once per query head. Keys in tiles of 256: thread i scores key i for
+// all 8 heads, warp h runs head h's online softmax, thread d accumulates dim d of P.V for all 8 heads. Writes the same
+// partials {m, l, acc[HD]} as attn_decode_k (merged by attn_combine_k). Needs H / KV == GQ.
+constexpr int GQ = 8, GT = 256;
+__global__ void __launch_bounds__(256) attn_gqa_k(const float* __restrict__ qo, KVCache kv, int H, int KV,
+                                                  const int* __restrict__ pos_d, int max_t, float* __restrict__ part) {
+    __shared__ __align__(16) float qs[GQ][AHD];  // the group's queries
+    __shared__ __align__(16) float ps[GT][GQ];   // scores, then probabilities * V scale, [key][head]
+    __shared__ float cs[GQ], ms[GQ], ls[GQ];
+    const int tok = blockIdx.y, T = *pos_d + tok + 1, ns = gridDim.z, L = (T + ns - 1) / ns;
+    const int lo = blockIdx.z * L, hi = min(T, lo + L), kvh = blockIdx.x, tid = threadIdx.x, lane = tid & 31, wid = tid >> 5;
+    for (int h = 0; h < GQ; h++) qs[h][tid] = qo[((size_t)tok * H + kvh * GQ + h) * AHD + tid];
+    const int8_t *K = kv.k + (size_t)kvh * max_t * AHD, *V = kv.v + (size_t)kvh * max_t * AHD;
+    const float *Ks = kv.ks + (size_t)kvh * max_t, *Vs = kv.vs + (size_t)kvh * max_t;
+    const float scale = rsqrtf((float)AHD);
+    float acc[GQ] = {}, m = -INFINITY, l = 0.f;  // m, l: head wid's, the same in every lane
+    __syncthreads();
+    for (int t0 = lo; t0 < hi; t0 += GT) {
+        const int n = min(GT, hi - t0);
+        if (tid < n) {
+            const uint4* kr = reinterpret_cast<const uint4*>(K + (size_t)(t0 + tid) * AHD);
+            float s[GQ] = {};
+            for (int c = 0; c < AHD / 16; c++) {
+                const uint4 u = kr[c];
+                const int8_t* b = reinterpret_cast<const int8_t*>(&u);
+#pragma unroll
+                for (int j = 0; j < 16; j += 4)
+#pragma unroll
+                    for (int h = 0; h < GQ; h++) {
+                        const float4 qv = *reinterpret_cast<const float4*>(&qs[h][c * 16 + j]);
+                        s[h] += b[j] * qv.x + b[j + 1] * qv.y + b[j + 2] * qv.z + b[j + 3] * qv.w;
+                    }
+            }
+            const float sc = Ks[t0 + tid] * scale;
+            for (int h = 0; h < GQ; h++) ps[tid][h] = s[h] * sc;
+        }
+        __syncthreads();
+        {
+            float mx = -INFINITY;
+            for (int i = lane; i < n; i += 32) mx = fmaxf(mx, ps[i][wid]);
+            for (int o = 16; o; o >>= 1) mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, o));
+            const float mn = fmaxf(m, mx), c = __expf(m - mn);  // m = -inf on the first tile: c = 0
+            float sum = 0.f;
+            for (int i = lane; i < n; i += 32) { const float e = __expf(ps[i][wid] - mn); sum += e; ps[i][wid] = e * Vs[t0 + i]; }
+            l = l * c + warp_sum(sum);
+            m = mn;
+            if (lane == 0) cs[wid] = c;
+        }
+        __syncthreads();
+#pragma unroll
+        for (int h = 0; h < GQ; h++) acc[h] *= cs[h];
+        for (int i = 0; i < n; i++) {
+            const float v = (float)V[(size_t)(t0 + i) * AHD + tid];
+            const float4 p0 = *reinterpret_cast<const float4*>(&ps[i][0]), p1 = *reinterpret_cast<const float4*>(&ps[i][4]);
+            acc[0] += p0.x * v; acc[1] += p0.y * v; acc[2] += p0.z * v; acc[3] += p0.w * v;
+            acc[4] += p1.x * v; acc[5] += p1.y * v; acc[6] += p1.z * v; acc[7] += p1.w * v;
+        }
+        __syncthreads();  // ps is overwritten by the next tile
+    }
+    if (lane == 0) { ms[wid] = m; ls[wid] = l; }
+    __syncthreads();
+    for (int h = 0; h < GQ; h++) {  // an empty split (T < ns) leaves m = -inf, l = 0, acc = 0
+        float* p = part + (((size_t)tok * H + kvh * GQ + h) * ns + blockIdx.z) * (AHD + 2);
+        p[2 + tid] = acc[h];
+        if (tid == 0) { p[0] = ms[h]; p[1] = ls[h]; }
+    }
+}
+
 // pos_d: device int, the position of the first token, so the same launch can be replayed from a graph at any position.
 // T tokens (a prefill chunk): q/k/v rows have stride ld; all K/V are appended before any token attends.
 // ns > 1 needs part = T * H * ns * (AHD + 2) floats. Chunks of > 2 rows: attn_prefill_k (the MTP round's 2 rows and
@@ -1008,6 +1077,11 @@ inline void attn_decode(const float* q, const float* k, const float* v, const ha
                         int rot, float theta, float eps, int T, int ld, cudaStream_t st = 0, float* part = nullptr, int ns = 1) {
     qk_norm_rope_k<<<dim3(H + KV, T), AHD, 0, st>>>(q, k, v, qn, kn, qo, kv, H, KV, pos_d, max_t, rot, theta, eps, ld);
     if (T > 2 && ns == 1 && PR % (H / KV) == 0) { attn_prefill(qo, q, kv, out, H, KV, pos_d, max_t, ld, T, st); return; }
+    if (ns > 1 && H / KV == GQ) {
+        attn_gqa_k<<<dim3(KV, T, ns), GT, 0, st>>>(qo, kv, H, KV, pos_d, max_t, part);
+        attn_combine_k<<<dim3(H, T), AHD, 0, st>>>(part, q, out, H, ns, ld);
+        return;
+    }
     attn_decode_k<<<dim3(H, T, ns), AHD, 0, st>>>(qo, q, kv, out, H, KV, pos_d, max_t, ld, part);
     if (ns > 1) attn_combine_k<<<dim3(H, T), AHD, 0, st>>>(part, q, out, H, ns, ld);
 }
