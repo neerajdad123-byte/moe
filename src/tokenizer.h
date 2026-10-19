@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <queue>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -204,20 +205,34 @@ private:
     void bpe(const std::string& word, std::vector<int>& out) {
         auto ci = cache.find(word);
         if (ci != cache.end()) { out.insert(out.end(), ci->second.begin(), ci->second.end()); return; }
-        std::vector<std::string> sym;
-        for (unsigned char b : word) { std::string u; put_utf8(u, byte2cp[b]); sym.push_back(u); }
-        while (sym.size() > 1) {
-            int best = -1, bi = -1;
-            for (size_t k = 0; k + 1 < sym.size(); k++) {
-                auto it = merge_rank.find(sym[k] + " " + sym[k + 1]);
-                if (it != merge_rank.end() && (best < 0 || it->second < best)) { best = it->second; bi = (int)k; }
-            }
-            if (bi < 0) break;
-            sym[bi] += sym[bi + 1];
-            sym.erase(sym.begin() + bi + 1);
+        // Lowest-rank merge first, leftmost among equal ranks (as HF), with a heap over the adjacent pairs and a linked
+        // list of symbols: O(n log n). Rescanning every pair after each merge was quadratic: a 50,000-letter word
+        // (a DNA string, a blob) took 29 s.
+        struct Sym { std::string s; int prev, next; };
+        std::vector<Sym> sy;
+        for (unsigned char b : word) { std::string u; put_utf8(u, byte2cp[b]); sy.push_back({u, (int)sy.size() - 1, (int)sy.size() + 1}); }
+        if (!sy.empty()) sy.back().next = -1;
+        struct Cand { int rank, l, r; size_t ll, lr; };  // a pair as it was when queued (lengths detect later merges)
+        auto later = [](const Cand& a, const Cand& b) { return a.rank != b.rank ? a.rank > b.rank : a.l > b.l; };
+        std::priority_queue<Cand, std::vector<Cand>, decltype(later)> q(later);
+        auto queue_pair = [&](int l, int r) {
+            if (l < 0 || r < 0) return;
+            auto it = merge_rank.find(sy[l].s + " " + sy[r].s);
+            if (it != merge_rank.end()) q.push({it->second, l, r, sy[l].s.size(), sy[r].s.size()});
+        };
+        for (int k = 0; k + 1 < (int)sy.size(); k++) queue_pair(k, k + 1);
+        while (!q.empty()) {
+            const Cand c = q.top(); q.pop();
+            if (sy[c.l].next != c.r || sy[c.l].s.size() != c.ll || sy[c.r].s.size() != c.lr) continue;  // stale
+            sy[c.l].s += sy[c.r].s;
+            sy[c.l].next = sy[c.r].next;
+            if (sy[c.r].next >= 0) sy[sy[c.r].next].prev = c.l;
+            sy[c.r].next = -2;  // merged away
+            queue_pair(sy[c.l].prev, c.l);
+            queue_pair(c.l, sy[c.l].next);
         }
         std::vector<int> ids;
-        for (auto& t : sym) { auto it = vocab.find(t); if (it != vocab.end()) ids.push_back(it->second); }
+        for (int k = sy.empty() ? -1 : 0; k >= 0; k = sy[k].next) { auto it = vocab.find(sy[k].s); if (it != vocab.end()) ids.push_back(it->second); }
         if (cache.size() < 200000) cache[word] = ids;
         out.insert(out.end(), ids.begin(), ids.end());
     }

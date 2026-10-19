@@ -23,6 +23,12 @@ cases = [
     "URL https://example.com/path?q=1&r=two#frag and email a.b@c.de", "Ünïcödé MiXeD CaSe wörds",
     "\u00a0nbsp\u00a0separated\u2003em space\u3000ideographic",
 ]
+# long single words (one pretoken each): many merges of equal rank, overlapping pairs, the heap's tie order
+import random
+rng = random.Random(7)
+cases += ["".join(rng.choice("ACGT") for _ in range(20000)), "a" * 5000, "ab" * 3000, "aab" * 2000,
+          "".join(rng.choice("abcdefghijklmnopqrstuvwxyz") for _ in range(20000)), "Supercalifragilistic" * 300,
+          "".join(rng.choice("éàüößñ") for _ in range(3000)), "ЖжЖж" * 1000]
 for pat in ("data/*.txt", "*.md", "src/*.cu", "src/*.h", "tools/*.py", "ref/*.py"):
     for p in sorted(glob.glob(pat)):
         cases.append(open(p, encoding="utf-8", errors="ignore").read())
