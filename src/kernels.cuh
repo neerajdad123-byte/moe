@@ -1333,12 +1333,12 @@ inline void argmax(const float* x, int n, float* sv, int* si, int* out, cudaStre
 
 // Shared expert added into `out`. gate+up fused [2*SI,H], down [H,SI], sgate F16 [1,H].
 // scratch: >= 2*SI + H + 1 floats.
-inline void shared_expert_add(const Mat& Wgu, const Mat& Wd, const half* Wsg,
+// gate_logit: the shared expert gate's logit, already computed (decode: with the router)
+inline void shared_expert_add(const Mat& Wgu, const Mat& Wd, const float* gate_logit,
                               const float* x, float* out, float* scratch, int H, int SI, cudaStream_t st = 0) {
-    float *g = scratch, *u = g + SI, *sh = u + SI, *sl = sh + H;
+    float *g = scratch, *u = g + SI, *sh = u + SI;
     gemv(Wgu, x, g, H, 2 * SI, st);  // fused [gate; up] -> g, u
-    gemv_f16(Wsg, x, sl, H, 1, st);
     silu_mul_k<<<(SI + 255) / 256, 256, 0, st>>>(g, u, SI);
     gemv(Wd, g, sh, SI, H, st);
-    gated_add_k<<<(H + 255) / 256, 256, 0, st>>>(out, sh, sl, H);
+    gated_add_k<<<(H + 255) / 256, 256, 0, st>>>(out, sh, gate_logit, H);
 }

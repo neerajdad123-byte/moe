@@ -99,7 +99,7 @@ struct Engine {
     uint8_t* vbuf = nullptr;  // the 2-token round's scratch (the prefill scratch lives in expert slots)
     int draft = -1;
     // scratch
-    float *x, *h, *tmp, *moe, *big, *q, *k, *v, *qo, *ag, *apart, *z, *a, *b, *conv, *o, *act, *scr, *logits, *rw, *amv;
+    float *rlog, *x, *h, *tmp, *moe, *big, *q, *k, *v, *qo, *ag, *apart, *z, *a, *b, *conv, *o, *act, *scr, *logits, *rw, *amv;
     int *ridx, *ams;
     const uint8_t** slots_d;
     cudaStream_t cs, cp;  // compute, copy (both non-blocking: the legacy default stream would serialize them)
@@ -650,6 +650,14 @@ struct Engine {
         new_jobs.clear();
     }
 
+    // a then b, contiguous (decode reads the router and the shared-expert gate in one GEMV)
+    half* wup2(const std::string& a, int64_t na, const std::string& b, int64_t nb) {
+        if ((int64_t)C.at(a).bytes != na * 2 || (int64_t)C.at(b).bytes != nb * 2) { fprintf(stderr, "shape mismatch %s\n", a.c_str()); exit(1); }
+        half* d; CK(cudaMalloc(&d, (na + nb) * 2));
+        CK(cudaMemcpy(d, C.map(a), na * 2, cudaMemcpyHostToDevice));
+        CK(cudaMemcpy(d + na, C.map(b), nb * 2, cudaMemcpyHostToDevice));
+        return d;
+    }
     half* wup(const std::string& n, int64_t numel) {
         const StTensor& s = C.at(n);
         if ((int64_t)s.bytes != numel * 2) { fprintf(stderr, "shape mismatch %s\n", n.c_str()); exit(1); }
@@ -747,10 +755,10 @@ struct Engine {
             LayerW& w = L[i];
             w.in_ln = wup(p + "input_layernorm.weight", D);
             w.post_ln = wup(p + "post_attention_layernorm.weight", D);
-            w.router = wup(m + "gate.weight", (int64_t)E * D);
+            w.router = wup2(m + "gate.weight", (int64_t)E * D, m + "shared_expert_gate.weight", D);  // row E: the shared gate
             w.sh_gu = wmat({{m + "shared_expert.gate_proj.weight", SI}, {m + "shared_expert.up_proj.weight", SI}}, D, "sh_gu");
             w.sh_d = wmat({{m + "shared_expert.down_proj.weight", D}}, SI, "sh_d");
-            w.sh_gate = wup(m + "shared_expert_gate.weight", D);
+            w.sh_gate = w.router + (size_t)E * D;
             if (is_attn(i)) {
                 std::string a = p + "self_attn.";
                 w.attn_qkv = wmat({{a + "q_proj.weight", AH * 2 * AHD}, {a + "k_proj.weight", AKV * AHD}, {a + "v_proj.weight", AKV * AHD}}, D, "attn_qkv");
@@ -786,7 +794,7 @@ struct Engine {
         q = falloc(AH * 2 * AHD + 2 * AKV * AHD); k = q + AH * 2 * AHD; v = k + AKV * AHD; qo = falloc(AH * AHD); ag = falloc(AH * AHD);
         big = falloc(DC + DVH * DNV + 2 * DVH); z = big + DC; a = z + DVH * DNV; b = a + DVH;
         conv = falloc(DC); o = falloc(DVH * DNV);
-        act = falloc(TOPK * EI); scr = falloc(2 * SI + D + 1); logits = falloc(V); rw = falloc(TOPK);
+        act = falloc(TOPK * EI); scr = falloc(2 * SI + D + 1); rlog = falloc(E + 1); logits = falloc(V); rw = falloc(TOPK);
         amv = falloc(ARGMAX_BLOCKS + 1);
         CK(cudaMalloc(&ridx, TOPK * 4)); CK(cudaMalloc(&ams, ARGMAX_BLOCKS * 4));
         CK(cudaMalloc(&slots_d, TOPK * sizeof(void*)));
@@ -889,14 +897,14 @@ struct Engine {
             gemv(w.out, o, tmp, DVH * DNV, D, cs);
         }
         rmsnorm(x, tmp, w.post_ln, h, D, EPS, 1, cs);
-        gemv_f16(w.router, h, scr, D, E, cs);
-        router_topk(scr, E, TOPK, NORM_TOPK, ridx, rw, cs);
+        gemv_f16(w.router, h, rlog, D, E + 1, cs);  // router logits + the shared expert's gate logit (rlog[E])
+        router_topk(rlog, E, TOPK, NORM_TOPK, ridx, rw, cs);
         export_route_k<<<(D + 255) / 256, 256, 0, cs>>>(h, ridx, rw, h_hd, ids_hd, w_hd, D, TOPK);
         CK(cudaEventRecordWithFlags(ev_route, cs, cudaEventRecordExternal));  // host-visible even from a graph
         // hits from the device slot table, then resident experts + shared expert, no host in the loop
         route_hits_k<<<1, 32, 0, cs>>>(ridx, rw, TOPK, l * E, table_d, slots_d, hw_d, nh_d);
         experts_forward(slots_d, hw_d, TOPK, h, act, moe, cs, nh_d);
-        shared_expert_add(w.sh_gu, w.sh_d, w.sh_gate, h, moe, scr, D, SI, cs);
+        shared_expert_add(w.sh_gu, w.sh_d, rlog + E, h, moe, scr, D, SI, cs);
         // Router-ahead prediction for the own RAM cache's prefetch: after this layer's GPU work, while the GPU waits for
         // the CPU's misses (x is still this layer's pre-MoE residual). The host reads it after the next layer's routing
         // event; double-buffered so the next layer's prediction can't overwrite it first.

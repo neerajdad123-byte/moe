@@ -163,7 +163,9 @@ int main(int argc, char** argv) {
             CK(cudaMemcpy(Wgu, Wg, (size_t)SI * D * 2, cudaMemcpyDeviceToDevice));
             CK(cudaMemcpy(Wgu + (size_t)SI * D, Wu, (size_t)SI * D * 2, cudaMemcpyDeviceToDevice));
             experts_forward(slots, w, K, h, act, out);
-            shared_expert_add({Wgu}, {Wd}, Ws, h, out, scr, D, SI);
+            float* sl = dalloc(1);
+            gemv_f16(Ws, h, sl, D, 1);  // the gate logit (decode computes it with the router)
+            shared_expert_add({Wgu}, {Wd}, sl, h, out, scr, D, SI);
             check((std::string(pf) + "routed+shared -> moe_out").c_str(), down(out, D), golden(pf + std::string("moe_out")), 1e-5f);
             if (L == 0) {
                 bench("router gemv 256x2048 + topk", 256.0 * D * 2, [&] { gemv_f16(Wr, h, logits, D, E); router_topk(logits, E, K, true, idx, w); });
@@ -171,9 +173,9 @@ int main(int argc, char** argv) {
                 const double gu_b = K * (EXPERT_Q_BYTES * 2.0 / 3 + 2.0 * EI * (D / 64) * 4), dn_b = K * (EXPERT_Q_BYTES / 3.0 + D * (EI / 64) * 4.0);
                 bench("  gate_up only", gu_b, [&] { expert_gate_up_k<8><<<persistent_blocks(), 256>>>(slots, K, nullptr, h, act); });
                 bench("  down only", dn_b, [&] { expert_down_k<8><<<persistent_blocks(), 256, K * xpad_size(EI) * 4>>>(slots, w, K, nullptr, act, out); });
-                bench("shared expert F16", 3.0 * SI * D * 2, [&] { shared_expert_add({Wgu}, {Wd}, Ws, h, out, scr, D, SI); });
+                bench("shared expert F16", 3.0 * SI * D * 2, [&] { shared_expert_add({Wgu}, {Wd}, sl, h, out, scr, D, SI); });
             }
-            for (void* p : {(void*)Wr, (void*)h, (void*)Wg, (void*)Wu, (void*)Wgu, (void*)Wd, (void*)Ws}) CK(cudaFree(p));
+            for (void* p : {(void*)Wr, (void*)h, (void*)Wg, (void*)Wu, (void*)Wgu, (void*)Wd, (void*)Ws, (void*)sl}) CK(cudaFree(p));
         }
     }
 
