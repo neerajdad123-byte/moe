@@ -1335,6 +1335,7 @@ struct Engine {
                     for (auto& pr : per[e]) pairs_h[npairs++] = pr;
                     nitems++;
                 };
+                char fskip[VT * TOPK] = {};  // MTP round: pairs MOEX_FAST dropped
                 for (int e = 0; e < E; e++) {
                     if (per[e].empty()) continue;
                     int key = l * E + e, sl = slot_of[key];
@@ -1348,7 +1349,11 @@ struct Engine {
                     if (!verify && (int)per[e].size() >= STREAM_MIN) { ondemand.push_back(e); continue; }
                     job_of[e] = (int)jobs.size();
                     jobs.push_back({eq[key], es[key], {}, {}, {}});
-                    for (auto& pr : per[e]) { jobs.back().toks.push_back(pr.t); jobs.back().pids.push_back(pr.p); jobs.back().ws.push_back(pr.w); }
+                    for (auto& pr : per[e]) {
+                        if (verify && fast_w > 0 && pr.p % TOPK >= FAST_RANK && pr.w < fast_w) { fskip[pr.p] = 1; fast_skipped++; continue; }
+                        jobs.back().toks.push_back(pr.t); jobs.back().pids.push_back(pr.p); jobs.back().ws.push_back(pr.w);
+                    }
+                    if (jobs.back().pids.empty()) { jobs.pop_back(); job_of[e] = -1; }
                 }
                 if (!ondemand.empty()) stream_push(l, ondemand);
                 if (!verify && T >= AHEAD_T && l + 1 < NL) {  // after l's own list: the streamer's order is consumption order
@@ -1439,7 +1444,7 @@ struct Engine {
                     std::fill(y, y + D, 0.f);
                     for (int r = 0; r < TOPK; r++) {
                         int e = ridxc_h[t * TOPK + r];
-                        if (job_of[e] < 0 || (verify && dpair[t * TOPK + r])) continue;  // dpair: verify rows only (T <= VT)
+                        if (job_of[e] < 0 || (verify && (dpair[t * TOPK + r] || fskip[t * TOPK + r]))) continue;  // verify rows only (T <= VT)
                         const float* yp = ypair_cpu.data() + (size_t)(t * TOPK + r) * D;
                         for (int d = 0; d < D; d++) y[d] += yp[d];
                     }
@@ -1485,6 +1490,10 @@ struct Engine {
     // MOEX_MTP_DEFER=k (opt-in, approximate): the MTP round's CPU pairs at router rank >= k are computed during the next
     // layer's GPU work and enter the residual one layer late (as MOEX_DEFER in decode)
     const int mtp_defer = getenv("MOEX_MTP_DEFER") ? atoi(getenv("MOEX_MTP_DEFER")) : 0;
+    // MOEX_FAST=w (opt-in, approximate): a CPU miss at router rank >= FAST_RANK with routing weight < w is skipped
+    static constexpr int FAST_RANK = 6;
+    const double fast_w = getenv("MOEX_FAST") ? atof(getenv("MOEX_FAST")) : 0.0;
+    long long fast_skipped = 0;
     std::vector<CpuExperts::Job> md_jobs;
     std::vector<float> md_rows = std::vector<float>((size_t)VT * D), md_y = std::vector<float>((size_t)VT * D),
                        md_yp = std::vector<float>((size_t)VT * TOPK * D);
@@ -1802,6 +1811,7 @@ struct Engine {
                 touch(key);
                 if (sl >= 0) last[sl] = clock;
                 if (*(volatile unsigned*)hmask_h >> j & 1) hits++;
+                else if (fast_w > 0 && j >= FAST_RANK && w_h[j] < fast_w) fast_skipped++;  // MOEX_FAST: dropped
                 else {
                     if (can_defer && j >= defer_rank) { dw[nd] = w_h[j]; dq[nd] = eq[key]; dsc[nd++] = es[key]; }
                     else { mw[nm] = w_h[j]; mq[nm] = eq[key]; msc[nm++] = es[key]; }
@@ -1893,6 +1903,7 @@ struct Engine {
                 touch(key);
                 if (sl >= 0) last[sl] = clock;  // protects this step's experts (incl. in-flight) from eviction
                 if (*(volatile unsigned*)hmask_h >> j & 1) hits++;
+                else if (fast_w > 0 && j >= FAST_RANK && w_h[j] < fast_w) fast_skipped++;  // MOEX_FAST: dropped
                 else { mw[nm] = w_h[j]; mall[nm] = key; mkey[nm++] = sl < 0 ? key : -1; misses++; }
             }
             if (rc_n) { rc_poll(); rc_prefetch(l); rc_need(mall, nm); }
