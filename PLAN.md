@@ -942,3 +942,27 @@ Budget at 1K (e4729f5, raw, ms/token; GPU kernel times from nsys, waits from the
 Launches per token: ~145 host launches (40 layer graphs + add_k + table_k) -> ~50 (1 step graph + small setup +
 per-layer table flushes queued behind it). Target 15 ms (67 raw / 80 MTP): 4.4 ms missing. Biggest parts left: the
 3.0 ms CPU wait (105 misses/token on the CPU), dense GEMVs already at 90%+ of bandwidth.
+
+### CPU-wait and MTP pass (speed2, 2026-10-20, after the user's power fix)
+Measurement rule learned: start every sweep with a warm-up run (a cold expert file cache makes the first runs page-fault:
+CPU 25-35 ms/token); CPU clock checked with "% Processor Performance" (~170% at full turbo).
+
+| change | commit | raw tok/s | MTP tok/s | quality (3 check sets) |
+|---|---|---|---|---|
+| start of day (int8, b577b69) | - | 48.6 | 54.7 | KL ~2.0e-3 |
+| int6 + router fusion + graph + agent2 + fixes | ..e4729f5 | 51.4 | 59 | 2.57e-3 / 99.7% |
+| admit only experts used >= 2.5x lately (RAM traffic) | c38cd47 | **56.0** | **64.6** | 2.47e-3 / 99.7% |
+| opt-in MOEX_DEFER=6 (raw only) | 489bb55 | 59.4 / 57.5 | - | 3.23e-3 / 99.7% |
+| MTP GPU-wait meter; opt-in MOEX_MTP2=0.5 (2nd draft) | f334369 | - | 65.7 | not bit-identical (near-tie) |
+| opt-in ranked draft vocab 32K (MOEX_DRAFT_RANK + VOCAB) | 0e1ffdd | - | 66.8; with MTP2 **72.3** | exact (full lm_head verifies) |
+| opt-in MOEX_MTP_DEFER=6 (on ranked + MTP2) | 0bc5940 | - | **79.0** | MTP 3.36e-3 / 99.1% |
+| opt-in MOEX_FAST=0.05 | 29a7124 | 56.5 | 73.9 (ranked + MTP2) | 2.72e-3 / 99.7% |
+
+Dropped (measured): no-barrier CPU kernel (+0.3%, noise), 4-row ILP CPU dot (4x in isolation, slower in decode: the CPU
+experts are RAM-bandwidth-bound, not latency-bound), eviction policies (sim: tau=10 is the best online policy; Belady
+84% needs the future; +100 slots = -4 misses/token), doorbell (dispatch + quantize = 0.11 ms/token in total), DMA of
+misses and next-layer prefetch (both add RAM copies, the direction the admission sweep showed is slower).
+MTP round at 1K (default): 29.5 ms for 1.91 tokens = 40 layers 24 (GPU 10.3, CPU experts 10.3 of which the GPU idles
+5.4, host overhead ~2.9) + lm_head 2.4 + draft layer 3.1 (2.4 of it the full lm_head: hence the ranked draft vocab).
+CPU misses per round: real-token only 105, draft only 112, shared 30 (already read once for both rows).
+Next: CUDA graph per MTP window (2-3 rows; removes ~2.9 ms of host work per round); decide which opt-ins become default.
