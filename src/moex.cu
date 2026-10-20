@@ -2262,7 +2262,7 @@ int main(int argc, char** argv) {
         int pos = 0, tok = -1;
         if (use_prefill && !eng.trace) { tok = eng.prefill(p.data(), (int)p.size(), 0); pos = (int)p.size(); }
         else for (; pos < (int)p.size(); pos++) tok = eng.step(p[pos], pos, pos + 1 == (int)p.size());
-        long long h0 = eng.hits, m0 = eng.misses, a0 = eng.admits; double c0 = eng.cpu_s, gw0 = eng.gpu_wait_s, t1 = now();
+        long long h0 = eng.hits, m0 = eng.misses, a0 = eng.admits; double c0 = eng.cpu_s, gw0 = eng.gpu_wait_s + eng.mtp_gwait, t1 = now();
         double ht0[4]; for (int i = 0; i < 4; i++) ht0[i] = eng.ht[i];
         eng.trace_phase = 1;
         const bool mtp = eng.has_mtp && use_prefill && !eng.trace;
@@ -2284,7 +2284,7 @@ int main(int argc, char** argv) {
             }
         }
         st.ttft = t1 - t0;
-        st.sec = now() - t1; st.hits = eng.hits - h0; st.misses = eng.misses - m0; st.admits = eng.admits - a0; st.cpu = eng.cpu_s - c0; st.gwait = eng.gpu_wait_s - gw0;
+        st.sec = now() - t1; st.hits = eng.hits - h0; st.misses = eng.misses - m0; st.admits = eng.admits - a0; st.cpu = eng.cpu_s - c0; st.gwait = eng.gpu_wait_s + eng.mtp_gwait - gw0;  // decode step graph + MTP rounds
         for (int i = 0; i < 4; i++) st.ht[i] = eng.ht[i] - ht0[i];
         return st;
     };
