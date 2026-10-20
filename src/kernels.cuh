@@ -1407,6 +1407,12 @@ __global__ void argmax_k(const float* __restrict__ x, const int* __restrict__ xi
         pv[blockIdx.x] = bv; pi[blockIdx.x] = bi;
     }
 }
+// dst row i = src row ids[i] (row_bytes each; one block per row)
+__global__ void gather_rows_k(const uint8_t* __restrict__ src, uint8_t* __restrict__ dst, const int* __restrict__ ids, int row_bytes) {
+    const uint8_t* s = src + (size_t)ids[blockIdx.x] * row_bytes;
+    uint8_t* d = dst + (size_t)blockIdx.x * row_bytes;
+    for (int i = threadIdx.x; i < row_bytes; i += blockDim.x) d[i] = s[i];
+}
 // part[block] = sum exp(x - *mx) over the block's share (softmax denominator; the host adds the ARGMAX_BLOCKS parts)
 __global__ void sumexp_k(const float* __restrict__ x, int n, const float* __restrict__ mx, float* part) {
     const float m = *mx;

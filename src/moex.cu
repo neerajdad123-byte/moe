@@ -876,6 +876,7 @@ struct Engine {
         if (has_mtp) {
             CK(cudaMalloc(&vbuf, carve_prefill(nullptr, VT)));
             mtp_cat = falloc((size_t)CH * 2 * D); lg2 = falloc((size_t)VT * V); dlog = falloc(V);
+            build_draft_head();
             snap_rows = ngram.nmin ? dlen.kmax : mtp2 > 0 ? 2 : 1;
             CK(cudaHostAlloc((void**)&sexp_h, ARGMAX_BLOCKS * 4, cudaHostAllocMapped)); CK(cudaHostGetDevicePointer((void**)&sexp_hd, sexp_h, 0));
             snap = falloc(NDN * DNS); rsnap = falloc((size_t)snap_rows * RSTRIDE);
@@ -1498,19 +1499,44 @@ struct Engine {
         set_int_k<<<1, 1, 0, cs>>>(pos_d, pos);
         chunk_layer(NL, T, pt, verify);
         rmsnorm(Xc + (size_t)(T - 1) * D, moec + (size_t)(T - 1) * D, mtp_norm, h, D, EPS, 1, cs);
-        // the draft scores only the first draft_v vocab rows (BPE ids ~ frequency order; the full lm_head verifies)
-        gemv(lm_head, h, dlog, D, draft_v, cs);  // own buffer: logits[] holds the real model's last scores
+        // the draft scores only draft_v vocab rows: the first ones, or the MOEX_DRAFT_RANK list's (the full lm_head
+        // verifies, so the output does not change)
+        gemv(draft_map.empty() ? lm_head : draft_head, h, dlog, D, draft_v, cs);  // own buffer: logits[] holds the real model's scores
         argmax(dlog, draft_v, amv, ams, ids_hd, cs);
         if (conf) sumexp_k<<<ARGMAX_BLOCKS, 256, 0, cs>>>(dlog, draft_v, amv + ARGMAX_BLOCKS, sexp_hd);
         CK(cudaStreamSynchronize(cs));
         if (conf) { double s = 0; for (int i = 0; i < ARGMAX_BLOCKS; i++) s += sexp_h[i]; *conf = 1.0 / s; }
-        return ids_h[0];
+        return draft_map.empty() ? ids_h[0] : draft_map[ids_h[0]];
     }
     // MOEX_MTP2=theta (opt-in, greedy): a second draft per round by running the MTP layer once more on the first draft
     // (fed its own output state); proposed only when the head gives it probability >= theta. Verified as a 3-row round.
     const double mtp2 = getenv("MOEX_MTP2") ? atof(getenv("MOEX_MTP2")) : 0.0;
     // MOEX_DRAFT_VOCAB=N: the draft head's vocabulary (rows 0 .. N-1 of lm_head; default all V)
     const int draft_v = getenv("MOEX_DRAFT_VOCAB") ? std::clamp(atoi(getenv("MOEX_DRAFT_VOCAB")), 1024, V) : V;
+    // MOEX_DRAFT_RANK=file (ids, most generated first; tools/draft_rank.py): the draft head holds those draft_v rows of
+    // lm_head (ids not in the file follow in id order), gathered at load
+    Mat draft_head;
+    std::vector<int> draft_map;  // draft row -> token id
+    void build_draft_head() {
+        const char* f = getenv("MOEX_DRAFT_RANK");
+        if (!f || draft_v >= V || f16 || lm_head.q4) return;
+        std::vector<char> seen(V, 0);
+        if (FILE* fp = fopen(f, "r")) {
+            for (int t; (int)draft_map.size() < draft_v && fscanf(fp, "%d", &t) == 1;) if (t >= 0 && t < V && !seen[t]) { seen[t] = 1; draft_map.push_back(t); }
+            fclose(fp);
+        } else { fprintf(stderr, "[mtp] cannot read %s: full draft vocabulary\n", f); return; }
+        for (int t = 0; (int)draft_map.size() < draft_v; t++) if (!seen[t]) draft_map.push_back(t);
+        int* ids_d; CK(cudaMalloc(&ids_d, draft_v * 4)); CK(cudaMemcpy(ids_d, draft_map.data(), draft_v * 4, cudaMemcpyHostToDevice));
+        auto take = [&](const void* src, int row_bytes) {
+            uint8_t* d; CK(cudaMalloc(&d, (size_t)draft_v * row_bytes));
+            gather_rows_k<<<draft_v, 256>>>((const uint8_t*)src, d, ids_d, row_bytes); CK(cudaGetLastError());
+            return d;
+        };
+        if (lm_head.q6) { draft_head.q6 = take(lm_head.q6, D / 2); draft_head.q6h = take(lm_head.q6h, D / 4); draft_head.s = (const float*)take(lm_head.s, D / 64 * 4); }
+        else { draft_head.q = (const int8_t*)take(lm_head.q, D); draft_head.s = (const float*)take(lm_head.s, 4); }
+        CK(cudaDeviceSynchronize()); CK(cudaFree(ids_d));
+        fprintf(stderr, "[mtp] draft head: %d ranked rows of lm_head (%s)\n", draft_v, f);
+    }
     float *sexp_h = nullptr, *sexp_hd = nullptr;
     long long m2_tried = 0, m2_used = 0;
 
