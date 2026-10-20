@@ -937,9 +937,10 @@ struct Engine {
         CK(cudaMalloc(&table_d, NKEY * sizeof(void*))); CK(cudaMemset(table_d, 0, NKEY * sizeof(void*)));
         CK(cudaEventCreateWithFlags(&ev_route, cudaEventDisableTiming));
         CK(cudaMalloc(&pos_d, 4));
-        // the step graph admits a whole token's misses at once: 96 stages; the MTP round admits per layer, and more
-        // stages there only add copy churn (32: -4% MTP tok/s at 96). MOEX_NSTAGE overrides (A/B).
-        nstage = getenv("MOEX_NSTAGE") ? std::clamp(atoi(getenv("MOEX_NSTAGE")), 8, NSTAGE) : has_mtp ? 32 : NSTAGE;
+        // the step and MTP round graphs start a whole token's / round's copies only after the graph: 96 stages; the
+        // per-layer MTP path (MOEX_ROUND_GRAPH=0) admits per layer, where more stages only add churn (32: -4% at 96)
+        const bool round_graph_off = getenv("MOEX_ROUND_GRAPH") && atoi(getenv("MOEX_ROUND_GRAPH")) == 0;
+        nstage = getenv("MOEX_NSTAGE") ? std::clamp(atoi(getenv("MOEX_NSTAGE")), 8, NSTAGE) : has_mtp && round_graph_off ? 32 : NSTAGE;
         for (int i = 0; i < nstage; i++) {
             CK(cudaMallocHost(&stage[i].buf, EXPERT_BYTES + 64));  // + the slot pointer the copy publishes
             CK(cudaEventCreateWithFlags(&stage[i].after_compute, cudaEventDisableTiming));
@@ -1241,15 +1242,11 @@ struct Engine {
 
     // One layer over the T rows in Xc (positions *pos_d..). verify: the MTP round (2 rows, private scratch): no
     // streaming, misses run on the CPU and are admitted to VRAM as in step(); otherwise prefill (streaming).
-    void chunk_layer(int l, int T, double* pt, bool verify) {
+    // Layer l over T rows of Xc up to the routing (+ the shared expert in the MTP round). ev = false (the MTP round
+    // graph): no routing export / event, route_export_k hands the routing to the host instead.
+    void pre_layer(int l, int T, bool verify, bool ev = true) {
                 const int LQ = AH * 2 * AHD + 2 * AKV * AHD, LB = DC + DVH * DNV + 2 * DVH;
                 LayerW& w = L[l];
-                if (verify) { poll_admissions(); flush_table(); clock++; }
-                double ct = now(), cv[9];  // chunk_layer host timeline (cl[] below)
-                auto lap = [&](int i) { double n = now(); cv[i] = n - ct; ct = n; };
-                // everything up to the routing (+ the shared expert, which doesn't depend on it). In the MTP round the
-                // shapes and buffers are fixed, so it is captured once per (layer, rows) and replayed as one graph launch.
-                auto pre = [&] {
                 rmsnorm(Xc, l % NL ? moec : nullptr, w.in_ln, hc, D, EPS, T, cs);  // layers 0 and NL (MTP) start fresh
                 if (is_attn(l)) {
                     calib("attn_qkv", l, hc, T, D);
@@ -1274,7 +1271,7 @@ struct Engine {
                 rmsnorm(Xc, tmpc, w.post_ln, hc, D, EPS, T, cs);
                 gemv_f16(w.router, hc, lgc, D, E, cs, T);  // fp32 routing, as decode
                 router_topk(lgc, E, TOPK, NORM_TOPK, ridxc, rwc, cs, T);
-                export_route_k<<<(T * D + 255) / 256, 256, 0, cs>>>(hc, ridxc, rwc, rows_d, ridxc_d, rwc_d, T * D, T * TOPK);
+                if (ev) export_route_k<<<(T * D + 255) / 256, 256, 0, cs>>>(hc, ridxc, rwc, rows_d, ridxc_d, rwc_d, T * D, T * TOPK);
                 if (!verify && T >= AHEAD_T && l + 1 < NL) {  // predict layer l+1's routing (fp16 GEMM: only a prediction)
                     rmsnorm(Xc, nullptr, L[l + 1].post_ln, tmpc, D, EPS, T, cs);
                     Mat r; r.f16 = L[l + 1].router;
@@ -1282,10 +1279,19 @@ struct Engine {
                     router_topk(lgc, E, TOPK, NORM_TOPK, predi_d, rwc, cs, T);
                 }
                 if (verify) {  // the host only needs the routing: signal it, then the shared expert overlaps the CPU work
-                    CK(cudaEventRecordWithFlags(ev_route, cs, cudaEventRecordExternal));
+                    if (ev) CK(cudaEventRecordWithFlags(ev_route, cs, cudaEventRecordExternal));
                     shared_rows(w, T);
                 }
-                };
+    }
+    void chunk_layer(int l, int T, double* pt, bool verify) {
+                const int LQ = AH * 2 * AHD + 2 * AKV * AHD, LB = DC + DVH * DNV + 2 * DVH;
+                LayerW& w = L[l];
+                if (verify) { poll_admissions(); flush_table(); clock++; }
+                double ct = now(), cv[9];  // chunk_layer host timeline (cl[] below)
+                auto lap = [&](int i) { double n = now(); cv[i] = n - ct; ct = n; };
+                // everything up to the routing (+ the shared expert, which doesn't depend on it). In the MTP round the
+                // shapes and buffers are fixed, so it is captured once per (layer, rows) and replayed as one graph launch.
+                auto pre = [&] { pre_layer(l, T, verify); };
                 if (verify) {
                     cudaGraphExec_t& g = vgraph[T - 1][l];
                     if (!g) {
@@ -1618,6 +1624,151 @@ struct Engine {
         CK(cudaGetLastError());
     }
 
+    // The MTP round's 40 layers as one graph per row count T (like step_full for decode): the GPU decides its hits and
+    // groups them by expert (route_export_k), hands each layer's routing + hit mask to the host through mapped memory,
+    // and waits for the host's CPU pairs (wait_add_k, with the spin timeout); the host only polls, runs the CPU pairs
+    // (MOEX_FAST / MOEX_MTP_DEFER as in chunk_layer) and admits misses mid-round (their copies wait for the graph).
+    // A timeout finishes the round on the per-layer path. MOEX_ROUND_GRAPH=0: per-layer path.
+    cudaGraphExec_t rgraph[VT + 1] = {};
+    PairItem* r_items = nullptr; Pair* r_pairs = nullptr; int *r_nitems = nullptr, *r_use = nullptr;
+    long long *rwait_h = nullptr, *rwait_hd = nullptr;
+    long long round_fallbacks = 0;
+    // Layer l's MoE output when its graph wait timed out (ycpu_h holds the CPU part). The skipped layers' graph nodes
+    // that ignore g_skip (memsets, GEMMs) may have overwritten ypair and the shared expert's buffers, so both are
+    // recomputed; their inputs survive (hc: rmsnorm skips; r_items: route_export_k skips).
+    void round_tail(int l) {
+        const int T = rows_T;
+        set_int_k<<<1, 1, 0, cs>>>(skip_d, 0);
+        CK(cudaMemsetAsync(ypair, 0, (size_t)T * TOPK * D * 4, cs));
+        pairs_forward_dev(r_items, r_nitems, T * TOPK, r_pairs, hc, actp, ypair, cs);
+        shared_rows(L[l], T);
+        pairs_reduce_k<<<dim3((D + 255) / 256, T), 256, 0, cs>>>(ypair, ycpu_d, moec, TOPK, D);
+        gated_add_rows_k<<<dim3((D + 255) / 256, T), 256, 0, cs>>>(moec, shs, shl, D);
+    }
+    int rows_T = 1;
+    // test: MOEX_TEST_STALL=layer:ms:every (the host stalls before that layer's done flag)
+    static const char* stall_env() { return getenv("MOEX_TEST_STALL"); }
+    static int stall_layer() { static const int v = stall_env() ? atoi(stall_env()) : -1; return v; }
+    static int stall_ms() { static const int v = stall_env() && strchr(stall_env(), ':') ? atoi(strchr(stall_env(), ':') + 1) : 0; return v; }
+    static int stall_every() { static const int v = stall_env() && strrchr(stall_env(), ':') != strchr(stall_env(), ':') ? std::max(1, atoi(strrchr(stall_env(), ':') + 1)) : 1; return v; }
+    void round_layers(int T, double* pt) {
+        rows_T = T;
+        if (!r_items) {
+            CK(cudaMalloc(&r_items, VT * TOPK * sizeof(PairItem))); CK(cudaMalloc(&r_pairs, VT * TOPK * sizeof(Pair)));
+            CK(cudaMalloc(&r_nitems, 4)); CK(cudaMalloc(&r_use, 4));
+            CK(cudaHostAlloc((void**)&rwait_h, NL * 8, cudaHostAllocMapped)); CK(cudaHostGetDevicePointer((void**)&rwait_hd, rwait_h, 0));
+        }
+        cudaGraphExec_t& g = rgraph[T];
+        if (!g) {
+            vcaptured = true;
+            cudaGraph_t gr;
+            CK(cudaStreamBeginCapture(cs, cudaStreamCaptureModeThreadLocal));
+            for (int l = 0; l < NL; l++) {
+                pre_layer(l, T, true, false);
+                route_export_k<<<1, 256, 0, cs>>>(hc, ridxc, rwc, T, TOPK, D, l * E, table_d, r_items, r_pairs, r_nitems,
+                                                  rows_d, ridxc_d, rwc_d, hmask_hd, seq_d, rflag_hd + l);
+                CK(cudaMemsetAsync(ypair, 0, (size_t)T * TOPK * D * 4, cs));
+                pairs_forward_dev(r_items, r_nitems, T * TOPK, r_pairs, hc, actp, ypair, cs);
+                wait_add_k<<<1, 256, 0, cs>>>(nullptr, nullptr, seq_d, dflag_hd + l, 0, abort_hd, l, NL, spin_ns, rwait_hd, r_use);
+                pairs_reduce_k<<<dim3((D + 255) / 256, T), 256, 0, cs>>>(ypair, ycpu_d, moec, TOPK, D, r_use);
+                gated_add_rows_k<<<dim3((D + 255) / 256, T), 256, 0, cs>>>(moec, shs, shl, D);
+            }
+            CK(cudaStreamEndCapture(cs, &gr));
+            CK(cudaGraphInstantiate(&g, gr, 0));
+            CK(cudaGraphDestroy(gr));
+        }
+        poll_admissions();
+        flush_table();
+        set_int_k<<<1, 1, 0, cs>>>(seq_d, ++seq);
+        set_int_k<<<1, 1, 0, cs>>>(skip_d, 0);
+        CK(cudaGraphLaunch(g, cs));
+        std::vector<int> adm;
+        for (int l = 0; l < NL; l++) {
+            const double w0 = now();
+            while (*(volatile int*)&rflag_h[l] != seq) {
+                if (*(volatile int*)abort_h == seq) {  // the GPU gave up waiting on layer l - 1
+                    round_fallbacks++;
+                    round_tail(l - 1);
+                    for (int key : adm) if (slot_of[key] < 0) admit(key);
+                    start_admissions();
+                    for (int l2 = l; l2 < NL; l2++) chunk_layer(l2, T, pt, true);
+                    return;
+                }
+                if (now() - w0 > 10.0) { CK(cudaStreamSynchronize(cs)); fprintf(stderr, "mtp: layer %d's routing never arrived\n", l); exit(1); }
+                _mm_pause();
+            }
+            const double w1 = now();
+            pt[0] += w1 - w0;
+            clock++;
+            const unsigned m = *(volatile unsigned*)hmask_h;
+            for (auto& v : per) v.clear();
+            char cpu_pair[VT * TOPK] = {};
+            for (int p = 0; p < T * TOPK; p++) {
+                const int e = ridxc_h[p], key = l * E + e, sl = slot_of[key];
+                touch(key);
+                if (sl >= 0) last[sl] = clock;
+                if (m >> p & 1) { hits++; continue; }
+                misses++;
+                if (fast_w > 0 && p % TOPK >= FAST_RANK && rwc_h[p] < fast_w) { fast_skipped++; continue; }
+                if (per[e].empty() && sl < 0) adm.push_back(key);
+                per[e].push_back({p / TOPK, p, rwc_h[p]});
+            }
+            std::vector<CpuExperts::Job> jobs, djobs;
+            const bool can_defer = mtp_defer > 0 && l + 1 < NL;
+            for (int e = 0; e < E; e++) {
+                if (per[e].empty()) continue;
+                CpuExperts::Job u{eq[l * E + e], es[l * E + e], {}, {}, {}}, dj = u;
+                for (auto& pr : per[e]) {
+                    CpuExperts::Job& to = can_defer && pr.p % TOPK >= mtp_defer ? dj : u;
+                    to.toks.push_back(pr.t); to.pids.push_back(pr.p); to.ws.push_back(pr.w);
+                    if (&to == &u) cpu_pair[pr.p] = 1;
+                }
+                if (!u.pids.empty()) jobs.push_back(std::move(u));
+                if (!dj.pids.empty()) djobs.push_back(std::move(dj));
+            }
+            const double c0 = now();
+            if (!jobs.empty()) cpu.run_pairs_small(jobs, rows_h, T, ypair_cpu.data());
+            for (int t = 0; t < T; t++) {  // rank order per row, as chunk_layer
+                float* y = ycpu_h + (size_t)t * D;
+                std::fill(y, y + D, 0.f);
+                for (int r = 0; r < TOPK; r++) {
+                    if (!cpu_pair[t * TOPK + r]) continue;
+                    const float* yp = ypair_cpu.data() + (size_t)(t * TOPK + r) * D;
+                    for (int d = 0; d < D; d++) y[d] += yp[d];
+                }
+                if (md_pending) for (int d = 0; d < D; d++) y[d] += md_y[(size_t)t * D + d];
+            }
+            const bool has = !jobs.empty() || md_pending;
+            md_pending = false;
+            if (!djobs.empty()) { md_jobs = std::move(djobs); memcpy(md_rows.data(), rows_h, (size_t)T * D * 4); md_T = T; md_pending = true; }
+            cpu_s += now() - c0; pt[2] += now() - c0;
+            if (l == stall_layer() && mtp_rounds % stall_every() == 0) std::this_thread::sleep_for(std::chrono::milliseconds(stall_ms()));
+            std::atomic_thread_fence(std::memory_order_seq_cst);  // ycpu_h before the flag
+            *(volatile int*)&dflag_h[l] = 2 * seq + has;
+            if (!deterministic && !adm.empty()) {  // copies wait for this graph (see step_full)
+                poll_admissions();
+                for (int key : adm) if (slot_of[key] < 0) admit(key);
+                adm.clear();
+                start_admissions();
+            }
+            if (md_pending) {  // the deferred pairs, while the GPU runs layer l + 1
+                const double m0 = now();
+                std::fill(md_y.begin(), md_y.begin() + (size_t)T * D, 0.f);
+                cpu.run_pairs_small(md_jobs, md_rows.data(), T, md_yp.data());
+                for (auto& jb : md_jobs)
+                    for (size_t k = 0; k < jb.pids.size(); k++)
+                        for (int d = 0; d < D; d++) md_y[(size_t)jb.toks[k] * D + d] += md_yp[(size_t)jb.pids[k] * D + d];
+                cpu_s += now() - m0; pt[2] += now() - m0;
+            }
+        }
+        for (const double w0 = now(); ((volatile int*)abort_h)[1] != seq && ((volatile int*)abort_h)[0] != seq; _mm_pause())
+            if (now() - w0 > 10.0) { CK(cudaStreamSynchronize(cs)); fprintf(stderr, "mtp: the round graph never finished\n"); exit(1); }
+        if (((volatile int*)abort_h)[0] == seq) { round_fallbacks++; round_tail(NL - 1); }
+        else for (int l = 0; l < NL; l++) mtp_gwait += ((volatile long long*)rwait_h)[l] * 1e-9;
+        for (int key : adm) if (slot_of[key] < 0) admit(key);
+        start_admissions();
+    }
+
     // One MTP decode round: feeds y at position p and the K drafts at p+1.. together (K = 1: the head's draft). Returns
     // the new tokens: the accepted drafts (fed), then one more (not yet fed): the residual draw at the first rejection
     // or the token after the last draft.
@@ -1648,7 +1799,8 @@ struct Engine {
         }
         copy_k<<<(T * D + 255) / 256, 256, 0, cs>>>(Xc, rows_d, T * D);
         set_int_k<<<1, 1, 0, cs>>>(pos_d, p);
-        for (int l = 0; l < NL; l++) chunk_layer(l, T, pt, true);
+        if (step_graph && !prof && !trace && !(getenv("MOEX_ROUND_GRAPH") && atoi(getenv("MOEX_ROUND_GRAPH")) == 0)) round_layers(T, pt);
+        else for (int l = 0; l < NL; l++) chunk_layer(l, T, pt, true);
         CK(cudaStreamSynchronize(cs)); mt[1] += now() - t0; t0 = now();
         vpt[0] += pt[0]; vpt[1] += pt[2];
         rmsnorm(Xc, moec, norm, hc, D, EPS, T, cs);  // Xc = final hidden at p .. p+K
@@ -2376,6 +2528,7 @@ int main(int argc, char** argv) {
             fprintf(stderr, "[mtp] rollbacks: to row 0 %lld x %.3f ms (state copy) | past row 0 %lld x %.3f ms (state copy + replay)\n",
                     eng.rb_n[0], 1e3 * eng.rb_t[0] / std::max(1LL, eng.rb_n[0]), eng.rb_n[1], 1e3 * eng.rb_t[1] / std::max(1LL, eng.rb_n[1]));
             if (eng.mtp2 > 0) fprintf(stderr, "[mtp] second draft (theta %.2f): proposed in %lld of %lld rounds\n", eng.mtp2, eng.m2_used, eng.m2_tried);
+            if (eng.r_items) fprintf(stderr, "[mtp] round graph: %lld spin-timeout fallbacks\n", eng.round_fallbacks);
             const double* v = eng.vs;
             fprintf(stderr, "[mtp] per round, 40 layers: %.0f experts needed, %.0f in VRAM | CPU misses: real token only %.0f, draft only %.0f, both %.0f"
                             " | host: before CPU %.2f ms, after CPU %.2f ms\n",

@@ -644,7 +644,8 @@ struct Pair { int t, p; float w; };
 // weights stay in registers while the warp walks the item's tokens.
 template <int WARPS>
 __global__ void pairs_gate_up_k(const PairItem* __restrict__ items, const Pair* __restrict__ pairs,
-                                const float* __restrict__ X, float* __restrict__ act) {
+                                const float* __restrict__ X, float* __restrict__ act, const int* __restrict__ nitems = nullptr) {
+    if (nitems && (int)blockIdx.y >= *nitems) return;  // MTP round graph: the item count is on the device
     const PairItem it = items[blockIdx.y];
     const int row = blockIdx.x * WARPS + (threadIdx.x >> 5), lane = threadIdx.x & 31;
     const uint4* g = reinterpret_cast<const uint4*>(it.slot + (size_t)row * (EH / 2));
@@ -674,7 +675,8 @@ __global__ void pairs_gate_up_k(const PairItem* __restrict__ items, const Pair* 
 // half-warp, and the two half-warps take alternate tokens.
 template <int WARPS>
 __global__ void pairs_down_k(const PairItem* __restrict__ items, const Pair* __restrict__ pairs,
-                             const float* __restrict__ act, float* __restrict__ ypair) {
+                             const float* __restrict__ act, float* __restrict__ ypair, const int* __restrict__ nitems = nullptr) {
+    if (nitems && (int)blockIdx.y >= *nitems) return;
     const PairItem it = items[blockIdx.y];
     const int d = blockIdx.x * WARPS + (threadIdx.x >> 5), lane = threadIdx.x & 31, half_ = lane >> 4, c = lane & 15;
     const uint4 q = __ldcs(reinterpret_cast<const uint4*>(it.slot + (size_t)2 * EI * (EH / 2) + (size_t)d * (EI / 2)) + c);
@@ -690,14 +692,25 @@ __global__ void pairs_down_k(const PairItem* __restrict__ items, const Pair* __r
 }
 
 // moe[t][d] = sum over ranks of ypair[t*K + r][d] (GPU pairs; others are zero) + ycpu[t][d] (CPU pairs), in rank order.
-__global__ void pairs_reduce_k(const float* __restrict__ ypair, const float* __restrict__ ycpu, float* __restrict__ moe, int K, int D) {
+// use_cpu (optional, device): add ycpu only if *use_cpu (the MTP round graph: the host's flag said it wrote one)
+__global__ void pairs_reduce_k(const float* __restrict__ ypair, const float* __restrict__ ycpu, float* __restrict__ moe, int K, int D,
+                               const int* __restrict__ use_cpu = nullptr) {
+    if (g_skip) return;
+    if (use_cpu && !*use_cpu) ycpu = nullptr;
     int t = blockIdx.y, d = blockIdx.x * blockDim.x + threadIdx.x;
     if (d >= D) return;
     float acc = 0.f;
     for (int r = 0; r < K; r++) acc += ypair[((size_t)t * K + r) * D + d];
-    moe[(size_t)t * D + d] = acc + ycpu[(size_t)t * D + d];
+    moe[(size_t)t * D + d] = acc + (ycpu ? ycpu[(size_t)t * D + d] : 0.f);
 }
 
+// items / pairs / count on the device (route_export_k): grid for up to max_items, the extra blocks return
+inline void pairs_forward_dev(const PairItem* items, const int* nitems, int max_items, const Pair* pairs, const float* X,
+                              float* act, float* ypair, cudaStream_t st) {
+    constexpr int WARPS = 8;
+    pairs_gate_up_k<WARPS><<<dim3(EI / WARPS, max_items), WARPS * 32, 0, st>>>(items, pairs, X, act, nitems);
+    pairs_down_k<WARPS><<<dim3(EH / WARPS, max_items), WARPS * 32, 0, st>>>(items, pairs, act, ypair, nitems);
+}
 inline void pairs_forward(const PairItem* items, int n_items, const Pair* pairs, const float* X, float* act, float* ypair,
                           cudaStream_t st = 0) {
     constexpr int WARPS = 8;
@@ -877,6 +890,7 @@ __global__ void silu_mul_rows_k(const float* __restrict__ gu, float* __restrict_
 }
 // rows: out[t][d] += sigmoid(gl[t]) * sh[t][d]
 __global__ void gated_add_rows_k(float* __restrict__ out, const float* __restrict__ sh, const float* __restrict__ gl, int D) {
+    if (g_skip) return;
     int t = blockIdx.y, d = blockIdx.x * blockDim.x + threadIdx.x;
     if (d < D) out[(size_t)t * D + d] += sh[(size_t)t * D + d] / (1.f + __expf(-gl[t]));
 }
@@ -919,13 +933,52 @@ __global__ void export_signal_k(const float* __restrict__ h, const int* __restri
     __syncthreads();
     if (threadIdx.x == 0) *(volatile int*)flag = *seq;
 }
+// MTP round graph, one layer's hand-off: the GPU's hits among the T x K top-K pairs (device slot table), grouped by
+// expert for pairs_forward_dev (pairs in t order, as the host path), the hit mask and the routing to mapped host memory,
+// then flag = *seq once all of it is visible to the host. One block; thread 0 does the grouping (<= 32 pairs).
+__global__ void route_export_k(const float* __restrict__ h, const int* __restrict__ idx, const float* __restrict__ w,
+                               int T, int K, int D, int key_base, const uint8_t* const* __restrict__ table,
+                               PairItem* items, Pair* pairs, int* nitems, float* h_out, int* idx_out, float* w_out,
+                               unsigned* hmask, const int* __restrict__ seq, int* flag) {
+    if (g_skip) return;
+    const int n = T * K;
+    if (threadIdx.x == 0) {
+        unsigned m = 0;
+        int ni = 0, ie[32], cnt[32];
+        const uint8_t* sp[32];
+        for (int p = 0; p < n; p++) {
+            const uint8_t* s = table[key_base + idx[p]];
+            if (!s) continue;
+            m |= 1u << p;
+            int i = 0;
+            while (i < ni && ie[i] != idx[p]) i++;
+            if (i == ni) { ie[ni] = idx[p]; sp[ni] = s; cnt[ni++] = 0; }
+            cnt[i]++;
+        }
+        for (int i = 0, st = 0; i < ni; st += cnt[i++]) { items[i].slot = sp[i]; items[i].start = st; items[i].count = 0; }
+        for (int p = 0; p < n; p++)
+            if (m >> p & 1) {
+                int i = 0;
+                while (ie[i] != idx[p]) i++;
+                pairs[items[i].start + items[i].count++] = {p / K, p, w[p]};
+            }
+        *nitems = ni;
+        *(volatile unsigned*)hmask = m;
+    }
+    for (int i = threadIdx.x; i < T * D; i += blockDim.x) h_out[i] = h[i];
+    for (int i = threadIdx.x; i < n; i += blockDim.x) { idx_out[i] = idx[i]; w_out[i] = w[i]; }
+    __threadfence_system();
+    __syncthreads();
+    if (threadIdx.x == 0) *(volatile int*)flag = *seq;
+}
 // Spins until the host's flag = 2 * seq + (1 if it wrote a CPU result), then out += y (y: mapped host memory).
 // Gives up after timeout_ns (a stalled host must not keep the GPU busy into a Windows TDR reset, 2 s): then y is not
 // added, g_skip is set (layers l+1.. leave their state untouched) and *abort = seq tells the host
 // to finish this token on the per-layer path. The last layer reports a normal pass in abort[1] = seq.
 __global__ void wait_add_k(float* __restrict__ out, const float* y, const int* __restrict__ seq, const int* flag, int D,
                            int* abort, int l, int NL, long long timeout_ns,
-                           long long* waited) {  // mapped host [NL]: ns this layer's GPU waited for the host (exposed CPU time)
+                           long long* waited, int* use_out = nullptr) {  // waited: mapped host [NL], ns this layer's GPU waited
+                                                                          // for the host; use_out: device, 1 if the host wrote y
     if (g_skip) return;
     __shared__ int f;
     if (threadIdx.x == 0) {
@@ -946,6 +999,7 @@ __global__ void wait_add_k(float* __restrict__ out, const float* y, const int* _
         f = v;
         asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
         waited[l] = t - t0;
+        if (use_out) *use_out = f & 1;
     }
     __syncthreads();
     if (f & 1)
