@@ -145,7 +145,9 @@ struct Engine {
     std::vector<const uint8_t*> eq;  // mmapped expert blobs [NL*E]
     std::vector<const float*> es;    // and their scales
     // CPU side of the MoE
-    CpuExperts cpu{getenv("MOEX_CPU_THREADS") ? atoi(getenv("MOEX_CPU_THREADS")) : 8};
+    // CPU expert threads: one per physical core (logical / 2), at most 8: the CPU experts are RAM-bandwidth-bound and
+    // 12 / 16 threads measured no faster on the 14-core i7-13650HX. MOEX_CPU_THREADS overrides.
+    CpuExperts cpu{getenv("MOEX_CPU_THREADS") ? atoi(getenv("MOEX_CPU_THREADS")) : std::clamp((int)std::thread::hardware_concurrency() / 2, 2, 8)};
     // Host buffers mapped into the GPU's address space (zero-copy): kernels write the routing straight to the
     // host and read the CPU experts' result straight from it, so a layer needs no memcpy operations
     // (each small async copy costs a separate DMA op, ~10-20 us on WDDM; ~10% of the decode timeline).
@@ -938,8 +940,9 @@ struct Engine {
         CK(cudaEventCreateWithFlags(&ev_route, cudaEventDisableTiming));
         CK(cudaMalloc(&pos_d, 4));
         // the step and MTP round graphs start a whole token's / round's copies only after the graph: 96 stages; the
-        // per-layer MTP path (MOEX_ROUND_GRAPH=0) admits per layer, where more stages only add churn (32: -4% at 96)
-        const bool round_graph_off = getenv("MOEX_ROUND_GRAPH") && atoi(getenv("MOEX_ROUND_GRAPH")) == 0;
+        // per-layer MTP path (MOEX_ROUND_GRAPH=0, or no graphs: low-RAM mode) admits per layer, where more stages only
+        // add churn (32: -4% at 96)
+        const bool round_graph_off = (getenv("MOEX_ROUND_GRAPH") && atoi(getenv("MOEX_ROUND_GRAPH")) == 0) || !graphs_possible();
         nstage = getenv("MOEX_NSTAGE") ? std::clamp(atoi(getenv("MOEX_NSTAGE")), 8, NSTAGE) : has_mtp && round_graph_off ? 32 : NSTAGE;
         for (int i = 0; i < nstage; i++) {
             CK(cudaMallocHost(&stage[i].buf, EXPERT_BYTES + 64));  // + the slot pointer the copy publishes
@@ -953,9 +956,9 @@ struct Engine {
         loader = std::thread([this] { loader_main(); });
         if (rc_victim) { CK(cudaStreamCreateWithFlags(&cb, cudaStreamNonBlocking)); backer = std::thread([this] { backer_main(); }); }
         capture_graphs();
-        fprintf(stderr, "[load] %.1f s, dense %s, %d expert slots (%.2f GB, %.1f%% of %d experts), ctx %d%s%s\n",
+        fprintf(stderr, "[load] %.1f s, dense %s, %d expert slots (%.2f GB, %.1f%% of %d experts), ctx %d, %d CPU threads%s%s\n",
                 now() - t0, f16 ? "F16" : ("int8" + (q6groups != "none" ? ", int6: " + q6groups : "") + (q4groups.empty() ? "" : ", int4: " + q4groups)).c_str(), nslots, nslots * (double)EXPERT_BYTES / 1e9, 100.0 * nslots / (NL * E), NL * E, ctx,
-                has_mtp ? ", MTP on" : "", deterministic ? ", deterministic" : "");
+                cpu.pool.n_threads(), has_mtp ? ", MTP on" : "", deterministic ? ", deterministic" : "");
     }
 
     // New conversation: recurrent state back to zero (KV rows are overwritten position by position).
@@ -1055,8 +1058,10 @@ struct Engine {
     }
     bool sgraph_off = false, rgraph_off = false;
     int sgraph_streak = 0, rgraph_streak = 0;
+    // the step / round graphs need every expert in RAM (low-RAM mode's own cache and SSD reads are per-layer host work)
+    bool graphs_possible() const { return !low_ram && !rc_n && !ahead_k && !(getenv("MOEX_STEP_GRAPH") && atoi(getenv("MOEX_STEP_GRAPH")) == 0); }
     void capture_graphs() {
-        if (!low_ram && !rc_n && !ahead_k && !(getenv("MOEX_STEP_GRAPH") && atoi(getenv("MOEX_STEP_GRAPH")) == 0)) {
+        if (graphs_possible()) {
             CK(cudaMalloc(&seq_d, 4)); CK(cudaMemset(seq_d, 0, 4));
             CK(cudaHostAlloc((void**)&rflag_h, NL * 4, cudaHostAllocMapped)); CK(cudaHostGetDevicePointer((void**)&rflag_hd, rflag_h, 0));
             CK(cudaHostAlloc((void**)&dflag_h, NL * 4, cudaHostAllocMapped)); CK(cudaHostGetDevicePointer((void**)&dflag_hd, dflag_h, 0));

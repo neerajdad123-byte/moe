@@ -39,6 +39,7 @@ struct CpuPool {
         for (int i = 0; i < threads - 1; i++) th.emplace_back([this] { worker(); });  // caller is the last worker
     }
     ~CpuPool() { quit = true; gen++; gen.notify_all(); for (auto& t : th) t.join(); }
+    int n_threads() const { return (int)th.size() + 1; }
 
     void run_items() {
         for (int i; (i = next.fetch_add(1)) < n;) (*fn)(i);
