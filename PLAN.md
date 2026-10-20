@@ -985,4 +985,28 @@ Final, 4 prompts (1K + 3 short) x 64 tokens, warm-up, alternating, 2 rounds (156
 MTP round (default, 74.4 tok/s run): 34.6 ms for 2.62 tokens = 40 layers 29.2 (host waiting for the GPU 13.4, CPU
 experts 14.3, of which the GPU idles 8.5) + lm_head 2.72 + 2 draft passes 2.35 + rollback 0.17 + pick 0.1. --fast:
 31.5 ms for 2.58 tokens (GPU waits 5.5). Biggest part left: CPU experts (the third row's draft-only misses).
-Known gap: the "[mtp] per round ... experts needed" line counts only the per-layer path (zeros with the round graph).
+Fixed (bc74971): the "[mtp] per round ... experts needed" line now counts the round-graph path too.
+
+### CPU-expert cost of the MTP round (speed2, 2026-10-20)
+Profile (round graph, 4 prompts x 64, per round): 664 experts needed, 325 in VRAM; CPU misses: real token only 98,
+**draft only 196 (58%)**, both 46. Draft-only experts are real work (accepted drafts are real tokens): per committed
+token the MTP round reads ~130 CPU experts vs raw decode's 121 misses/token.
+CPU kernel (temporary MOEX_CPU_PROF probe, 8 threads, 42 calls/round, 8.1 experts/call): gate+up 9.2 ms wall (thread
+busy mean 8.62, max 9.12), down 4.9 ms (mean 4.32, max 4.85): wall = slowest thread, barriers ~free, imbalance ~1 ms
+per round. 43 / 41 GB/s vs 55-60 GB/s measured RAM peak. Finer down items (32 / 16 rows instead of 64): same or
+slower. 12/16 threads, no-barrier, ILP kernels were already measured (no gain).
+Tried, all dropped (noise band of one binary: 74.1-76.4 MTP tok/s):
+
+| option | result |
+|---|---|
+| a) row 0 first, next layer's GPU work for finished rows | not built: needs the next layer split by rows; the GPU's dense layer work is weight-read-bound (raw: ~13 ms / 40 layers at 1 row; round: 20.7 ms at 2.6 rows), so row 0 + rows 1-2 = ~30 ms GPU per round vs 29 ms wall today |
+| b) admission threshold for MTP (1.5 / 2.5 / 3.5) | 71.8 / 74.4 / 75.0: 2.5 kept (3.5 = noise, fewer hits) |
+| b) draft-row touches weighted 2x / 0.5x in the decayed count | 71.7 / 73.5 vs 74.3: dropped |
+| c) see profile above | ~1 ms imbalance, kernel at ~75% of RAM peak |
+| lossy: skip draft-row CPU pairs rank>=4 & w<0.1 (no --fast) | 82.9 tok/s, KL 6.78e-3 / 98.5% (default 2.46e-3 / 99.1%) |
+| lossy: same, on top of --fast | 80.2 -> 82.5: MTP_DEFER already hides most of it |
+| lossy: --fast + defer draft-row CPU pairs rank>=4 / >=2 one layer | 81.3 -> 84.1 / 85.4, KL 3.80e-3 -> 6.30e-3 / 1.25e-2, top-1 98.8 -> 97.9 / 97.0% |
+
+None added to --fast: each costs more KL per % than --fast itself (+8-10% for 2.5e-3 -> 3.8e-3). The draft-row
+defer (MOEX_DDEFER=4, ~3 lines in round_layers) is the candidate if a "--faster" is wanted.
+Note: MTP KL/top-1 needs `--check ... --load --mtp` (without --mtp, --check runs raw steps).
