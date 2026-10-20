@@ -1713,6 +1713,15 @@ struct Engine {
                 if (per[e].empty() && sl < 0) adm.push_back(key);
                 per[e].push_back({p / TOPK, p, rwc_h[p]});
             }
+            if (T >= 2) {  // the [mtp] experts-needed line, as chunk_layer's vs_on
+                unsigned char rows_of[E] = {}, hit_e[E] = {};  // bit t: row t needs e
+                for (int p = 0; p < T * TOPK; p++) { rows_of[ridxc_h[p]] |= 1 << p / TOPK; hit_e[ridxc_h[p]] |= m >> p & 1; }
+                for (int e = 0; e < E; e++) {
+                    if (!rows_of[e]) continue;
+                    vs[0]++;
+                    vs[hit_e[e] ? 1 : rows_of[e] == 1 ? 2 : rows_of[e] & 1 ? 4 : 3]++;
+                }
+            }
             std::vector<CpuExperts::Job> jobs, djobs;
             const bool can_defer = mtp_defer > 0 && l + 1 < NL;
             for (int e = 0; e < E; e++) {
@@ -1727,6 +1736,7 @@ struct Engine {
                 if (!dj.pids.empty()) djobs.push_back(std::move(dj));
             }
             const double c0 = now();
+            if (T >= 2) vt[0] += c0 - w1;
             if (!jobs.empty()) cpu.run_pairs_small(jobs, rows_h, T, ypair_cpu.data());
             for (int t = 0; t < T; t++) {  // rank order per row, as chunk_layer
                 float* y = ycpu_h + (size_t)t * D;
@@ -1742,6 +1752,7 @@ struct Engine {
             md_pending = false;
             if (!djobs.empty()) { md_jobs = std::move(djobs); memcpy(md_rows.data(), rows_h, (size_t)T * D * 4); md_T = T; md_pending = true; }
             cpu_s += now() - c0; pt[2] += now() - c0;
+            const double a0 = now();
             if (l == stall_layer() && mtp_rounds % stall_every() == 0) std::this_thread::sleep_for(std::chrono::milliseconds(stall_ms()));
             std::atomic_thread_fence(std::memory_order_seq_cst);  // ycpu_h before the flag
             *(volatile int*)&dflag_h[l] = 2 * seq + has;
@@ -1760,6 +1771,7 @@ struct Engine {
                         for (int d = 0; d < D; d++) md_y[(size_t)jb.toks[k] * D + d] += md_yp[(size_t)jb.pids[k] * D + d];
                 cpu_s += now() - m0; pt[2] += now() - m0;
             }
+            if (T >= 2) vt[1] += now() - a0;
         }
         for (const double w0 = now(); ((volatile int*)abort_h)[1] != seq && ((volatile int*)abort_h)[0] != seq; _mm_pause())
             if (now() - w0 > 10.0) { CK(cudaStreamSynchronize(cs)); fprintf(stderr, "mtp: the round graph never finished\n"); exit(1); }
