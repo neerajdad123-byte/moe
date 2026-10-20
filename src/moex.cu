@@ -1299,6 +1299,15 @@ struct Engine {
                     CK(cudaGraphLaunch(g, cs));
                 } else pre();
                 lap(0);
+                if (verify && md_pending) {  // the previous layer's deferred CPU pairs, while the GPU runs this layer's mixer
+                    const double m0 = now();
+                    std::fill(md_y.begin(), md_y.begin() + (size_t)md_T * D, 0.f);
+                    cpu.run_pairs_small(md_jobs, md_rows.data(), md_T, md_yp.data());
+                    for (auto& jb : md_jobs)
+                        for (size_t k = 0; k < jb.pids.size(); k++)
+                            for (int d = 0; d < D; d++) md_y[(size_t)jb.toks[k] * D + d] += md_yp[(size_t)jb.pids[k] * D + d];
+                    cpu_s += now() - m0; pt[2] += now() - m0;
+                }
                 double w0 = now();
                 if (verify) CK(cudaEventSynchronize(ev_route)); else CK(cudaStreamSynchronize(cs));
                 pt[0] += now() - w0;
@@ -1406,6 +1415,22 @@ struct Engine {
                 // CPU: non-resident experts, each read once for all of its tokens, overlapped with the above
                 double c1 = now();
                 if (vs_on) vt[0] += c1 - hb0;
+                // MOEX_MTP_DEFER=k: pairs at router rank >= k run during the next layer's GPU work (not the last layer)
+                char dpair[VT * TOPK] = {};
+                std::vector<CpuExperts::Job> djobs;
+                if (verify && mtp_defer > 0 && l + 1 < NL) {
+                    for (auto& jb : jobs) {
+                        CpuExperts::Job u{jb.q, jb.sc, {}, {}, {}}, dj{jb.q, jb.sc, {}, {}, {}};
+                        for (size_t k = 0; k < jb.pids.size(); k++) {
+                            CpuExperts::Job& to = jb.pids[k] % TOPK >= mtp_defer ? dj : u;
+                            to.toks.push_back(jb.toks[k]); to.pids.push_back(jb.pids[k]); to.ws.push_back(jb.ws[k]);
+                        }
+                        for (int p : dj.pids) dpair[p] = 1;
+                        if (!dj.pids.empty()) djobs.push_back(std::move(dj));
+                        jb = std::move(u);
+                    }
+                    jobs.erase(std::remove_if(jobs.begin(), jobs.end(), [](const CpuExperts::Job& j) { return j.pids.empty(); }), jobs.end());
+                }
                 if (verify) cpu.run_pairs_small(jobs, rows_h, T, ypair_cpu.data());  // the MTP round: int8 kernel, as decode
                 else cpu.run_pairs(jobs, rows_h, T, T * TOPK, ypair_cpu.data());
                 lap(5);
@@ -1414,10 +1439,17 @@ struct Engine {
                     std::fill(y, y + D, 0.f);
                     for (int r = 0; r < TOPK; r++) {
                         int e = ridxc_h[t * TOPK + r];
-                        if (job_of[e] < 0) continue;
+                        if (job_of[e] < 0 || (verify && dpair[t * TOPK + r])) continue;  // dpair: verify rows only (T <= VT)
                         const float* yp = ypair_cpu.data() + (size_t)(t * TOPK + r) * D;
                         for (int d = 0; d < D; d++) y[d] += yp[d];
                     }
+                    if (md_pending) for (int d = 0; d < D; d++) y[d] += md_y[(size_t)t * D + d];  // the previous layer's deferred part
+                }
+                md_pending = false;
+                if (!djobs.empty()) {  // run at the start of the next layer (rows_h is overwritten by its routing export)
+                    md_jobs = std::move(djobs);
+                    memcpy(md_rows.data(), rows_h, (size_t)T * D * 4);
+                    md_T = T; md_pending = true;
                 }
                 cpu_s += now() - c1;
                 pt[2] += now() - c1;
@@ -1450,6 +1482,14 @@ struct Engine {
     // MTP round profile, main layers only: unique experts needed, hits, misses used by the real token only, the draft
     // only, both; host time building the work before the CPU starts, and after it (launches + admissions)
     double vs[5] = {}, vt[2] = {};
+    // MOEX_MTP_DEFER=k (opt-in, approximate): the MTP round's CPU pairs at router rank >= k are computed during the next
+    // layer's GPU work and enter the residual one layer late (as MOEX_DEFER in decode)
+    const int mtp_defer = getenv("MOEX_MTP_DEFER") ? atoi(getenv("MOEX_MTP_DEFER")) : 0;
+    std::vector<CpuExperts::Job> md_jobs;
+    std::vector<float> md_rows = std::vector<float>((size_t)VT * D), md_y = std::vector<float>((size_t)VT * D),
+                       md_yp = std::vector<float>((size_t)VT * TOPK * D);
+    bool md_pending = false;
+    int md_T = 0;
     std::vector<int> admits_todo;
     cudaGraphExec_t vgraph[VT][NL + 1] = {};  // MTP round: per (rows - 1, layer), see chunk_layer
     // MOEX_CALIB=dir (research): prefill appends each dense matrix's input rows (fp16) to dir/<group>.L<layer>.f16
