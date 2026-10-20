@@ -966,3 +966,23 @@ MTP round at 1K (default): 29.5 ms for 1.91 tokens = 40 layers 24 (GPU 10.3, CPU
 5.4, host overhead ~2.9) + lm_head 2.4 + draft layer 3.1 (2.4 of it the full lm_head: hence the ranked draft vocab).
 CPU misses per round: real-token only 105, draft only 112, shared 30 (already read once for both rows).
 Next: CUDA graph per MTP window (2-3 rows; removes ~2.9 ms of host work per round); decide which opt-ins become default.
+
+### Defaults decided by the user + MTP round graph (speed2, 2026-10-20)
+Commits: 350c8d0 ranked 32K draft vocab default (built-in src/draft_rank.h); d41e645 MTP GPU-wait in the per-prompt
+line; e400f18 MTP2=0.5 default (audit below); 45494fe MOEX_FAST=0.05 default; 5327af8 --fast (= MOEX_DEFER=6 +
+MOEX_MTP_DEFER=6); 156c28d MTP round graph (MOEX_ROUND_GRAPH=0 = per-layer).
+MTP2 audit (55 prompts x 64 greedy tokens vs raw): 1-draft MTP and MTP2 both diverge on 17/55 prompts, the MTP run took
+raw's top-2 in 15/17 and 16/17, raw gaps median 0.28 / 0.25 logits: residency-dependent CPU int8 vs GPU numerics, the
+same with or without the second draft. Teacher-forced 2-draft --check (incl. forced rollbacks to rows 0 / 1) = 1-draft KL.
+
+Final, 4 prompts (1K + 3 short) x 64 tokens, warm-up, alternating, 2 rounds (156c28d):
+
+| | raw tok/s | MTP tok/s | acceptance | KL / top-1 raw | KL / top-1 MTP |
+|---|---|---|---|---|---|
+| default | 56.5 / 56.6 | **75.4 / 76.9** | 88.6 / 91.3% | 2.77e-3 / 99.7% | 2.49e-3 / 99.4% |
+| --fast | 59.5 / 59.5 | **83.7 / 81.4** | 90.9 / 86.1% | 3.58e-3 / 99.4% | 3.68e-3 / 98.2% |
+
+MTP round (default, 74.4 tok/s run): 34.6 ms for 2.62 tokens = 40 layers 29.2 (host waiting for the GPU 13.4, CPU
+experts 14.3, of which the GPU idles 8.5) + lm_head 2.72 + 2 draft passes 2.35 + rollback 0.17 + pick 0.1. --fast:
+31.5 ms for 2.58 tokens (GPU waits 5.5). Biggest part left: CPU experts (the third row's draft-only misses).
+Known gap: the "[mtp] per round ... experts needed" line counts only the per-layer path (zeros with the round graph).
