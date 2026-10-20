@@ -1498,9 +1498,10 @@ struct Engine {
         set_int_k<<<1, 1, 0, cs>>>(pos_d, pos);
         chunk_layer(NL, T, pt, verify);
         rmsnorm(Xc + (size_t)(T - 1) * D, moec + (size_t)(T - 1) * D, mtp_norm, h, D, EPS, 1, cs);
-        gemv(lm_head, h, dlog, D, V, cs);  // own buffer: logits[] holds the real model's last scores
-        argmax(dlog, V, amv, ams, ids_hd, cs);
-        if (conf) sumexp_k<<<ARGMAX_BLOCKS, 256, 0, cs>>>(dlog, V, amv + ARGMAX_BLOCKS, sexp_hd);
+        // the draft scores only the first draft_v vocab rows (BPE ids ~ frequency order; the full lm_head verifies)
+        gemv(lm_head, h, dlog, D, draft_v, cs);  // own buffer: logits[] holds the real model's last scores
+        argmax(dlog, draft_v, amv, ams, ids_hd, cs);
+        if (conf) sumexp_k<<<ARGMAX_BLOCKS, 256, 0, cs>>>(dlog, draft_v, amv + ARGMAX_BLOCKS, sexp_hd);
         CK(cudaStreamSynchronize(cs));
         if (conf) { double s = 0; for (int i = 0; i < ARGMAX_BLOCKS; i++) s += sexp_h[i]; *conf = 1.0 / s; }
         return ids_h[0];
@@ -1508,6 +1509,8 @@ struct Engine {
     // MOEX_MTP2=theta (opt-in, greedy): a second draft per round by running the MTP layer once more on the first draft
     // (fed its own output state); proposed only when the head gives it probability >= theta. Verified as a 3-row round.
     const double mtp2 = getenv("MOEX_MTP2") ? atof(getenv("MOEX_MTP2")) : 0.0;
+    // MOEX_DRAFT_VOCAB=N: the draft head's vocabulary (rows 0 .. N-1 of lm_head; default all V)
+    const int draft_v = getenv("MOEX_DRAFT_VOCAB") ? std::clamp(atoi(getenv("MOEX_DRAFT_VOCAB")), 1024, V) : V;
     float *sexp_h = nullptr, *sexp_hd = nullptr;
     long long m2_tried = 0, m2_used = 0;
 
