@@ -1558,9 +1558,10 @@ struct Engine {
         if (conf) { double s = 0; for (int i = 0; i < ARGMAX_BLOCKS; i++) s += sexp_h[i]; *conf = 1.0 / s; }
         return draft_map.empty() ? ids_h[0] : draft_map[ids_h[0]];
     }
-    // MOEX_MTP2=theta (opt-in, greedy): a second draft per round by running the MTP layer once more on the first draft
-    // (fed its own output state); proposed only when the head gives it probability >= theta. Verified as a 3-row round.
-    const double mtp2 = getenv("MOEX_MTP2") ? atof(getenv("MOEX_MTP2")) : 0.0;
+    // MOEX_MTP2=theta (default 0.5, 0 = off; greedy): a second draft per round by running the MTP layer once more on the
+    // first draft (fed its own output state); proposed only when the head gives it probability >= theta, verified as a
+    // 3-row round. Teacher-forced checks with 2 drafts (and forced rollbacks to rows 0 / 1) match 1-draft KL (PLAN.md).
+    const double mtp2 = getenv("MOEX_MTP2") ? atof(getenv("MOEX_MTP2")) : 0.5;
     // The MTP draft head scores draft_v vocabulary rows (default 32768; MOEX_DRAFT_VOCAB=N, V = the full lm_head): the
     // ids the model generates most (src/draft_rank.h, or MOEX_DRAFT_RANK=file from tools/draft_rank.py), then the rest
     // in id order, gathered from lm_head at load (54 MB). Exact: the full lm_head verifies. Measured: draft layer
@@ -1698,6 +1699,15 @@ struct Engine {
     // logits[] is being computed on cs; returns the next token.
     int pick_token() {
         std::vector<TokP> p = token_dist();
+        // audit (MOEX_GAPLOG=file, greedy): per picked token "top-1 id, top-2 id, logit gap" (near-tie checks)
+        static FILE* gl = getenv("MOEX_GAPLOG") ? fopen(getenv("MOEX_GAPLOG"), "w") : nullptr;
+        if (gl && samp.temp <= 0.f) {
+            std::vector<float> lg(V);
+            CK(cudaMemcpy(lg.data(), logits, V * 4, cudaMemcpyDeviceToHost));
+            int a = 0, b = -1;
+            for (int i = 1; i < V; i++) if (lg[i] > lg[a]) { b = a; a = i; } else if (b < 0 || lg[i] > lg[b]) b = i;
+            fprintf(gl, "%d %d %.6f\n", a, b, lg[a] - lg[b]); fflush(gl);
+        }
         return samp.temp <= 0.f ? p[0].id : sample_from(p, rng);
     }
     // The distribution the next token is drawn from: greedy {argmax: 1}; sampled: the candidates top-k / top-p keep,
@@ -2200,7 +2210,7 @@ int main(int argc, char** argv) {
         std::vector<std::vector<float>> pend; std::vector<int> pend_id;
         int pend_pos = -1;
         // teacher-forced drafts per round: 1 (the head's slot), or MOEX_NGRAM_MAX with MOEX_NGRAM set (multi-token rounds)
-        const int KCHK = eng.ngram.nmin ? eng.dlen.kmax : 1;
+        const int KCHK = eng.ngram.nmin ? eng.dlen.kmax : eng.mtp2 > 0 ? 2 : 1;  // MOEX_MTP2: 3-row rounds
         // MOEX_CHECK_DUMP=1: write this run's logits as the reference files (with --f16: a reference for new prompts)
         const bool dump = getenv("MOEX_CHECK_DUMP") != nullptr;
         for (;; pos++) {
