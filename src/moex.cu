@@ -31,6 +31,7 @@
 #include "st.h"
 #include "kernels.cuh"
 #include "cpu_expert.h"
+#include "draft_rank.h"
 #include "spec.h"
 #include "dense_ovr.h"
 #include <nvtx3/nvToolsExt.h>  // header-only; ranges show in Nsight Systems, no-ops otherwise
@@ -1560,20 +1561,21 @@ struct Engine {
     // MOEX_MTP2=theta (opt-in, greedy): a second draft per round by running the MTP layer once more on the first draft
     // (fed its own output state); proposed only when the head gives it probability >= theta. Verified as a 3-row round.
     const double mtp2 = getenv("MOEX_MTP2") ? atof(getenv("MOEX_MTP2")) : 0.0;
-    // MOEX_DRAFT_VOCAB=N: the draft head's vocabulary (rows 0 .. N-1 of lm_head; default all V)
-    const int draft_v = getenv("MOEX_DRAFT_VOCAB") ? std::clamp(atoi(getenv("MOEX_DRAFT_VOCAB")), 1024, V) : V;
-    // MOEX_DRAFT_RANK=file (ids, most generated first; tools/draft_rank.py): the draft head holds those draft_v rows of
-    // lm_head (ids not in the file follow in id order), gathered at load
+    // The MTP draft head scores draft_v vocabulary rows (default 32768; MOEX_DRAFT_VOCAB=N, V = the full lm_head): the
+    // ids the model generates most (src/draft_rank.h, or MOEX_DRAFT_RANK=file from tools/draft_rank.py), then the rest
+    // in id order, gathered from lm_head at load (54 MB). Exact: the full lm_head verifies. Measured: draft layer
+    // 3.1 -> 1.06 ms/round, acceptance 91.0 -> 88.9%, MTP 63.4 -> 66.8 tok/s (PLAN.md).
+    const int draft_v = getenv("MOEX_DRAFT_VOCAB") ? std::clamp(atoi(getenv("MOEX_DRAFT_VOCAB")), 1024, V) : 32768;
     Mat draft_head;
     std::vector<int> draft_map;  // draft row -> token id
     void build_draft_head() {
         const char* f = getenv("MOEX_DRAFT_RANK");
-        if (!f || draft_v >= V || f16 || lm_head.q4) return;
+        if (draft_v >= V || f16 || lm_head.q4) return;
         std::vector<char> seen(V, 0);
-        if (FILE* fp = fopen(f, "r")) {
-            for (int t; (int)draft_map.size() < draft_v && fscanf(fp, "%d", &t) == 1;) if (t >= 0 && t < V && !seen[t]) { seen[t] = 1; draft_map.push_back(t); }
-            fclose(fp);
-        } else { fprintf(stderr, "[mtp] cannot read %s: full draft vocabulary\n", f); return; }
+        auto add = [&](int t) { if ((int)draft_map.size() < draft_v && t >= 0 && t < V && !seen[t]) { seen[t] = 1; draft_map.push_back(t); } };
+        if (!f) for (int t : DRAFT_RANK) add(t);
+        else if (FILE* fp = fopen(f, "r")) { for (int t; fscanf(fp, "%d", &t) == 1;) add(t); fclose(fp); }
+        else { fprintf(stderr, "[mtp] cannot read %s: full draft vocabulary\n", f); return; }
         for (int t = 0; (int)draft_map.size() < draft_v; t++) if (!seen[t]) draft_map.push_back(t);
         int* ids_d; CK(cudaMalloc(&ids_d, draft_v * 4)); CK(cudaMemcpy(ids_d, draft_map.data(), draft_v * 4, cudaMemcpyHostToDevice));
         auto take = [&](const void* src, int row_bytes) {
@@ -1584,7 +1586,7 @@ struct Engine {
         if (lm_head.q6) { draft_head.q6 = take(lm_head.q6, D / 2); draft_head.q6h = take(lm_head.q6h, D / 4); draft_head.s = (const float*)take(lm_head.s, D / 64 * 4); }
         else { draft_head.q = (const int8_t*)take(lm_head.q, D); draft_head.s = (const float*)take(lm_head.s, 4); }
         CK(cudaDeviceSynchronize()); CK(cudaFree(ids_d));
-        fprintf(stderr, "[mtp] draft head: %d ranked rows of lm_head (%s)\n", draft_v, f);
+        if (!quiet) fprintf(stderr, "[mtp] draft head: %d ranked rows of lm_head (%s)\n", draft_v, f ? f : "built-in ranking");
     }
     float *sexp_h = nullptr, *sexp_hd = nullptr;
     long long m2_tried = 0, m2_used = 0;
