@@ -5,7 +5,9 @@
 #include <cstdint>
 #include <algorithm>
 
-#define CK(x) do { cudaError_t e_ = (x); if (e_ != cudaSuccess) { \
+// g_soft_ck set (graph capture, Engine::try_capture): CK records the first error there instead of exiting
+inline cudaError_t* g_soft_ck = nullptr;
+#define CK(x) do { cudaError_t e_ = (x); if (e_ != cudaSuccess) { if (g_soft_ck) { if (!*g_soft_ck) *g_soft_ck = e_; break; } \
     fprintf(stderr, "CUDA %s at %s:%d\n", cudaGetErrorString(e_), __FILE__, __LINE__); exit(1); } } while (0)
 
 __device__ __forceinline__ float warp_sum(float v) {

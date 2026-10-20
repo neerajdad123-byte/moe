@@ -992,7 +992,10 @@ struct Engine {
         if (full) export_signal_k<<<1, 256, 0, cs>>>(h, ridx, rw, h_hd, ids_hd, w_hd, D, TOPK, seq_d, rflag_hd + l);
         else {
             export_route_k<<<(D + 255) / 256, 256, 0, cs>>>(h, ridx, rw, h_hd, ids_hd, w_hd, D, TOPK);
-            CK(cudaEventRecordWithFlags(ev_route, cs, cudaEventRecordExternal));  // host-visible even from a graph
+            cudaStreamCaptureStatus cst;  // External: host-visible even from a graph (only valid while capturing)
+            CK(cudaStreamIsCapturing(cs, &cst));
+            if (cst == cudaStreamCaptureStatusActive) CK(cudaEventRecordWithFlags(ev_route, cs, cudaEventRecordExternal));
+            else CK(cudaEventRecord(ev_route, cs));
         }
         // resident experts + shared expert, no host in the loop
         experts_forward(slots_d, hw_d, TOPK, h, act, moe, cs, nh_d);
@@ -1020,6 +1023,38 @@ struct Engine {
     long long fallbacks = 0;        // tokens finished on the per-layer path after such a timeout
     long long *waited_h, *waited_hd;  // per layer, ns the GPU waited for the host's CPU result (GPU clock)
     double gpu_wait_s = 0;            // their sum over tokens
+    // Captures enqueue()'s work into a graph. A CUDA error (a GPU / driver the graphs don't work on) returns nullptr
+    // instead of exiting, and the caller keeps the path without that graph. Test: MOEX_TEST_GRAPH_FAIL=<part of the name>.
+    template <class F> cudaGraphExec_t try_capture(const char* what, F enqueue) {
+        cudaError_t err = cudaStreamBeginCapture(cs, cudaStreamCaptureModeThreadLocal);
+        cudaGraph_t gr = nullptr;
+        cudaGraphExec_t ex = nullptr;
+        if (!err) {  // never enqueue uncaptured: the work would run now
+            g_soft_ck = &err;
+            enqueue();
+            CK(cudaGetLastError());
+            g_soft_ck = nullptr;
+            const cudaError_t e2 = cudaStreamEndCapture(cs, &gr);
+            if (!err) err = e2;
+            if (!err && getenv("MOEX_TEST_GRAPH_FAIL") && strstr(what, getenv("MOEX_TEST_GRAPH_FAIL"))) err = cudaErrorNotSupported;
+            if (!err) err = cudaGraphInstantiate(&ex, gr, 0);
+            if (gr) cudaGraphDestroy(gr);
+        }
+        if (!err) return ex;
+        cudaGetLastError();
+        if (ex) cudaGraphExecDestroy(ex);
+        static const char* told = nullptr;  // once per graph kind (40 layer graphs)
+        if (told != what && (told = what)) fprintf(stderr, "[graph] %s: CUDA %s while capturing it: using the path without it (slower)\n", what, cudaGetErrorString(err));
+        return nullptr;
+    }
+    // Runtime watchdog of the step / round graph: spin timeouts in 3 rounds in a row (a host or driver that can't keep
+    // up with the GPU's waits) turn that graph off for the rest of the run.
+    static void graph_watch(bool timed_out, int& streak, bool& off, const char* what) {
+        streak = timed_out ? streak + 1 : 0;
+        if (streak >= 3 && !off) { off = true; fprintf(stderr, "[graph] %s: 3 spin timeouts in a row: using the per-layer path\n", what); }
+    }
+    bool sgraph_off = false, rgraph_off = false;
+    int sgraph_streak = 0, rgraph_streak = 0;
     void capture_graphs() {
         if (!low_ram && !rc_n && !ahead_k && !(getenv("MOEX_STEP_GRAPH") && atoi(getenv("MOEX_STEP_GRAPH")) == 0)) {
             CK(cudaMalloc(&seq_d, 4)); CK(cudaMemset(seq_d, 0, 4));
@@ -1030,21 +1065,11 @@ struct Engine {
             memset(rflag_h, 0, NL * 4); memset(dflag_h, 0, NL * 4); abort_h[0] = abort_h[1] = 0;
             if (getenv("MOEX_SPIN_MS")) spin_ns = (long long)(atof(getenv("MOEX_SPIN_MS")) * 1e6);
             CK(cudaGetSymbolAddress((void**)&skip_d, g_skip));
-            cudaGraph_t g;
-            CK(cudaStreamBeginCapture(cs, cudaStreamCaptureModeThreadLocal));
-            for (int l = 0; l < NL; l++) enqueue_layer(l, true);
-            CK(cudaStreamEndCapture(cs, &g));
-            CK(cudaGraphInstantiate(&step_graph, g, 0));
-            CK(cudaGraphDestroy(g));
+            step_graph = try_capture("decode step graph", [&] { for (int l = 0; l < NL; l++) enqueue_layer(l, true); });
         }
         graphs.resize(NL);
         for (int l = 0; l < NL; l++) {
-            cudaGraph_t g;
-            CK(cudaStreamBeginCapture(cs, cudaStreamCaptureModeThreadLocal));
-            enqueue_layer(l);
-            CK(cudaStreamEndCapture(cs, &g));
-            CK(cudaGraphInstantiate(&graphs[l], g, 0));
-            CK(cudaGraphDestroy(g));
+            graphs[l] = try_capture("layer graph", [&] { enqueue_layer(l); });
         }
     }
 
@@ -1651,7 +1676,7 @@ struct Engine {
     static int stall_layer() { static const int v = stall_env() ? atoi(stall_env()) : -1; return v; }
     static int stall_ms() { static const int v = stall_env() && strchr(stall_env(), ':') ? atoi(strchr(stall_env(), ':') + 1) : 0; return v; }
     static int stall_every() { static const int v = stall_env() && strrchr(stall_env(), ':') != strchr(stall_env(), ':') ? std::max(1, atoi(strrchr(stall_env(), ':') + 1)) : 1; return v; }
-    void round_layers(int T, double* pt) {
+    bool round_layers(int T, double* pt) {  // false: the round graph didn't run (the caller runs the per-layer path)
         rows_T = T;
         if (!r_items) {
             CK(cudaMalloc(&r_items, VT * TOPK * sizeof(PairItem))); CK(cudaMalloc(&r_pairs, VT * TOPK * sizeof(Pair)));
@@ -1661,9 +1686,7 @@ struct Engine {
         cudaGraphExec_t& g = rgraph[T];
         if (!g) {
             vcaptured = true;
-            cudaGraph_t gr;
-            CK(cudaStreamBeginCapture(cs, cudaStreamCaptureModeThreadLocal));
-            for (int l = 0; l < NL; l++) {
+            g = try_capture("MTP round graph", [&] { for (int l = 0; l < NL; l++) {
                 pre_layer(l, T, true, false);
                 route_export_k<<<1, 256, 0, cs>>>(hc, ridxc, rwc, T, TOPK, D, l * E, table_d, r_items, r_pairs, r_nitems,
                                                   rows_d, ridxc_d, rwc_d, hmask_hd, seq_d, rflag_hd + l);
@@ -1672,27 +1695,30 @@ struct Engine {
                 wait_add_k<<<1, 256, 0, cs>>>(nullptr, nullptr, seq_d, dflag_hd + l, 0, abort_hd, l, NL, spin_ns, rwait_hd, r_use);
                 pairs_reduce_k<<<dim3((D + 255) / 256, T), 256, 0, cs>>>(ypair, ycpu_d, moec, TOPK, D, r_use);
                 gated_add_rows_k<<<dim3((D + 255) / 256, T), 256, 0, cs>>>(moec, shs, shl, D);
-            }
-            CK(cudaStreamEndCapture(cs, &gr));
-            CK(cudaGraphInstantiate(&g, gr, 0));
-            CK(cudaGraphDestroy(gr));
+            } });
+            if (!g) { rgraph_off = true; return false; }
         }
         poll_admissions();
         flush_table();
         set_int_k<<<1, 1, 0, cs>>>(seq_d, ++seq);
         set_int_k<<<1, 1, 0, cs>>>(skip_d, 0);
-        CK(cudaGraphLaunch(g, cs));
+        if (cudaGraphLaunch(g, cs) != cudaSuccess) {  // nothing of it ran
+            cudaGetLastError(); rgraph_off = true;
+            fprintf(stderr, "[graph] MTP round graph: launch failed: using the per-layer path\n");
+            return false;
+        }
         std::vector<int> adm;
         for (int l = 0; l < NL; l++) {
             const double w0 = now();
             while (*(volatile int*)&rflag_h[l] != seq) {
                 if (*(volatile int*)abort_h == seq) {  // the GPU gave up waiting on layer l - 1
                     round_fallbacks++;
+                    graph_watch(true, rgraph_streak, rgraph_off, "MTP round graph");
                     round_tail(l - 1);
                     for (int key : adm) if (slot_of[key] < 0) admit(key);
                     start_admissions();
                     for (int l2 = l; l2 < NL; l2++) chunk_layer(l2, T, pt, true);
-                    return;
+                    return true;
                 }
                 if (now() - w0 > 10.0) { CK(cudaStreamSynchronize(cs)); fprintf(stderr, "mtp: layer %d's routing never arrived\n", l); exit(1); }
                 _mm_pause();
@@ -1775,10 +1801,13 @@ struct Engine {
         }
         for (const double w0 = now(); ((volatile int*)abort_h)[1] != seq && ((volatile int*)abort_h)[0] != seq; _mm_pause())
             if (now() - w0 > 10.0) { CK(cudaStreamSynchronize(cs)); fprintf(stderr, "mtp: the round graph never finished\n"); exit(1); }
-        if (((volatile int*)abort_h)[0] == seq) { round_fallbacks++; round_tail(NL - 1); }
+        const bool timed_out = ((volatile int*)abort_h)[0] == seq;
+        graph_watch(timed_out, rgraph_streak, rgraph_off, "MTP round graph");
+        if (timed_out) { round_fallbacks++; round_tail(NL - 1); }
         else for (int l = 0; l < NL; l++) mtp_gwait += ((volatile long long*)rwait_h)[l] * 1e-9;
         for (int key : adm) if (slot_of[key] < 0) admit(key);
         start_admissions();
+        return true;
     }
 
     // One MTP decode round: feeds y at position p and the K drafts at p+1.. together (K = 1: the head's draft). Returns
@@ -1811,8 +1840,8 @@ struct Engine {
         }
         copy_k<<<(T * D + 255) / 256, 256, 0, cs>>>(Xc, rows_d, T * D);
         set_int_k<<<1, 1, 0, cs>>>(pos_d, p);
-        if (step_graph && !prof && !trace && !(getenv("MOEX_ROUND_GRAPH") && atoi(getenv("MOEX_ROUND_GRAPH")) == 0)) round_layers(T, pt);
-        else for (int l = 0; l < NL; l++) chunk_layer(l, T, pt, true);
+        if (!(step_graph && !prof && !trace && !rgraph_off && !(getenv("MOEX_ROUND_GRAPH") && atoi(getenv("MOEX_ROUND_GRAPH")) == 0) && round_layers(T, pt)))
+            for (int l = 0; l < NL; l++) chunk_layer(l, T, pt, true);
         CK(cudaStreamSynchronize(cs)); mt[1] += now() - t0; t0 = now();
         vpt[0] += pt[0]; vpt[1] += pt[2];
         rmsnorm(Xc, moec, norm, hc, D, EPS, T, cs);  // Xc = final hidden at p .. p+K
@@ -1967,6 +1996,7 @@ struct Engine {
             while (*(volatile int*)&rflag_h[l] != seq) {
                 if (*(volatile int*)abort_h == seq) {  // the GPU gave up waiting on layer l - 1: finish on the per-layer path
                     fallbacks++;
+                    graph_watch(true, sgraph_streak, sgraph_off, "decode step graph");
                     set_int_k<<<1, 1, 0, cs>>>(skip_d, 0);  // after the rest of the graph, before the per-layer kernels
                     if (yd_pending) { for (int i = 0; i < D; i++) y_h[i] = (y_pending ? y_h[i] : 0.f) + yd[i]; y_pending = true; yd_pending = false; }
                     if (y_pending) add_k<<<(D + 255) / 256, 256, 0, cs>>>(moe, y_hd, D);
@@ -2032,6 +2062,7 @@ struct Engine {
         // the last layer's wait: passed, or timed out (then its CPU result is added here)
         for (const double w0 = now(); ((volatile int*)abort_h)[1] != seq && ((volatile int*)abort_h)[0] != seq; _mm_pause())
             if (now() - w0 > 10.0) { CK(cudaStreamSynchronize(cs)); fprintf(stderr, "decode: the step graph never finished\n"); exit(1); }
+        graph_watch(((volatile int*)abort_h)[0] == seq, sgraph_streak, sgraph_off, "decode step graph");
         if (((volatile int*)abort_h)[0] == seq) { fallbacks++; set_int_k<<<1, 1, 0, cs>>>(skip_d, 0); if (y_pending) add_k<<<(D + 255) / 256, 256, 0, cs>>>(moe, y_hd, D); }
         else for (int l = 0; l < NL; l++) gpu_wait_s += ((volatile long long*)waited_h)[l] * 1e-9;
         rmsnorm(x, moe, norm, h, D, EPS, 1, cs);
@@ -2046,7 +2077,7 @@ struct Engine {
 
     // from > 0: the rest of a token whose whole-step graph stopped before layer `from` (step_full)
     int step(int tok, int pos, bool want_logits, int from = 0) {
-        if (!from && step_graph && !prof && !trace && !trace_ahead) return step_full(tok, pos, want_logits);
+        if (!from && step_graph && !sgraph_off && !prof && !trace && !trace_ahead) return step_full(tok, pos, want_logits);
         struct Range { Range() { nvtxRangePushA("decode"); } ~Range() { nvtxRangePop(); } } range;
         double t = now();
         if (!from) {
@@ -2060,7 +2091,7 @@ struct Engine {
             double h0 = now();
             poll_admissions();
             flush_table();  // the GPU's view of residency for this layer == the host's ready[] below
-            if (prof || graphs.empty()) enqueue_layer(l); else CK(cudaGraphLaunch(graphs[l], cs));
+            if (prof || graphs.empty() || !graphs[l]) enqueue_layer(l); else CK(cudaGraphLaunch(graphs[l], cs));
             double h1 = now();
             CK(cudaEventSynchronize(ev_route));  // host needs the routing only for the misses
             double h2 = now();
