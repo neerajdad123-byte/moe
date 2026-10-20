@@ -1034,3 +1034,23 @@ any context; a longer context costs expert slots (1692 at 4K -> 1500 at 32K, raw
 MTP acceptance on these summaries is ~66% (vs ~89% on the short dec4 set), so MTP gains +14% here (+33% there).
 Open: one segfault in raw --fast (1K set, prompt 15 of 16) in the first attempt; not reproduced in 5 more runs and
 2 full long runs (the second with a crash handler + pdb).
+
+### Release checklist + final table (speed2, 2026-10-20)
+Commits: bc74971 [mtp] experts-needed line counts the round graph; cd82e27 crash-safe graph fallback (capture /
+instantiate / launch error -> path without that graph, 3 spin timeouts in a row -> per-layer path; MOEX_TEST_GRAPH_FAIL
+tests it; fixed the no-graph raw path's event record on the way); f5dd22e auto defaults (CPU threads = cores, max 8;
+32 stages when the round graph can't run: low-RAM MTP 36.0 -> 36.8 tok/s); 0736617 tools/bench.py (one command).
+Graph gate: greedy hashes equal HEAD's in every mode, with each graph made to fail and with a 300 ms host stall every
+round (raw 58b4bd7a; MTP round graph 12750a75, per-layer b68fc4b5); test_kernels ALL PASS.
+
+Final, 4 prompts (1K + 3 short) x 64 tokens, warm-up, alternating, 2 rounds (f5dd22e); KL / top-1 over eval1 +
+code1 + agent1 (330 positions; MTP: `--check --load --mtp`):
+
+| | raw tok/s | MTP tok/s | acceptance | KL / top-1 raw | KL / top-1 MTP |
+|---|---|---|---|---|---|
+| default | 55.0 / 56.5 | **76.1 / 71.9** | 88.6 / 88.1% | 2.78e-3 / 99.1% | 2.46e-3 / 99.1% |
+| --fast | 60.1 / 59.9 | **82.2 / 80.3** | 90.3 / 87.6% | 3.73e-3 / 99.1% | 3.80e-3 / 98.8% |
+
+Targets 67 raw / 80 MTP: --fast MTP reaches 80; default MTP ~75, raw 56-60. Left: the draft rows' CPU experts (58%
+of a round's CPU reads) have no lossless fix found; the next lossy step (draft-row defer, +3.4%, KL 6.3e-3) is not in
+--fast.
