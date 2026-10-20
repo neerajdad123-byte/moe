@@ -1526,7 +1526,7 @@ struct Engine {
     double vs[5] = {}, vt[2] = {};
     // MOEX_MTP_DEFER=k (opt-in, approximate): the MTP round's CPU pairs at router rank >= k are computed during the next
     // layer's GPU work and enter the residual one layer late (as MOEX_DEFER in decode)
-    const int mtp_defer = getenv("MOEX_MTP_DEFER") ? atoi(getenv("MOEX_MTP_DEFER")) : 0;
+    int mtp_defer = getenv("MOEX_MTP_DEFER") ? atoi(getenv("MOEX_MTP_DEFER")) : 0;  // set_fast() switches it between prompts
     // MOEX_FAST=w (default 0.05, 0 = off; approximate): a CPU miss at router rank >= FAST_RANK with routing weight < w is
     // skipped. 0.05 is the largest weight within the KL budget (+0.25e-3, top-1 unchanged; 0.1: +3.3e-3, -1.2 pt).
     static constexpr int FAST_RANK = 6;
@@ -1973,8 +1973,8 @@ struct Engine {
     std::vector<int> adm_keys;
     // MOEX_DEFER=k (opt-in, approximate, 1..7): CPU misses at router rank >= k of layer l are computed while the GPU
     // runs layer l + 1 and enter the residual one layer late (with layer l + 1's MoE output). Never the last layer.
-    const int defer_rank = getenv("MOEX_DEFER") ? atoi(getenv("MOEX_DEFER")) : 0;
-    const bool defer = defer_rank > 0 && defer_rank < TOPK;
+    int defer_rank = getenv("MOEX_DEFER") ? atoi(getenv("MOEX_DEFER")) : 0;
+    void set_fast(bool on) { defer_rank = mtp_defer = on ? 6 : 0; }  // = --fast; between prompts (nothing deferred is pending then)
     std::vector<float> yd = std::vector<float>(D), hd = std::vector<float>(D);  // deferred result / its MoE input copy
     bool yd_pending = false;
     bool y_pending = false;  // the last layer's CPU result, in case the GPU timed out before adding it
@@ -2017,7 +2017,7 @@ struct Engine {
             clock++;
             int nm = 0, nd = 0;
             const uint8_t *mq[TOPK], *dq[TOPK]; const float *msc[TOPK], *dsc[TOPK]; float mw[TOPK], dw[TOPK];
-            const bool can_defer = defer && l + 1 < NL;
+            const bool can_defer = defer_rank > 0 && defer_rank < TOPK && l + 1 < NL;
             for (int j = 0; j < TOPK; j++) {
                 int key = l * E + ids_h[j], sl = slot_of[key];
                 touch(key);

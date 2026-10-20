@@ -19,5 +19,6 @@ copy /y %1 dist\moex\ > nul
 copy /y README.md dist\moex\ > nul
 copy /y LICENSE dist\moex\ > nul
 copy /y data\moex_hot.bin dist\moex\ > nul
+copy /y moex-bench.bat dist\moex\ > nul
 powershell -NoProfile -Command "Compress-Archive -Path dist\moex\* -DestinationPath dist\%2.zip -Force" || exit /b 1
 echo dist\%2.zip

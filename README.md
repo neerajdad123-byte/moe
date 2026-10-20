@@ -95,7 +95,7 @@ downloads to that folder instead.
 | `moex download` | download or resume the model |
 | `moex chat` | chat in the terminal |
 | `moex serve` | OpenAI-compatible API for other apps |
-| `moex bench` | measure speed on your PC (~2 min): low / average / high tok/s, a line to share, tips to go faster |
+| `moex bench` | measure speed on your PC (~2-4 min, one model load): MTP off, MTP on and --fast tok/s, your PC's specs, a line to share |
 | `moex install` | put moex on your PATH (for zip users) |
 | `moex help`, `-h`, `--help` | all commands and options |
 | `moex --version`, `-v` | the version |
@@ -200,7 +200,7 @@ expert in VRAM is one the CPU doesn't have to compute.
 | RTX 4050 Laptop, 6 GB | i7-13650HX | 24 GB | ~46 tokens/s |
 | RTX 4060 Laptop, 8 GB | i7-13th gen HX | 24 GB | ~60 tokens/s |
 
-Ran it on something else? Run `moex bench` (10 everyday questions, ~2 minutes) and paste the line it prints into a
+Ran it on something else? Run `moex bench` (or double-click `moex-bench.bat`: 3 everyday questions per setting, ~2-4 minutes) and paste the line it prints into a
 [benchmark report](https://github.com/neerajdad123-byte/moe/issues/new?template=benchmark.yml).
 
 ## How it works
