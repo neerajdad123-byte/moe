@@ -1491,9 +1491,10 @@ struct Engine {
     // MOEX_MTP_DEFER=k (opt-in, approximate): the MTP round's CPU pairs at router rank >= k are computed during the next
     // layer's GPU work and enter the residual one layer late (as MOEX_DEFER in decode)
     const int mtp_defer = getenv("MOEX_MTP_DEFER") ? atoi(getenv("MOEX_MTP_DEFER")) : 0;
-    // MOEX_FAST=w (opt-in, approximate): a CPU miss at router rank >= FAST_RANK with routing weight < w is skipped
+    // MOEX_FAST=w (default 0.05, 0 = off; approximate): a CPU miss at router rank >= FAST_RANK with routing weight < w is
+    // skipped. 0.05 is the largest weight within the KL budget (+0.25e-3, top-1 unchanged; 0.1: +3.3e-3, -1.2 pt).
     static constexpr int FAST_RANK = 6;
-    const double fast_w = getenv("MOEX_FAST") ? atof(getenv("MOEX_FAST")) : 0.0;
+    const double fast_w = getenv("MOEX_FAST") ? atof(getenv("MOEX_FAST")) : 0.05;
     long long fast_skipped = 0;
     std::vector<CpuExperts::Job> md_jobs;
     std::vector<float> md_rows = std::vector<float>((size_t)VT * D), md_y = std::vector<float>((size_t)VT * D),
