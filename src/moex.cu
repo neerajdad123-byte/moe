@@ -668,8 +668,14 @@ struct Engine {
     }
 
     // Start copying expert `key` into the lowest-scoring slot not used this layer step; skipped when all stages are busy.
+    // Admit only experts whose decayed use count (10-token half-life) is >= admit_min: an admission moves ~3x an
+    // expert's bytes through RAM (mmap -> pinned -> PCIe) while a CPU miss reads it once, and the CPU experts are
+    // RAM-bandwidth-bound. 2.5 measured best at 1K (raw 50.8 -> 56.0, MTP 58.7 -> 64.6; PLAN.md). Low-RAM mode
+    // (own RAM cache, SSD reads) keeps 0 = admit every miss. MOEX_ADMIT_MIN overrides.
+    double admit_min = 2.5;
     void admit(int key) {
         if (free_st.empty()) return;
+        if (admit_min > 0 && exp(G[key] - tokens / TAU) < admit_min) return;
         int s = -1; double best = INFINITY;
         for (int i = 0; i < nslots; i++) {
             double sc = owner[i] < 0 ? -INFINITY : G[owner[i]];
@@ -885,6 +891,7 @@ struct Engine {
             es[l * E + e] = (const float*)C.map(ep + "qs");
         }
         low_ram = low_ram_machine();
+        admit_min = getenv("MOEX_ADMIT_MIN") ? atof(getenv("MOEX_ADMIT_MIN")) : low_ram ? 0.0 : admit_min;
         rc_setup();
         if (pin_async) pinner = std::thread([this] { pin_experts_in_ram(); });  // until done, misses may page-fault
         else pin_experts_in_ram();
