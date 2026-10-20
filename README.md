@@ -200,7 +200,7 @@ expert in VRAM is one the CPU doesn't have to compute.
 | RTX 4050 Laptop, 6 GB | i7-13650HX | 24 GB | ~46 tokens/s |
 | RTX 4060 Laptop, 8 GB | i7-13th gen HX | 24 GB | ~60 tokens/s |
 
-Ran it on something else? Run `moex bench` (or double-click `moex-bench.bat`: 3 everyday questions per setting, ~2-4 minutes) and paste the line it prints into a
+Ran it on something else? Run `moex bench` (or just double-click moex.exe: 3 everyday questions per setting, ~2-4 minutes) and paste the line it prints into a
 [benchmark report](https://github.com/neerajdad123-byte/moe/issues/new?template=benchmark.yml).
 
 ## How it works
