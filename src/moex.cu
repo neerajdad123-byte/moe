@@ -1657,6 +1657,12 @@ struct Engine {
     // layer's done flag. Residency is frozen for the token (slot table flushed before the launch, admissions decided
     // after the last layer), so the GPU's hits and the host's misses always partition the top-8.
     std::vector<int> adm_keys;
+    // MOEX_DEFER=k (opt-in, approximate, 1..7): CPU misses at router rank >= k of layer l are computed while the GPU
+    // runs layer l + 1 and enter the residual one layer late (with layer l + 1's MoE output). Never the last layer.
+    const int defer_rank = getenv("MOEX_DEFER") ? atoi(getenv("MOEX_DEFER")) : 0;
+    const bool defer = defer_rank > 0 && defer_rank < TOPK;
+    std::vector<float> yd = std::vector<float>(D), hd = std::vector<float>(D);  // deferred result / its MoE input copy
+    bool yd_pending = false;
     bool y_pending = false;  // the last layer's CPU result, in case the GPU timed out before adding it
     int step_full(int tok, int pos, bool want_logits) {
         struct Range { Range() { nvtxRangePushA("decode"); } ~Range() { nvtxRangePop(); } } range;
@@ -1682,6 +1688,7 @@ struct Engine {
                 if (*(volatile int*)abort_h == seq) {  // the GPU gave up waiting on layer l - 1: finish on the per-layer path
                     fallbacks++;
                     set_int_k<<<1, 1, 0, cs>>>(skip_d, 0);  // after the rest of the graph, before the per-layer kernels
+                    if (yd_pending) { for (int i = 0; i < D; i++) y_h[i] = (y_pending ? y_h[i] : 0.f) + yd[i]; y_pending = true; yd_pending = false; }
                     if (y_pending) add_k<<<(D + 255) / 256, 256, 0, cs>>>(moe, y_hd, D);
                     for (int key : adm_keys) if (slot_of[key] < 0) admit(key);
                     start_admissions();
@@ -1693,23 +1700,38 @@ struct Engine {
             const double w1 = now();
             ht[1] += w1 - w0;
             clock++;
-            int nm = 0;
-            const uint8_t* mq[TOPK]; const float* msc[TOPK]; float mw[TOPK];
+            int nm = 0, nd = 0;
+            const uint8_t *mq[TOPK], *dq[TOPK]; const float *msc[TOPK], *dsc[TOPK]; float mw[TOPK], dw[TOPK];
+            const bool can_defer = defer && l + 1 < NL;
             for (int j = 0; j < TOPK; j++) {
                 int key = l * E + ids_h[j], sl = slot_of[key];
                 touch(key);
                 if (sl >= 0) last[sl] = clock;
                 if (*(volatile unsigned*)hmask_h >> j & 1) hits++;
-                else { mw[nm] = w_h[j]; mq[nm] = eq[key]; msc[nm++] = es[key]; misses++; if (sl < 0) adm_keys.push_back(key); }
+                else {
+                    if (can_defer && j >= defer_rank) { dw[nd] = w_h[j]; dq[nd] = eq[key]; dsc[nd++] = es[key]; }
+                    else { mw[nm] = w_h[j]; mq[nm] = eq[key]; msc[nm++] = es[key]; }
+                    misses++; if (sl < 0) adm_keys.push_back(key);
+                }
             }
             if (nm) {
                 cpu.run(nm, mq, msc, mw, h_h, y_h);
                 cpu_s += now() - w1; ht[2] += now() - w1; hs[1][2] += now() - w1;
-            }
+                if (yd_pending) for (int i = 0; i < D; i++) y_h[i] += yd[i];
+            } else if (yd_pending) memcpy(y_h, yd.data(), D * 4);
+            const bool has_y = nm || yd_pending;
+            yd_pending = false;
+            if (nd) memcpy(hd.data(), h_h, D * 4);  // the GPU overwrites h_h at the next layer's hand-off
             if (l == stall_l && stall_ms && tokens % stall_every == 0) std::this_thread::sleep_for(std::chrono::milliseconds(stall_ms));
             std::atomic_thread_fence(std::memory_order_seq_cst);  // y_h before the flag
-            *(volatile int*)&dflag_h[l] = 2 * seq + (nm > 0);
-            y_pending = nm > 0;
+            *(volatile int*)&dflag_h[l] = 2 * seq + has_y;
+            y_pending = has_y;
+            if (nd) {  // deferred misses: computed while the GPU runs layer l + 1, added with layer l + 1's MoE output
+                const double d0 = now();
+                cpu.run(nd, dq, dsc, dw, hd.data(), yd.data());
+                yd_pending = true;
+                cpu_s += now() - d0; ht[2] += now() - d0;
+            }
             hs[nm > 0][1] += w1 - w0; hs[nm > 0][4]++;
             // Admit this layer's misses now (the GPU already has its flag): the loader's slow mmap -> pinned copies start
             // half a token earlier than at the token's end (hit rate 60% -> per-layer path's ~67%). Safe mid-graph: the
