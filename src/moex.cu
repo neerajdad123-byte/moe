@@ -2044,6 +2044,14 @@ int main(int argc, char** argv) {
         else if (s == "--profile") prof = true;
         else if (s == "--f16") f16 = true;
         else if (s == "--no-prefill") use_prefill = false;
+        else if (s == "--fast") {  // approximate, faster: late low-rank CPU experts (decode and MTP), unless set already
+#ifdef _WIN32
+            if (!getenv("MOEX_DEFER")) _putenv_s("MOEX_DEFER", "6");
+            if (!getenv("MOEX_MTP_DEFER")) _putenv_s("MOEX_MTP_DEFER", "6");
+#else
+            setenv("MOEX_DEFER", "6", 0); setenv("MOEX_MTP_DEFER", "6", 0);
+#endif
+        }
         else if (s == "--q4") q4groups = next();
         else if (s == "--q6") q6groups = next();
         else if (s == "--temp") { samp.temp = std::stof(next()); samp_set = true; }
@@ -2086,7 +2094,8 @@ int main(int argc, char** argv) {
                 "  --port N --host H      server address (serve; default 8765, 127.0.0.1 = this PC only)\n"
                 "  --allow-origin URL     serve: let web pages from URL call moex (default: localhost pages only; * = any)\n"
                 "  --model DIR            model folder (default %s; or set MOEX_MODEL)\n"
-                "  --no-mtp               no multi-token prediction (on by default when RAM holds every expert: ~5%% faster)\n\n"
+                "  --no-mtp               no multi-token prediction (on by default when RAM holds every expert: ~5%% faster)\n"
+                "  --fast                 ~10%% faster, slightly approximate: low-ranked CPU experts finish one layer late\n\n"
                 "Developer: --ids 1,2,3 [--n N] | --batch ids.txt | --check ref/eval1 | --f16 | --profile\n",
                 VERSION, model.c_str());
         return mode == "help" ? 0 : 2;
