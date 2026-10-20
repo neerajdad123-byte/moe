@@ -1407,6 +1407,14 @@ __global__ void argmax_k(const float* __restrict__ x, const int* __restrict__ xi
         pv[blockIdx.x] = bv; pi[blockIdx.x] = bi;
     }
 }
+// part[block] = sum exp(x - *mx) over the block's share (softmax denominator; the host adds the ARGMAX_BLOCKS parts)
+__global__ void sumexp_k(const float* __restrict__ x, int n, const float* __restrict__ mx, float* part) {
+    const float m = *mx;
+    float s = 0.f;
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x) s += __expf(x[i] - m);
+    s = block_sum(s);
+    if (threadIdx.x == 0) part[blockIdx.x] = s;
+}
 // sv: scratch of ARGMAX_BLOCKS+1 floats, si: ARGMAX_BLOCKS ints; the winning index lands in out[0]
 constexpr int ARGMAX_BLOCKS = 160;
 inline void argmax(const float* x, int n, float* sv, int* si, int* out, cudaStream_t st = 0) {

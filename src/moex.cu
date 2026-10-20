@@ -876,7 +876,8 @@ struct Engine {
         if (has_mtp) {
             CK(cudaMalloc(&vbuf, carve_prefill(nullptr, VT)));
             mtp_cat = falloc((size_t)CH * 2 * D); lg2 = falloc((size_t)VT * V); dlog = falloc(V);
-            snap_rows = ngram.nmin ? dlen.kmax : 1;
+            snap_rows = ngram.nmin ? dlen.kmax : mtp2 > 0 ? 2 : 1;
+            CK(cudaHostAlloc((void**)&sexp_h, ARGMAX_BLOCKS * 4, cudaHostAllocMapped)); CK(cudaHostGetDevicePointer((void**)&sexp_hd, sexp_h, 0));
             snap = falloc(NDN * DNS); rsnap = falloc((size_t)snap_rows * RSTRIDE);
             if (snap_rows > 1) {  // replay inputs for rows 1 .. kmax - 1 (~1 MB per draft row)
                 rp_conv = falloc(NDN * (snap_rows - 1) * DC); rp_ab = falloc(NDN * (snap_rows - 1) * 2 * DVH);
@@ -1366,6 +1367,11 @@ struct Engine {
                     else pairs_forward_tc(it, n, pairs_d, hc, actp, ypair, cs);
                 };
                 moe_pairs(items_d, nres);
+                if (verify) {  // GPU-wait meter: the GPU's MoE work is done here; the CPU result is enqueued at ev_mb[l]
+                    if (!ev_ma[l]) { CK(cudaEventCreate(&ev_ma[l])); CK(cudaEventCreate(&ev_mb[l])); }
+                    else if (ev_set[l]) { float ms; if (cudaEventElapsedTime(&ms, ev_ma[l], ev_mb[l]) == cudaSuccess) mtp_gwait += ms / 1e3; }
+                    CK(cudaEventRecord(ev_ma[l], cs)); ev_set[l] = 0;
+                }
                 if (!verify) shared_rows(w, T);
                 // streamed experts: items point at their ring slot; batch k of this list is global batch b0 + k
                 const long long b0 = main_b;
@@ -1419,6 +1425,7 @@ struct Engine {
                 launch_streamed(true);
                 pt[1] += now() - j0;  // time the main thread waited on the streaming
                 lap(7);
+                if (verify) { CK(cudaEventRecord(ev_mb[l], cs)); ev_set[l] = 1; }  // read in the next round (completed by then)
                 pairs_reduce_k<<<dim3((D + 255) / 256, T), 256, 0, cs>>>(ypair, ycpu_d, moec, TOPK, D);
                 gated_add_rows_k<<<dim3((D + 255) / 256, T), 256, 0, cs>>>(moec, shs, shl, D);
                 if (verify) { for (int key : admits_todo) admit(key); admits_todo.clear(); start_admissions(); }
@@ -1476,7 +1483,8 @@ struct Engine {
 
     // The MTP layer over T rows: row t gets the token at position pos+t (toks[t], the last row `last`) and the main
     // model's final hidden state at pos+t-1 (Xc). Returns the draft for the token after the last row (greedy).
-    int mtp_forward(const int* toks, int T, int last, int pos, double* pt, bool verify) {
+    // conf (optional): the draft's probability under the head (softmax max), for MOEX_MTP2
+    int mtp_forward(const int* toks, int T, int last, int pos, double* pt, bool verify, double* conf = nullptr) {
         for (int t = 0; t < T; t++) {
             const int tok = t < T - 1 ? toks[t] : last;
             for (int i = 0; i < D; i++) rows_h[(size_t)t * D + i] = __half2float(embed[(size_t)tok * D + i]);
@@ -1492,9 +1500,16 @@ struct Engine {
         rmsnorm(Xc + (size_t)(T - 1) * D, moec + (size_t)(T - 1) * D, mtp_norm, h, D, EPS, 1, cs);
         gemv(lm_head, h, dlog, D, V, cs);  // own buffer: logits[] holds the real model's last scores
         argmax(dlog, V, amv, ams, ids_hd, cs);
+        if (conf) sumexp_k<<<ARGMAX_BLOCKS, 256, 0, cs>>>(dlog, V, amv + ARGMAX_BLOCKS, sexp_hd);
         CK(cudaStreamSynchronize(cs));
+        if (conf) { double s = 0; for (int i = 0; i < ARGMAX_BLOCKS; i++) s += sexp_h[i]; *conf = 1.0 / s; }
         return ids_h[0];
     }
+    // MOEX_MTP2=theta (opt-in, greedy): a second draft per round by running the MTP layer once more on the first draft
+    // (fed its own output state); proposed only when the head gives it probability >= theta. Verified as a 3-row round.
+    const double mtp2 = getenv("MOEX_MTP2") ? atof(getenv("MOEX_MTP2")) : 0.0;
+    float *sexp_h = nullptr, *sexp_hd = nullptr;
+    long long m2_tried = 0, m2_used = 0;
 
     // Rollback state of the MTP round (written by the kernels as they go): per linear-attention layer, the DeltaNet
     // state after row 0 (snap, 2 MB: the only full copy), the conv ring after every row but the last (rsnap, 96 KB per
@@ -1530,11 +1545,14 @@ struct Engine {
     long long picks = 0;  // token_dist calls in rounds
     bool vcaptured = false;  // this round captured a layer graph
     long long rb_n[2] = {};  // rollbacks: to row 0 (copy only), past row 0 (copy + replay)
+    cudaEvent_t ev_ma[NL + 1] = {}, ev_mb[NL + 1] = {};  // MTP round per layer: GPU MoE done / CPU result enqueued
+    char ev_set[NL + 1] = {};
+    double mtp_gwait = 0;  // s the GPU idled between the two (rounds before the last)
     double rb_t[2] = {};
     std::vector<int> mtp_round(int y, int p) {
         if (drafts.empty()) set_drafts({draft});
         // snap holds kmax rows; the KV cache ends at ctx
-        const int K = std::max(0, std::min({(int)drafts.size(), ngram.nmin ? dlen.kmax : 1, ctx - 1 - p})), T = K + 1;
+        const int K = std::max(0, std::min({(int)drafts.size(), ngram.nmin ? dlen.kmax : mtp2 > 0 ? 2 : 1, ctx - 1 - p})), T = K + 1;
         drafts.resize(K); dqs.resize(K);
         double pt[5] = {}, t0 = now();
         const double tr = t0;
@@ -1572,6 +1590,13 @@ struct Engine {
         if (!vcaptured) (ng_draft ? gate.ng : gate.head).add(a + 1, deterministic ? 1.0 + 0.1 * (T - 2) : now() - tr);
         const std::vector<int> kept(drafts.begin(), drafts.begin() + a);
         choose_draft(mtp_forward(kept.data(), a + 1, out.back(), p + 1, pt, true), out.back());
+        if (mtp2 > 0 && !ng_draft && samp.temp <= 0.f && p + a + 3 < ctx) {  // chained draft from row a's MTP output state
+            CK(cudaMemcpyAsync(Xc, Xc + (size_t)a * D, D * 4, cudaMemcpyDeviceToDevice, cs));
+            double c = 0;
+            const int d2 = mtp_forward(nullptr, 1, draft, p + a + 2, pt, true, &c);
+            m2_tried++;
+            if (c >= mtp2) { drafts = {draft, d2}; dqs = {{{draft, 1.0}}, {{d2, 1.0}}}; m2_used++; }
+        }
         mt[3] += now() - t0;
         carve_prefill(arena + (size_t)(nslots - nres) * EXPERT_BYTES);
         nvtxRangePop();
@@ -2242,12 +2267,13 @@ int main(int argc, char** argv) {
         if (eng.mtp_rounds) {
             const double r = (double)eng.mtp_rounds;
             fprintf(stderr, "[mtp] %lld rounds, %.2f drafts/round, accepted %.1f%% | ms/round: 40 layers %.2f  lm_head %.2f  pick %.2f (%.3f per row, %.2f rows)"
-                            "  mtp layer %.2f  rollback %.2f | layers: gpu-wait %.2f  cpu-experts %.2f\n",
+                            "  mtp layer %.2f  rollback %.2f | layers: gpu-wait %.2f  cpu-experts %.2f | GPU waited on CPU %.2f\n",
                     eng.mtp_rounds, eng.mtp_drafted / r, 100.0 * eng.mtp_acc / eng.mtp_drafted, 1e3 * eng.mt[1] / r, 1e3 * eng.mt[2] / r,
                     1e3 * eng.mt[5] / r, 1e3 * eng.mt[5] / std::max(1LL, eng.picks), eng.picks / r, 1e3 * eng.mt[3] / r, 1e3 * eng.mt[4] / r,
-                    1e3 * eng.vpt[0] / r, 1e3 * eng.vpt[1] / r);
+                    1e3 * eng.vpt[0] / r, 1e3 * eng.vpt[1] / r, 1e3 * eng.mtp_gwait / r);
             fprintf(stderr, "[mtp] rollbacks: to row 0 %lld x %.3f ms (state copy) | past row 0 %lld x %.3f ms (state copy + replay)\n",
                     eng.rb_n[0], 1e3 * eng.rb_t[0] / std::max(1LL, eng.rb_n[0]), eng.rb_n[1], 1e3 * eng.rb_t[1] / std::max(1LL, eng.rb_n[1]));
+            if (eng.mtp2 > 0) fprintf(stderr, "[mtp] second draft (theta %.2f): proposed in %lld of %lld rounds\n", eng.mtp2, eng.m2_used, eng.m2_tried);
             const double* v = eng.vs;
             fprintf(stderr, "[mtp] per round, 40 layers: %.0f experts needed, %.0f in VRAM | CPU misses: real token only %.0f, draft only %.0f, both %.0f"
                             " | host: before CPU %.2f ms, after CPU %.2f ms\n",
