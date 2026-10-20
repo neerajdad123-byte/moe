@@ -1010,3 +1010,27 @@ Tried, all dropped (noise band of one binary: 74.1-76.4 MTP tok/s):
 None added to --fast: each costs more KL per % than --fast itself (+8-10% for 2.5e-3 -> 3.8e-3). The draft-row
 defer (MOEX_DDEFER=4, ~3 lines in round_layers) is the candidate if a "--faster" is wanted.
 Note: MTP KL/top-1 needs `--check ... --load --mtp` (without --mtp, --check runs raw steps).
+
+### Longer workload: 16 prompts x 64 tokens at 1K / 8K (speed2 bc74971, 2026-10-20)
+Prompts: 16 slices of the repo's text (~1K / ~8K tokens) + "summarize, list three details" (tools/bench.py makes the
+same). Warm-up, then raw / MTP x default / --fast alternating, 2 rounds. Decode = batch total tok/s; prefill = all
+prompts' tokens / prefill time. 8K round 1 of raw --fast and MTP default dropped: the laptop slept during them.
+
+| context | mode | decode tok/s | prefill tok/s | VRAM hit | MTP acceptance | KV MB / expert slots |
+|---|---|---|---|---|---|---|
+| 1K | raw | 56.4 / 57.3 | 740 | 68% | - | 41 / 1692 |
+| 1K | raw --fast | 59.2 / 59.1 | 739 | 68% | - | 41 / 1692 |
+| 1K | MTP | **65.0 / 64.6** | 702 | 65% | 65.7 / 64.6% | 41 / 1578 |
+| 1K | MTP --fast | **68.7 / 67.4** | 703 | 64% | 66.5 / 64.7% | 41 / 1578 |
+| 8K | raw | 55.4 / 54.3 | 757 | 68% | - | 91 / 1645 |
+| 8K | raw --fast | 56.4 | 748 | 67% | - | 91 / 1645 |
+| 8K | MTP | **62.4** | 711 | 64% | 66.2% | 91 / 1526 |
+| 8K | MTP --fast | **63.9 / 65.3** | 720 | 64% | 66.2 / 66.6% | 91 / 1526 |
+
+32K (skipped as a 16-prompt run, too long: ~14 min per run; one prompt measured): prefill 32030 tok in 51.7 s = 620
+tok/s, raw decode 48.9 tok/s, KV 330 MB, 1500 expert slots, 4.85 of 6.14 GB VRAM in use at peak (1.06 GB of it the
+display / other apps). The 96 staging buffers are pinned host RAM (96 x 1.77 MB = 170 MB), not VRAM: they fit at
+any context; a longer context costs expert slots (1692 at 4K -> 1500 at 32K, raw).
+MTP acceptance on these summaries is ~66% (vs ~89% on the short dec4 set), so MTP gains +14% here (+33% there).
+Open: one segfault in raw --fast (1K set, prompt 15 of 16) in the first attempt; not reproduced in 5 more runs and
+2 full long runs (the second with a crash handler + pdb).
