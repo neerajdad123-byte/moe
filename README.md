@@ -29,7 +29,7 @@ No CUDA toolkit, no Python.
   irm https://raw.githubusercontent.com/neerajdad123-byte/moe/main/install.ps1 | iex
   ```
 
-  It puts `moex` (1.3 MB) in `%LOCALAPPDATA%\Programs\moex` and on your PATH, no admin rights needed. Open a **new**
+  It puts `moex` (~20 MB) in `%LOCALAPPDATA%\Programs\moex` and on your PATH, no admin rights needed. Open a **new**
   terminal afterwards. Run the same line again to update.
 
 - **Zip:** download [`moex-windows-x64.zip`](https://github.com/neerajdad123-byte/moe/releases/latest), unzip it
