@@ -2226,17 +2226,14 @@ static bool has_avx2() {
 }
 
 int main(int argc, char** argv) {
-    // Double-clicked (no arguments, a console window of its own): download the model if it isn't there, then
-    // `moex bench`, and keep the window open at the end. From a terminal, no arguments still prints the help.
-    bool clicked = false;
 #ifdef _WIN32
+    // double-clicked (a console window of its own): only the help, kept open to be read; moex is a terminal program
     DWORD cps[2];
-    clicked = argc == 1 && GetConsoleProcessList(cps, 2) == 1;
-    if (clicked) atexit([] { fprintf(stderr, "\nPress Enter to close this window."); getchar(); });
+    if (argc == 1 && GetConsoleProcessList(cps, 2) == 1) atexit([] { fprintf(stderr, "\nPress Enter to close this window."); getchar(); });
 #endif
     if (!has_avx2()) { fprintf(stderr, "moex needs a CPU with AVX2 and FMA (Intel Haswell / AMD Zen or newer).\n"); return 1; }
     std::string model = default_model_dir(), only;
-    std::string mode = clicked ? "bench" : "", system_prompt;
+    std::string mode, system_prompt;
     bool think = false, samp_set = false, n_set = false, warm = false;
     int mtp = -1;  // --mtp 1, --no-mtp 0, else on where it was measured faster
     std::string host = "127.0.0.1";
@@ -2311,7 +2308,6 @@ int main(int argc, char** argv) {
                 "  moex chat              chat in this terminal (/reset new conversation, /exit quit)\n"
                 "  moex serve             OpenAI-compatible API on http://127.0.0.1:8765/v1\n"
                 "  moex bench             measure speed on this PC (~2-4 min): MTP off / on / --fast, specs, a line to share\n"
-                "                         (double-clicking moex.exe downloads the model if needed, then runs the bench)\n"
                 "  moex install           put moex on your PATH, so `moex` works in any terminal\n"
                 "  moex help | -h | --help, moex --version\n\n"
                 "Options:\n"
@@ -2339,11 +2335,6 @@ int main(int argc, char** argv) {
     if ((mode == "chat" || mode == "serve" || mode == "bench") && !ctx_set) ctx = 8192;
     if (mode == "bench") { warm = true; if (!samp.seed) samp.seed = 1; }  // what `moex chat --load` gets, same text every run
     if (mode == "download") return download_model(model, only);
-    if (clicked && !std::filesystem::exists(std::filesystem::path(model) / "config.json")) {
-        fprintf(stderr, "moex: first run. Downloading the model (~22 GB, once) to %s, then measuring this PC's speed.\n"
-                        "If it stops, double-click moex.exe again: it resumes.\n\n", model.c_str());
-        if (const int r = download_model(model, only)) return r;
-    }
     if (!std::filesystem::exists(std::filesystem::path(model) / "config.json")) {
         fprintf(stderr, "No model at %s.\nRun `moex download` first (or pass --model DIR).\n", model.c_str());
         return 1;
