@@ -1,5 +1,5 @@
 # Builds the release moex.exe (same flags as build.bat) and checks the tokenizer against Hugging Face's.
-# No GPU on GitHub runners: test_kernels and --check stay local.
+# No GPU on GitHub runners: test_kernels, --check and the server tests stay local (see README, Building from source).
 name: CI
 on:
   push:
@@ -39,6 +39,28 @@ jobs:
 
       - name: moex --version
         run: build\moex.exe --version
+
+      - name: Version matches the tag (v* tags only)
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        run: test "$(build/moex.exe --version)" = "moex ${GITHUB_REF_NAME#v}"
+
+      - name: Command line without a GPU or model (help, bad input, missing model)
+        shell: bash
+        run: |
+          build/moex.exe help | grep -q "moex download"
+          set +e
+          build/moex.exe > /dev/null 2>&1; test $? -eq 2 || exit 1
+          build/moex.exe nosuchcommand > /dev/null 2>&1; test $? -eq 2 || exit 1
+          build/moex.exe chat --model no_model_here 2>&1 | grep -q "No model at" || exit 1
+
+      - name: Download and PATH helpers (no GPU, no internet)
+        shell: cmd
+        run: |
+          nvcc -std=c++20 -O3 -Xcompiler "/EHsc /utf-8 /D_CRT_SECURE_NO_WARNINGS" tests\test_download.cu -o build\test_download.exe -ladvapi32 -luser32 || exit /b 1
+          nvcc -std=c++20 -O3 -Xcompiler "/EHsc /utf-8 /D_CRT_SECURE_NO_WARNINGS" tests\test_userenv.cu -o build\test_userenv.exe -ladvapi32 -luser32 || exit /b 1
+          build\test_download.exe || exit /b 1
+          build\test_userenv.exe || exit /b 1
 
       - name: Zip (same contents as package.bat)
         shell: pwsh
