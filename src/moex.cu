@@ -73,6 +73,25 @@ static bool low_ram_machine() {
     GlobalMemoryStatusEx(&ms);
     return ms.ullTotalPhys < (size_t)NL * E * EXPERT_BYTES + (5ull << 30) || getenv("MOEX_LOW_RAM");
 }
+#ifdef _WIN32
+// VRAM free on the whole card by NVIDIA's own count (NVML, part of the driver; what nvidia-smi shows), 0 = unknown.
+// On Windows, cudaMemGetInfo's free leaves out ~1 GB the OS holds back for other programs. NVML counts what the
+// display and other programs really use: on a hybrid laptop (display on the iGPU) that GB becomes expert slots (+10%
+// MTP decode on the RTX 4050 6 GB); with the display on the NVIDIA GPU its memory still counts as used.
+static size_t nvml_free() {
+    struct Mem { unsigned long long total, free, used; };
+    static HMODULE h = LoadLibraryA("nvml.dll");
+    if (!h) return 0;
+    auto init = (int (*)())GetProcAddress(h, "nvmlInit_v2");
+    auto bybus = (int (*)(const char*, void**))GetProcAddress(h, "nvmlDeviceGetHandleByPciBusId_v2");
+    auto mem = (int (*)(void*, Mem*))GetProcAddress(h, "nvmlDeviceGetMemoryInfo");
+    char bus[32]; void* dev = nullptr; Mem m{};
+    if (!init || !bybus || !mem || init() || cudaDeviceGetPCIBusId(bus, sizeof bus, 0) != cudaSuccess || bybus(bus, &dev) || mem(dev, &m)) return 0;
+    return (size_t)m.free;
+}
+#else
+static size_t nvml_free() { return 0; }  // Linux: cudaMemGetInfo's free is the real one
+#endif
 
 struct LayerW {
     half *in_ln, *post_ln, *router, *sh_gate, *qn, *kn, *conv, *nw, *alog, *dtb;  // small: F16 always
@@ -902,13 +921,14 @@ struct Engine {
         else pin_experts_in_ram();
         // every byte of VRAM left (minus headroom for the driver) becomes expert slots
         size_t fr, tot; CK(cudaMemGetInfo(&fr, &tot));
+        vf[3] = fr;  // the [vram] line's scratch is measured against CUDA's count
+        if (!getenv("MOEX_CUDA_FREE")) fr = std::max(fr, std::min(nvml_free(), tot));  // MOEX_CUDA_FREE=1: CUDA's count (smaller cache)
         const size_t reserve = (getenv("MOEX_RESERVE_MB") ? atoi(getenv("MOEX_RESERVE_MB")) : 320) * (1ull << 20);  // env: testing smaller caches
-        nslots = (int)((fr - std::min(fr, reserve)) / EXPERT_BYTES);
+        nslots = (int)((fr - std::min(fr, reserve) + (getenv("MOEX_EXTRA_MB") ? atoll(getenv("MOEX_EXTRA_MB")) << 20 : 0)) / EXPERT_BYTES);  // PROBE
         nslots = std::min(nslots, NKEY + (int)((carve_prefill(nullptr) + EXPERT_BYTES - 1) / EXPERT_BYTES));  // big GPUs: every expert fits
         nres = (int)((carve_prefill(nullptr) + EXPERT_BYTES - 1) / EXPERT_BYTES);
         if (nslots < 3 * nres) { nring = 2; nres = (int)((carve_prefill(nullptr) + EXPERT_BYTES - 1) / EXPERT_BYTES); }  // small GPUs
         if (nslots < nres + 2 * TOPK) { fprintf(stderr, "only %d expert slots fit; need >= %d\n", nslots, 2 * TOPK); exit(1); }
-        vf[3] = fr;
         CK(cudaMalloc(&arena, (size_t)nslots * EXPERT_BYTES));
         CK(cudaMemGetInfo(&vf[4], &vtot));
         {
