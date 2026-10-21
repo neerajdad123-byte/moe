@@ -1,14 +1,14 @@
 name: Benchmark report
 description: Share your `moex bench` result, so the tested machines table grows
-title: "Bench: <your GPU>, <avg> tok/s"
+title: "Bench: <your GPU>, <MTP on> tok/s"
 labels: [benchmark]
 body:
   - type: textarea
     id: line
     attributes:
       label: The line from `moex bench`
-      description: Run `moex bench` (and `moex bench --mtp` if you like) and paste the line(s) it tells you to share.
-      placeholder: moex 0.1.2 | NVIDIA GeForce RTX 4050 Laptop GPU 6.4 GB | ... | avg 47.9, low 45.2, high 49.6 tok/s
+      description: Run `moex bench` (plugged in, nothing else running) and paste the line it tells you to share.
+      placeholder: moex 0.2.0 | NVIDIA GeForce RTX 4050 Laptop GPU 6 GB, driver 610.74 | 13th Gen Intel(R) Core(TM) i7-13650HX, 20 threads | RAM 25 GB | 2007 slots | MTP off 60.1, MTP on 71.5, MTP on + --fast 74.6 tok/s
       render: text
     validations:
       required: true
