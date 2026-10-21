@@ -1054,3 +1054,37 @@ code1 + agent1 (330 positions; MTP: `--check --load --mtp`):
 Targets 67 raw / 80 MTP: --fast MTP reaches 80; default MTP ~75, raw 56-60. Left: the draft rows' CPU experts (58%
 of a round's CPU reads) have no lossless fix found; the next lossy step (draft-row defer, +3.4%, KL 6.3e-3) is not in
 --fast.
+
+### Expert cache from NVML's free VRAM (speed2 df0db07, 2026-10-21): how to test hybrid vs GPU-only laptops
+moex sized its expert cache from cudaMemGetInfo's free VRAM. On Windows that leaves out ~1 GB the OS holds back for
+other programs, so moex used 4.86 of 6.14 GB while llama.cpp used 5.9. Now the free VRAM comes from NVML (the whole
+card, the count nvidia-smi shows; nvml.dll ships with every NVIDIA driver, no CUDA toolkit needed; without it, CUDA's
+count as before). A smaller reserve (128 MB instead of 320) added 114 slots and no speed: kept 320.
+Laptops run the display one of two ways, and the cache size must be right in both:
+- Hybrid / Optimus (the default on most laptops, this one): the display on the Intel/AMD iGPU, the NVIDIA GPU empty
+  (nvidia-smi shows ~0 MiB used before moex starts). The ~1 GB is free: it becomes expert slots.
+- GPU-only / dGPU / "Ultimate" mode (MUX switch: NVIDIA Control Panel > Manage Display Mode, or the laptop's app:
+  Armoury Crate GPU Mode, Legion Space / Vantage, Omen Gaming Hub; needs a reboot): the display and every window
+  live in NVIDIA VRAM (often 0.3-1.5 GB). NVML counts that as used, so moex gets fewer slots and must still fit.
+Tests in each mode (short): 1. `nvidia-smi` before starting (used MiB). 2. `moex bench` (the line to share). 3. the
+peak VRAM while it runs (`nvidia-smi -l 1` in a second window) stays under the total, and the [vram] line's slot
+count matches. 4. `MOEX_CUDA_FREE=1 moex bench`: the old, smaller cache, for the comparison; new >= old.
+5. open a browser / video while `moex chat` answers: no crash (Windows may move some of moex's VRAM to RAM: slower
+until the other program closes).
+Measured here, hybrid only (the GPU-only mode needs a reboot into the MUX mode, not tested yet):
+
+| cache sized from | MTP slots | peak VRAM | VRAM hit (MTP) | raw tok/s | MTP tok/s |
+|---|---|---|---|---|---|
+| CUDA's free (before) | 1578 | 4.86 GB | 55% | 55.9 / 55.1 | 74.0 / 74.0 |
+| NVML's free (df0db07) | ~2050 | 5.63 GB | 61% | 56.8 / 57.6 | 76.6 / 76.5 |
+
+Final, 4 prompts (1K + 3 short) x 64 tokens, warm-up, alternating, 2 rounds (df0db07); KL / top-1 over eval1 +
+code1 + agent1 (330 positions; MTP: `--check --load --mtp`):
+
+| | raw tok/s | MTP tok/s | acceptance | KL / top-1 raw | KL / top-1 MTP |
+|---|---|---|---|---|---|
+| default | 56.7 / 56.1 | **78.1 / 78.4** | 88.1 / 91.3% | 2.37e-3 / 99.4% | 2.63e-3 / 99.4% |
+| --fast | 60.4 / 60.2 | **84.9 / 82.4** | 87.6 / 88.1% | 2.94e-3 / 99.7% | 3.11e-3 / 99.1% |
+
+Targets 67 raw / 80 MTP: MTP --fast 82-85 (met), default MTP 78; raw 56-60 (not met). More experts on the GPU also
+moved KL down a little (the GPU path is closer to the f16 reference than the CPU int8 one).

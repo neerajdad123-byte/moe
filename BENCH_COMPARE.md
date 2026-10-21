@@ -2,7 +2,7 @@
 
 Same laptop, plugged in, Windows "High performance" plan, nothing else running (display on the Intel iGPU):
 RTX 4050 Laptop 6 GB (driver 610.74), i7-13650HX (6P + 8E cores, 20 threads), 24 GB DDR5-4800 dual channel.
-Measured 2026-10-20, moex at speed2 0736617.
+Measured 2026-10-20 (llama engines) and 2026-10-21 (moex at speed2 df0db07: expert cache sized from NVML's free VRAM).
 
 ## Results
 
@@ -12,27 +12,29 @@ Each engine runs as its own OpenAI-compatible server with an 8K+ context, and on
 
 | engine | quant | decode 1K | decode 8K | prefill 1K | prefill 8K | VRAM | RAM working set / private |
 |---|---|---|---|---|---|---|---|
-| **moex** (default: MTP on) | int4 gs64 experts, int8 trunk | **65.5** (62.6-69.5) | **63.0** | **741** | **794** | 4.9 GB | 18.3 / 5.4 GB |
-| **moex --fast** | same | **68.0** (63.4-73.4) | **65.6** | 714 | 766 | 4.9 GB | 18.3 / 5.4 GB |
+| **moex** (default: MTP on) | int4 gs64 experts, int8 trunk | **67.8** (64.5-70.6) | **64.5** | **733** | **764** | 5.6 GB | 18.3 / 6.2 GB |
+| **moex --fast** | same | **69.2** (63.2-73.5) | **67.5** | 725 | 765 | 5.6 GB | 18.3 / 6.3 GB |
 | ik_llama.cpp 565f08d1 | Q4_K_M GGUF | 36.0 (35.8-36.2) | 35.1 | 333 | 336 | 5.9 GB | 16.5 / 23.2 GB |
 | llama.cpp b11756 | Q4_K_M GGUF | 33.3 (32.4-34.0) | 32.8 | 202 | 189 | 5.9 GB | 17.9 / 10.0 GB |
 
 All figures are tok/s unless marked otherwise. Decode = (tokens - 1) / (time from the first streamed text to the
 end), the mean over prompts with min-max in brackets. Prefill = prompt tokens / time to the first streamed text.
 VRAM = peak `nvidia-smi` memory.used while serving. RAM = the server process's peak working set and private bytes.
-- **moex and the 6 GB card:** moex keeps 1.2 GB of VRAM free on purpose and fills the rest with expert slots.
+- **moex and the 6 GB card:** moex fills the free VRAM (as NVML / nvidia-smi count it) with expert slots, minus a
+  320 MB margin. Before df0db07 it used CUDA's count, which on Windows leaves out ~1 GB: 4.9 GB, 65.5 / 63.0 tok/s.
+  The llama engines' 5.9 GB is what the hand-tuned `--n-cpu-moe` asks for, not a computed limit.
 - **RAM:** the llama engines memory-map the GGUF, so their working set includes file pages. ik_llama.cpp also copies
   the CPU experts into private memory. moex locks the expert file pages in RAM.
 - **Every prompt produced 128 tokens on every engine.** The llama engines get `ignore_eos`. moex has no such option,
   but none of its replies hit end-of-text early.
 
-moex vs the fastest llama engine: decode **1.8x** at 1K and 8K (default), prefill **2.2-2.4x**.
+moex vs the fastest llama engine: decode **1.9x** at 1K, **1.8x** at 8K (default), prefill **2.2-2.3x**.
 
 **Quants:** the closest pair available. moex runs its own container: int4 group-64 experts with int8 dense weights,
 int6 for dn_out / lm_head / shared-expert down, plus the MTP head. llama.cpp and ik_llama.cpp run the official
 ggml-org `Qwen3.6-35B-A3B-Q4_K_M.gguf` (19.0 GiB): Q4_K experts, about 4.5 bits per weight. Both are ~4.5-bit expert
 weights with an 8-bit-class trunk. moex's own quality check against the f16 reference is in PLAN.md
-(mean KL 2.5e-3, top-1 99.1%).
+(MTP: mean KL 2.6e-3, top-1 99.4%).
 
 **KTransformers: skipped**, decided within ~5 minutes, no install attempted. Its PyPI wheels (`ktransformers` /
 `sglang-kt` 0.7.2) are Linux-only (`manylinux_2_35_x86_64`). `kt-kernel` lists only Linux and macOS, and serving now
