@@ -2319,8 +2319,8 @@ int main(int argc, char** argv) {
                 "  --port N --host H      server address (serve; default 8765, 127.0.0.1 = this PC only)\n"
                 "  --allow-origin URL     serve: let web pages from URL call moex (default: localhost pages only; * = any)\n"
                 "  --model DIR            model folder (default %s; or set MOEX_MODEL)\n"
-                "  --no-mtp               no multi-token prediction (on by default when RAM holds every expert: ~5%% faster)\n"
-                "  --fast                 ~10%% faster, slightly approximate: low-ranked CPU experts finish one layer late\n\n"
+                "  --no-mtp               no multi-token prediction (on by default when RAM holds every expert: ~35%% faster on the test laptop)\n"
+                "  --fast                 2-9%% faster, slightly approximate: low-ranked CPU experts finish one layer late\n\n"
                 "Developer: --ids 1,2,3 [--n N] | --batch ids.txt | --check ref/eval1 | --f16 | --profile\n",
                 VERSION, model.c_str());
         return mode == "help" ? 0 : 2;
