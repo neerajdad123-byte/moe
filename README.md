@@ -108,7 +108,7 @@ Type a message and press Enter. `/reset` starts a new conversation, `/exit` quit
 | Option | What it does |
 |---|---|
 | `--load` | preload your most-used experts into VRAM and all experts into RAM before the prompt |
-| `--no-mtp` | turn off multi-token prediction (the model drafts the next tokens and checks them in one pass: ~35% faster on the test laptop, on by default when your RAM holds every expert) |
+| `--no-mtp` | turn off multi-token prediction (the model drafts the next tokens and checks them in one pass: 20-35% faster on the test laptop, on by default when your RAM holds every expert) |
 | `--fast` | 2-9% faster, slightly approximate: the least important CPU experts finish one layer late (mean KL 3.1e-3 instead of 2.6e-3, see Accuracy). Off by default |
 | `--system "You are ..."` | system prompt |
 | `--think` | let the model reason step by step before it answers |
@@ -191,7 +191,8 @@ the llama engines run without speculative decoding.
   (`--n-cpu-moe`, threads, batch sizes, flash attention). moex runs with no flags: it picks threads and cache size itself.
 - Exact commands, every flag tried and the RAM numbers: [BENCH_COMPARE.md](BENCH_COMPARE.md). Every measurement is
   logged in [PLAN.md](PLAN.md).
-- Short everyday prompts: ~78 tokens/s (`--fast`: 82-85). First token after Enter: under 1 s for short prompts.
+- Short everyday prompts: ~78 tokens/s greedy (`--fast`: 82-85); `moex bench`, which samples at temperature 0.7 like
+  `moex chat`, prints ~72 (`--fast` ~75, no MTP ~60). First token after Enter: under 1 s for short prompts.
 
 **A bigger GPU makes it faster, automatically.** moex turns all free VRAM into expert cache. A 6 GB card holds ~2,050
 of the 10,240 experts (20%), an 8 GB card ~2,700 (26%), a 12 GB card about half, and a 24 GB card all of them. Every
@@ -247,11 +248,11 @@ conversation, 330 positions):
 
 | | mean KL divergence | top-1 token agrees |
 |---|---|---|
-| default | 0.0024 | 99.4% |
-| default, with multi-token prediction | 0.0026 | 99.4% |
+| default | 0.0024-0.0026 | 99.4-99.7% |
+| default, with multi-token prediction | 0.0026-0.0028 | 99.1-99.4% |
 | `--fast` | 0.0029-0.0031 | 99.1-99.7% |
 
-KL 0.0024 means the next-token probabilities are nearly identical to the reference's; the top-1 column is how often
+KL 0.0025 means the next-token probabilities are nearly identical to the reference's; the top-1 column is how often
 both pick the same next token. With full-precision dense weights (`--f16`) the int8 KV cache is the only difference
 left: mean KL 0.0005-0.0006. The model file itself is an int4 quantization of Qwen3.6-35B-A3B made by others (see
 Credits), so it is not identical to the original BF16 weights.
