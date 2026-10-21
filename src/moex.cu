@@ -66,7 +66,7 @@ static bool NORM_TOPK = !getenv("MOEX_NO_NORM_TOPK");
 static bool PF_GEMV = getenv("MOEX_PF_GEMV") != nullptr;  // prefill experts on the old GEMV kernels (A/B tests)
 static bool is_attn(int l) { return l % 4 == 3 || l == NL; }  // layer NL = the MTP head's layer
 constexpr int NKEY = (NL + 1) * E;  // expert keys: 40 layers + the MTP layer
-static const char* VERSION = "0.1.4";
+static const char* VERSION = "0.2.0";
 // Too little RAM to lock every expert (the OS and other programs need ~5 GB): experts come from the SSD as needed.
 static bool low_ram_machine() {
     MEMORYSTATUSEX ms{sizeof ms};
