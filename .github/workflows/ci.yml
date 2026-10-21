@@ -49,11 +49,11 @@ jobs:
       - name: Command line without a GPU or model (help, bad input, missing model)
         shell: bash
         run: |
-          build/moex.exe help | grep -q "moex download"
-          set +e
-          build/moex.exe > /dev/null 2>&1; test $? -eq 2 || exit 1
-          build/moex.exe nosuchcommand > /dev/null 2>&1; test $? -eq 2 || exit 1
-          build/moex.exe chat --model no_model_here 2>&1 | grep -q "No model at" || exit 1
+          set +e  # outputs are captured whole (grep -q under pipefail would fail on the closed pipe), each check prints
+          out=$(build/moex.exe help 2>&1); rc=$?; echo "help: rc $rc"; [ $rc -eq 0 ] && [[ "$out" == *"moex download"* ]] || { echo "$out"; exit 1; }
+          build/moex.exe > /dev/null 2>&1; rc=$?; echo "no arguments: rc $rc"; [ $rc -eq 2 ] || exit 1
+          build/moex.exe nosuchcommand > /dev/null 2>&1; rc=$?; echo "unknown command: rc $rc"; [ $rc -eq 2 ] || exit 1
+          out=$(build/moex.exe chat --model no_model_here 2>&1); rc=$?; echo "missing model: rc $rc | $out"; [ $rc -eq 1 ] && [[ "$out" == *"No model at"* ]] || exit 1
 
       - name: Download and PATH helpers (no GPU, no internet)
         shell: cmd
