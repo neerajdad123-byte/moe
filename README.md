@@ -2,18 +2,16 @@
 
 # moex
 
-**Run Qwen3.6-35B-A3B at 46 tokens/s on a 6 GB laptop GPU.**<br>
-A 35-billion-parameter model, 2.3x faster than llama.cpp, with nothing to install but the NVIDIA driver.
+**Run Qwen3.6-35B-A3B at 68 tokens/s on a 6 GB laptop GPU.**<br>
+A 35-billion-parameter model, ~1.9x faster than tuned llama.cpp and ik_llama.cpp, with nothing to install but the NVIDIA driver.<br>
+<sub>moex with multi-token prediction (its default) vs llama.cpp / ik_llama.cpp without speculative decoding.</sub>
 
 [![Release](https://img.shields.io/github/v/release/neerajdad123-byte/moe?label=download&color=2a78d6)](https://github.com/neerajdad123-byte/moe/releases/latest)
 ![Platform](https://img.shields.io/badge/platform-Windows%2010%2F11-555)
 ![GPU](https://img.shields.io/badge/GPU-NVIDIA%20RTX%2020%2B%20%C2%B7%206%20GB%2B-76b900)
 [![License](https://img.shields.io/badge/license-MIT-555)](LICENSE)
 
-<img src="docs/speed.svg" alt="Decode speed: moex 46.2 tokens/s on average (up to 53) vs llama.cpp 20.3 tokens/s at default settings, 2.3x faster" width="760">
-
-<img src="docs/demo.gif" alt="moex chat in PowerShell writing an HTML page at 47.4 tokens/s on an RTX 4050 Laptop 6 GB, real time" width="760"><br>
-<sub>Real time, RTX 4050 Laptop 6 GB: <code>moex chat --load</code> at 47 tokens/s.</sub>
+<img src="docs/speed.svg" alt="Decode speed at 1K-token prompts: moex 67.8 tokens/s with multi-token prediction vs ik_llama.cpp 36.0 and llama.cpp 33.3 tokens/s (both hand-tuned, no speculative decoding), 1.9x faster" width="760">
 
 </div>
 
@@ -110,7 +108,8 @@ Type a message and press Enter. `/reset` starts a new conversation, `/exit` quit
 | Option | What it does |
 |---|---|
 | `--load` | preload your most-used experts into VRAM and all experts into RAM before the prompt |
-| `--no-mtp` | turn off multi-token prediction (the model drafts the next token and checks it for free: ~5% faster in `moex bench`, on by default when your RAM holds every expert) |
+| `--no-mtp` | turn off multi-token prediction (the model drafts the next tokens and checks them in one pass: ~35% faster on the test laptop, on by default when your RAM holds every expert) |
+| `--fast` | 2-9% faster, slightly approximate: the least important CPU experts finish one layer late (mean KL 3.1e-3 instead of 2.6e-3, see Accuracy). Off by default |
 | `--system "You are ..."` | system prompt |
 | `--think` | let the model reason step by step before it answers |
 | `--temp 0.7 --top-p 0.8 --top-k 20` | sampling (these are the defaults; `--temp 0` always picks the likeliest token) |
@@ -174,33 +173,39 @@ requests or read its replies. To let a web app on another address call moex, sta
 
 ## Speed
 
-| | decode speed |
-|---|---|
-| **moex** | **46.2 tokens/s** on average, 41-53 depending on the prompt |
-| llama.cpp, default settings | 20.3 tokens/s |
+| engine | decode 1K | decode 8K | prompt reading 1K | prompt reading 8K | VRAM |
+|---|---|---|---|---|---|
+| **moex** (default) | **67.8** | **64.5** | **733** | **764** | 5.6 GB |
+| **moex --fast** | **69.2** | **67.5** | 725 | 765 | 5.6 GB |
+| ik_llama.cpp 565f08d1, hand-tuned | 36.0 | 35.1 | 333 | 336 | 5.9 GB |
+| llama.cpp b11756, hand-tuned | 33.3 | 32.8 | 202 | 189 | 5.9 GB |
 
-- With multi-token prediction (on by default since v0.1.3): ~51 tokens/s on the same laptop.
-- First token after you press Enter: ~0.4-0.9 s. Long documents are read at ~230-300 tokens/s (4,000-16,000 tokens;
-  ~2x faster since v0.1.4).
-- A 26,500-token conversation still decodes at ~30 tokens/s.
+Tokens per second. moex vs the fastest llama engine: decode **1.8-1.9x**, prompt reading **2.2-2.3x**. moex's decode
+numbers use its default multi-token prediction (Qwen3.6's own draft head; without it, ~57 tok/s on short prompts);
+the llama engines run without speculative decoding.
 
-Measured on an RTX 4050 Laptop 6 GB, i7-13650HX, 24 GB RAM: the same model, 10 prompts neither engine had seen, the same
-chat template, greedy decoding, 128 tokens each. llama.cpp b11563 (official CUDA build) on the ggml-org Q4_K_M GGUF,
-which uses the same bit widths where it matters (int4 experts, int8 everything else). Script:
-[`tools/h2h.py`](tools/h2h.py); every measurement is logged in [PLAN.md](PLAN.md).
+- Same laptop for all (RTX 4050 Laptop 6 GB, i7-13650HX, 24 GB DDR5), each engine as its own OpenAI-compatible server,
+  the same prompts sent as the same token ids (4 of 1,030 tokens and 2 of 8,030), 128 output tokens, greedy, one
+  client timing all of them the same way.
+- The llama engines run the official ggml-org Q4_K_M GGUF, with the fastest flags found for this card
+  (`--n-cpu-moe`, threads, batch sizes, flash attention). moex runs with no flags: it picks threads and cache size itself.
+- Exact commands, every flag tried and the RAM numbers: [BENCH_COMPARE.md](BENCH_COMPARE.md). Every measurement is
+  logged in [PLAN.md](PLAN.md).
+- Short everyday prompts: ~78 tokens/s (`--fast`: 82-85). First token after Enter: under 1 s for short prompts.
 
-**A bigger GPU makes it faster, automatically.** moex turns all free VRAM into expert cache. A 6 GB card holds ~1,600
-of the 10,240 experts (15%), an 8 GB card ~2,700 (26%), a 12 GB card about half, and a 24 GB card all of them. Every
-expert in VRAM is one the CPU doesn't have to compute.
+**A bigger GPU makes it faster, automatically.** moex turns all free VRAM into expert cache. A 6 GB card holds ~2,050
+of the 10,240 experts (20%), an 8 GB card ~2,700 (26%), a 12 GB card about half, and a 24 GB card all of them. Every
+expert in VRAM is one the CPU doesn't have to compute. Tested on a laptop that runs its display on the integrated GPU
+(the default on most laptops); not yet in the "GPU only" display mode some laptops offer.
 
-**Tested machines** (v0.1.1, `moex chat`):
+**Tested machines** (v0.1.1, `moex chat`; v0.2.0 numbers welcome, see below):
 
 | GPU | CPU | RAM | decode |
 |---|---|---|---|
 | RTX 4050 Laptop, 6 GB | i7-13650HX | 24 GB | ~46 tokens/s |
 | RTX 4060 Laptop, 8 GB | i7-13th gen HX | 24 GB | ~60 tokens/s |
 
-Ran it on something else? Run `moex bench` (or just double-click moex.exe: 3 everyday questions per setting, ~2-4 minutes) and paste the line it prints into a
+Ran it on something else? Run `moex bench` (3 everyday questions per setting, ~2-4 minutes) and paste the line it prints into a
 [benchmark report](https://github.com/neerajdad123-byte/moe/issues/new?template=benchmark.yml).
 
 ## How it works
@@ -218,27 +223,38 @@ in each of its 40 layers, about 3B parameters per token. The trick is keeping th
   tokens); the lowest score is evicted. Picked by replaying real routing traces against the alternatives
   ([`tools/sim.py`](tools/sim.py)): it beat LRU, half-lives from 3 to 80 tokens, and predicting the next layer's experts
   (which added nothing). About 70% of the experts each token needs are already in VRAM.
-- **Misses on the CPU, in parallel.** For one conversation it is faster to compute a missing expert on the CPU (AVX2)
-  than to copy it over PCIe. The GPU and CPU work at the same time, and missing experts are copied into VRAM in the
-  background for next time.
+- **Misses on the CPU, in parallel.** For one conversation it is faster to compute a missing expert on the CPU (AVX2,
+  and AVX-VNNI int8 where the CPU has it) than to copy it over PCIe. The GPU and CPU work at the same time, and missing
+  experts are copied into VRAM in the background for next time.
+- **Multi-token prediction.** Qwen3.6's own draft head guesses up to two next tokens; the main model checks them in
+  one pass, so most steps produce more than one token (~88% of drafts accepted).
 - **Warm start.** moex remembers which experts you use most (`moex_hot.bin` in the model folder; the release ships
   counts from 80 test prompts), and `--load` puts those in VRAM before you type.
-- **Everything else on the GPU in int8.** Attention, the linear-attention (DeltaNet) layers and the output head live in
-  VRAM. The KV cache is int8 too (4x smaller), and attention is spread across the whole GPU (flash-decoding), so long
+- **Everything else on the GPU in int8 / int6.** Attention, the linear-attention (DeltaNet) layers and the output head
+  live in VRAM, in int8, with the three largest dense matrices (output head, DeltaNet output, shared-expert down) in
+  int6. The KV cache is int8 too (4x smaller), and attention reads each KV head once for its 8 query heads, so long
   conversations stay fast.
-- **No back-and-forth per layer.** The GPU looks up its cached experts itself, results cross PCIe through mapped
-  memory, and each layer is a single CUDA graph.
-- **Prompts in chunks.** Long prompts are processed 256 tokens at a time, streaming each needed expert to the GPU once
-  per chunk instead of once per token.
+- **One launch per token.** The GPU looks up its cached experts itself, results cross PCIe through mapped memory, and a
+  whole token (or a whole draft-check round) is a single CUDA graph, with a safe fallback if a graph can't run.
+- **Prompts in chunks.** Long prompts are processed 1,024 tokens at a time on tensor cores, streaming each needed expert
+  to the GPU once per chunk, ahead of time, while rarely used experts run on the CPU.
 
 ## Accuracy
 
-moex runs the published int4 model as it is, and every release is checked against a PyTorch reference implementation
-(`moex --check ref/eval1`, 72-107 positions). With the default int8 dense weights and int8 KV cache the mean KL
-divergence is 0.0015 and the top-1 token agrees with the reference 98.6% of the time. With full-precision dense
-weights (`--f16`) the int8 KV cache is the only difference left: mean KL 0.0005-0.0006, top-1 98.6-100% (it was
-exact, KL 1e-12, before the KV cache became int8). The model file itself is an int4 quantization
-of Qwen3.6-35B-A3B made by others (see Credits), so it is not identical to the original BF16 weights.
+moex runs the published int4 experts as they are, and every release is checked against a PyTorch reference
+implementation on three test sets (`moex --check ref/eval1`, `ref/code1`, `ref/agent1`: prose, code and an agent
+conversation, 330 positions):
+
+| | mean KL divergence | top-1 token agrees |
+|---|---|---|
+| default | 0.0024 | 99.4% |
+| default, with multi-token prediction | 0.0026 | 99.4% |
+| `--fast` | 0.0029-0.0031 | 99.1-99.7% |
+
+KL 0.0024 means the next-token probabilities are nearly identical to the reference's; the top-1 column is how often
+both pick the same next token. With full-precision dense weights (`--f16`) the int8 KV cache is the only difference
+left: mean KL 0.0005-0.0006. The model file itself is an int4 quantization of Qwen3.6-35B-A3B made by others (see
+Credits), so it is not identical to the original BF16 weights.
 
 ## Supported today
 
@@ -252,13 +268,14 @@ of Qwen3.6-35B-A3B made by others (see Credits), so it is not identical to the o
 
 ## Roadmap
 
-- **Linux** release binary (today: build from source).
+- **Linux** release binary (today: build from source). Next.
 - **GGUF support** and **more models:** load the GGUF files people already have, and other mixture-of-experts
   families (Qwen, DeepSeek, GLM, gpt-oss).
+- **More speed:** further lossless experiments, and opt-in modes that trade a little accuracy for speed, measured
+  and labelled like `--fast`.
 - **A chat page** in the browser, served by `moex serve`.
-- **Faster dense weights:** a finer 4-bit format for the parts every token reads (most of the time per token).
-- Even faster prompt reading, keeping agents' side requests from evicting the main conversation's cache, and several
-  conversations at once in `moex serve`.
+- Keeping agents' side requests from evicting the main conversation's cache, and several conversations at once in
+  `moex serve`.
 
 More plans will be announced soon.
 
@@ -279,6 +296,13 @@ model with `build/moex download`, then `build/moex chat --load`.
 | the API | `moex serve`, then `python tools/test_server.py` |
 | tool calling with the official SDKs | `moex serve`, then `python tools/test_tools.py` (`pip install openai anthropic`) |
 | prompts vs Qwen's chat template | `MOEX_DUMP_PROMPT=build\prompt_ids.txt moex serve`, then `python tools/check_template.py` |
+| server security and robustness | `moex serve`, then `python tools/test_security.py` and `python tools/test_robust.py` |
+| `/reset` in chat | `python tools/test_reset.py` |
+| download and PATH helpers (no GPU) | `build\test_download.exe`, `build\test_userenv.exe` |
+| the release benchmark | `python tools/bench.py` (1K / 8K prompts, MTP and `--fast`, prompt reading, VRAM, KL) |
+
+The release zips hold only what you need to run moex (`moex.exe`, `moex_hot.bin`, README, LICENSE); every test above
+is in this repository. CI builds both zips on every push and runs the checks that need no GPU.
 
 ## License and credits
 
