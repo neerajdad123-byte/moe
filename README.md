@@ -13,6 +13,9 @@ A 35-billion-parameter model, ~1.9x faster than tuned llama.cpp and ik_llama.cpp
 
 <img src="docs/speed.svg" alt="Decode speed at 1K-token prompts: moex 67.8 tokens/s with multi-token prediction vs ik_llama.cpp 36.0 and llama.cpp 33.3 tokens/s (both hand-tuned, no speculative decoding), 1.9x faster" width="760">
 
+<img src="docs/demo.gif" alt="moex chat in a terminal answering three messages in real time: an HTML explanation at 77.8 tokens/s, a leg-stretching routine of 1,204 tokens at 78.3 tokens/s, and a short reply at 68.6 tokens/s, on an RTX 4050 Laptop 6 GB" width="760"><br>
+<sub>Real time, RTX 4050 Laptop 6 GB, v0.2.0: <code>moex chat --load</code> at 68-78 tokens/s.</sub>
+
 </div>
 
 ## Get started in 3 steps
