@@ -33,6 +33,9 @@ def load(idx, name):
 def expert(idx, prefix):  # ref/qwen36_ref.py dequant_expert: [gate IxH | up IxH | down HxI]
     q = load(idx, prefix + "merged_weight"); s = load(idx, prefix + "qs")
     v = np.stack([q & 0xF, q >> 4], -1).reshape(-1).astype(np.int16)
+    if s.dtype == np.float16:  # zero-point experts: w = s * u + m, (s, m) per 32 inputs
+        sm = s.astype(np.float32).reshape(-1, 2)
+        return (v.astype(np.float32).reshape(-1, 32) * sm[:, :1] + sm[:, 1:]).reshape(-1)
     v = np.where(v >= 8, v - 16, v).astype(np.float32)
     return (v.reshape(-1, 64) * s.reshape(-1, 1)).reshape(-1)
 

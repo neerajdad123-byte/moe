@@ -82,33 +82,52 @@ int main() {
             for (int r = 0; r < 6; r++) { const int j = gg_vhead_src(h); ok &= u[2 + h * 6 + r] == w[2 + j * 6 + r]; }
         check(inv && ok, "value-head un-permutation inverts llama.cpp's reorder and leaves the leading rows");
     }
-    {  // int4 requantizer: decodes as packed, never worse than absmax/7, on smooth and already-quantized groups
+    {  // zero-point experts: Q4_K is carried over exactly (only s, m rounded to fp16); other types refit per 32
+        FILE* f = fopen("tests/gguf_blocks.bin", "rb");
+        uint32_t h[2];
+        while (f && fread(h, 4, 2, f) == 2) {
+            int bn, bb;
+            gg_block(h[0], bn, bb);
+            std::vector<uint8_t> raw((size_t)h[1] / bn * bb);
+            std::vector<float> want(h[1]);
+            fread(raw.data(), 1, raw.size(), f); fread(want.data(), 4, h[1], f);
+            if (h[0] != GG_Q4_K && h[0] != GG_Q6_K) continue;
+            std::vector<uint8_t> qb(h[1] / 2); std::vector<uint16_t> sm(h[1] / 32 * 2); std::vector<float> tmp(256);
+            gg_zp_row(h[0], raw.data(), (int)h[1], qb.data(), sm.data(), tmp.data());
+            double amax = 0, err = 0, ss = 0, ee = 0;
+            for (uint32_t i = 0; i < h[1]; i++) {
+                const float v = gg_half(sm[i / 32 * 2]) * ((qb[i / 2] >> (i % 2 * 4)) & 0xF) + gg_half(sm[i / 32 * 2 + 1]);
+                amax = std::max(amax, (double)std::fabs(want[i])); err = std::max(err, (double)std::fabs(v - want[i]));
+                ss += (double)want[i] * want[i]; ee += (double)(v - want[i]) * (v - want[i]);
+            }
+            if (h[0] == GG_Q4_K) check(err <= 2e-3 * amax, "zero point: Q4_K experts carried over exactly (max err " + std::to_string(err / amax) + " of max, fp16 s/m)");
+            else check(std::sqrt(ee / ss) < 0.1, "zero point: Q6_K requantized to 4 bits, relative RMS " + std::to_string(std::sqrt(ee / ss)));
+        }
+        if (f) fclose(f);
         std::mt19937 rng(3);
         std::normal_distribution<float> nd;
-        bool never_worse = true, decodes = true;
-        double e_mse = 0, e_max = 0;
-        for (int g = 0; g < 2000; g++) {
-            float x[64];
-            const float d = 0.01f * (1 + g % 7), m = 0.03f;
-            for (int i = 0; i < 64; i++) x[i] = g % 2 ? nd(rng) : d * (int)(rng() % 16) - m;  // odd: normal, even: a Q4_K-like grid
-            uint8_t qb[32]; float s;
-            gg_q4_rows(x, 1, 64, qb, &s);
-            float amax = 0;
-            for (float v : x) amax = std::max(amax, std::fabs(v));
-            double em = 0, ea = 0;
-            for (int i = 0; i < 64; i++) {
-                const int v = (qb[i / 2] >> (i % 2 * 4)) & 0xF, qi = v >= 8 ? v - 16 : v;
-                em += (x[i] - s * qi) * (x[i] - s * qi);
-                const float sa = amax / 7;
-                const int qa = std::clamp((int)std::nearbyint(x[i] * (7.0f / amax)), -8, 7);
-                ea += (x[i] - sa * qa) * (x[i] - sa * qa);
-                decodes &= qi >= -8 && qi <= 7;
+        bool never_worse = true, in_range = true;
+        double e_ls = 0, e_mm = 0;
+        for (int g = 0; g < 4000; g++) {
+            float x[32];
+            for (int i = 0; i < 32; i++) x[i] = g % 2 ? nd(rng) : 0.01f * (int)(rng() % 64) - 0.3f;  // odd: normal, even: a Q6_K-like grid
+            uint8_t u[32]; float s, m;
+            gg_zp_group(x, u, s, m);
+            float lo = x[0], hi = x[0];
+            for (float v : x) { lo = std::min(lo, v); hi = std::max(hi, v); }
+            const float s0 = (hi - lo) / 15;
+            double el = 0, em = 0;
+            for (int i = 0; i < 32; i++) {
+                in_range &= u[i] <= 15;
+                el += (x[i] - s * u[i] - m) * (x[i] - s * u[i] - m);
+                const int q0 = std::clamp((int)std::nearbyint((x[i] - lo) / s0), 0, 15);
+                em += (x[i] - s0 * q0 - lo) * (x[i] - s0 * q0 - lo);
             }
-            never_worse &= em <= ea * (1 + 1e-5);
-            e_mse += em; e_max += ea;
+            never_worse &= el <= em * (1 + 1e-5);
+            e_ls += el; e_mm += em;
         }
-        check(decodes && never_worse, "int4: least-squares scale search is never worse than absmax/7 (total sq. error " +
-                                      std::to_string(e_mse / e_max) + "x of absmax/7)");
+        check(in_range && never_worse, "zero point: least-squares refit never worse than min/max rounding (total sq. error " +
+                                       std::to_string(e_ls / e_mm) + "x)");
     }
     printf(fails ? "%d FAILED\n" : "all passed\n", fails);
     return fails ? 1 : 0;
