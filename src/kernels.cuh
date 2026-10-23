@@ -413,9 +413,16 @@ inline void router_topk(const float* logits, int E, int K, bool norm, int* idx, 
 // ---- K4: routed experts, int4 gs64 symmetric ----
 // Slot layout (= container): [gate IxH | up IxH | down HxI] packed int4 (low nibble first),
 // then f32 scales [gate Ix(H/64) | up Ix(H/64) | down Hx(I/64)].
+// Zero-point format (g_zp, a container whose expert .qs are F16): nibbles are unsigned u in [0, 15], w = s * u + m
+// with one half2 (s, m) per 32 inputs, same order. It holds GGUF Q4_K, AWQ and other asymmetric int4 exactly.
+// Every kernel reads 32 weights (one uint4) at a time, so g32 = row * (cols / 32) + c indexes both: f32 scale g32 / 2
+// (symmetric) or half2 g32 (zero point).
 constexpr int EH = 2048, EI = 512, EGS = 64, EGS_DENSE = 64;
-constexpr size_t EXPERT_Q_BYTES = (size_t)3 * EH * EI / 2;                           // 1,572,864
-constexpr size_t EXPERT_BYTES = EXPERT_Q_BYTES + (size_t)3 * EI * (EH / EGS) * 4;   // + 196,608
+constexpr size_t EXPERT_Q_BYTES = (size_t)3 * EH * EI / 2;                             // 1,572,864
+constexpr size_t EXPERT_BYTES_SYM = EXPERT_Q_BYTES + (size_t)3 * EI * (EH / EGS) * 4;  // + 196,608
+constexpr size_t EXPERT_BYTES_ZP = EXPERT_Q_BYTES + (size_t)3 * EI * (EH / 32) * 4;    // + 393,216
+inline bool g_zp = false;                          // set once at load, before any expert is touched
+inline size_t EXPERT_BYTES = EXPERT_BYTES_SYM;     // = EXPERT_BYTES_ZP with g_zp
 
 // 16 bytes = 32 int4 values; dot with 32 consecutive fp32 x values.
 // Dequant without int->float converts (low-throughput on Ada): u = nibble ^ 8 is v + 8 in [0,15], and the
@@ -434,6 +441,35 @@ __device__ __forceinline__ float dot32_i4(uint4 u, const float* __restrict__ x) 
             acc += (__int_as_float(0x4B000000u | ((q[j] >> (4 * n)) & 0xFu)) - 8388616.f) * xs[n];
     }
     return acc;
+}
+
+// Zero-point format: 32 unsigned nibbles . x, as s * sum(u x) + m * sum(x).
+__device__ __forceinline__ float dot32_u4(uint4 u, const float* __restrict__ x, float2 sm) {
+    const uint32_t q[4] = {u.x, u.y, u.z, u.w};
+    const float4* xv = reinterpret_cast<const float4*>(x);
+    float acc = 0.f, sx = 0.f;
+#pragma unroll
+    for (int j = 0; j < 4; j++) {
+        float4 a = xv[2 * j], b = xv[2 * j + 1];
+        const float xs[8] = {a.x, a.y, a.z, a.w, b.x, b.y, b.z, b.w};
+#pragma unroll
+        for (int n = 0; n < 8; n++) {
+            acc += (__int_as_float(0x4B000000u | ((q[j] >> (4 * n)) & 0xFu)) - 8388608.f) * xs[n];
+            sx += xs[n];
+        }
+    }
+    return sm.x * acc + sm.y * sx;
+}
+// The scale (and zero point) of 32-weight chunk g32; symmetric: (s, 0).
+template <bool Z>
+__device__ __forceinline__ float2 ld_sm(const float* __restrict__ sc, size_t g32) {
+    if constexpr (Z) return __half22float2(reinterpret_cast<const __half2*>(sc)[g32]);
+    else return make_float2(sc[g32 >> 1], 0.f);
+}
+template <bool Z>
+__device__ __forceinline__ float dotq(uint4 q, const float* __restrict__ x, float2 sm) {
+    if constexpr (Z) return dot32_u4(q, x, sm);
+    else return dot32_i4(q, x) * sm.x;
 }
 
 // Shared-memory layout for activations read 32 at a time per lane: lane c starts at element 32c, a 128-byte
@@ -554,7 +590,7 @@ inline int persistent_blocks() {
 
 // act[k][I] = silu(gate_k . x) * (up_k . x). One warp per (expert, row) at a time; rows are 1024 B = 64 uint4.
 // nh: optional device count of valid experts (<= K).
-template <int WARPS>
+template <int WARPS, bool Z = false>
 __global__ void expert_gate_up_k(const uint8_t* const* __restrict__ slots, int K, const int* __restrict__ nh,
                                  const float* __restrict__ x, float* __restrict__ act) {
     __shared__ __align__(16) float xs[xpad_size(EH)];
@@ -567,14 +603,12 @@ __global__ void expert_gate_up_k(const uint8_t* const* __restrict__ slots, int K
         const uint4* g = reinterpret_cast<const uint4*>(s + (size_t)row * (EH / 2));
         const uint4* u = reinterpret_cast<const uint4*>(s + (size_t)(EI + row) * (EH / 2));
         const float* sc = reinterpret_cast<const float*>(s + EXPERT_Q_BYTES);
-        const float* gsc = sc + row * (EH / EGS);
-        const float* usc = sc + EI * (EH / EGS) + row * (EH / EGS);
         float ag = 0.f, au = 0.f;
 #pragma unroll
-        for (int c = lane; c < EH / 32; c += 32) {  // uint4 c covers x[32c..32c+31], group c/2
+        for (int c = lane; c < EH / 32; c += 32) {  // uint4 c covers x[32c..32c+31]
             uint4 qg = __ldcs(g + c), qu = __ldcs(u + c);
-            ag += dot32_i4(qg, xs + 36 * c) * gsc[c >> 1];
-            au += dot32_i4(qu, xs + 36 * c) * usc[c >> 1];
+            ag += dotq<Z>(qg, xs + 36 * c, ld_sm<Z>(sc, (size_t)row * (EH / 32) + c));
+            au += dotq<Z>(qu, xs + 36 * c, ld_sm<Z>(sc, (size_t)(EI + row) * (EH / 32) + c));
         }
         ag = warp_sum(ag); au = warp_sum(au);
         if (lane == 0) act[r] = ag / (1.f + __expf(-ag)) * au;
@@ -583,7 +617,7 @@ __global__ void expert_gate_up_k(const uint8_t* const* __restrict__ slots, int K
 
 // out[H] = sum_k w[k] * (down_k . act_k). One warp per output row at a time; a down row is 256 B = 16 uint4,
 // so a warp covers two experts per iteration.
-template <int WARPS>
+template <int WARPS, bool Z = false>
 __global__ void expert_down_k(const uint8_t* const* __restrict__ slots, const float* __restrict__ w, int K,
                               const int* __restrict__ nh, const float* __restrict__ act, float* __restrict__ out) {
     if (g_skip) return;
@@ -594,21 +628,22 @@ __global__ void expert_down_k(const uint8_t* const* __restrict__ slots, const fl
     const int lane = threadIdx.x & 31, half_ = lane >> 4, c = lane & 15;
     constexpr int KMAX = 8;  // = top-k; all of a row's loads are issued before any math (latency-bound otherwise)
     for (int d = blockIdx.x * WARPS + (threadIdx.x >> 5); d < EH; d += gridDim.x * WARPS) {
-        uint4 q[KMAX / 2]; float sw[KMAX / 2];
+        uint4 q[KMAX / 2]; float2 sw[KMAX / 2];
 #pragma unroll
         for (int i = 0; i < KMAX / 2; i++) {
             int k = 2 * i + half_;
             if (k < K) {
                 const uint8_t* s = slots[k];
                 q[i] = __ldcs(reinterpret_cast<const uint4*>(s + (size_t)2 * EI * (EH / 2) + (size_t)d * (EI / 2)) + c);
-                sw[i] = w[k] * reinterpret_cast<const float*>(s + EXPERT_Q_BYTES)[2 * EI * (EH / EGS) + d * (EI / EGS) + (c >> 1)];
+                const float2 sm = ld_sm<Z>(reinterpret_cast<const float*>(s + EXPERT_Q_BYTES), (size_t)2 * EI * (EH / 32) + d * (EI / 32) + c);
+                sw[i] = make_float2(w[k] * sm.x, w[k] * sm.y);
             }
         }
         float acc = 0.f;
 #pragma unroll
         for (int i = 0; i < KMAX / 2; i++) {
             int k = 2 * i + half_;
-            if (k < K) acc += sw[i] * dot32_i4(q[i], as + k * xpad_size(EI) + 36 * c);
+            if (k < K) acc += dotq<Z>(q[i], as + k * xpad_size(EI) + 36 * c, sw[i]);
         }
         acc = warp_sum(acc);
         if (lane == 0) out[d] = acc;
@@ -622,6 +657,11 @@ inline void experts_forward(const uint8_t* const* slots, const float* w, int K, 
                             float* act, float* out, cudaStream_t st = 0, const int* nh = nullptr) {
     constexpr int WARPS = 8;
     int nb = persistent_blocks();
+    if (g_zp) {
+        expert_gate_up_k<WARPS, true><<<nb, WARPS * 32, 0, st>>>(slots, K, nh, x, act);
+        expert_down_k<WARPS, true><<<nb, WARPS * 32, K * xpad_size(EI) * sizeof(float), st>>>(slots, w, K, nh, act, out);
+        return;
+    }
     expert_gate_up_k<WARPS><<<nb, WARPS * 32, 0, st>>>(slots, K, nh, x, act);
     expert_down_k<WARPS><<<nb, WARPS * 32, K * xpad_size(EI) * sizeof(float), st>>>(slots, w, K, nh, act, out);
 }
@@ -644,7 +684,7 @@ struct Pair { int t, p; float w; };
 
 // act[p][row] = silu(gate . x_t) * (up . x_t) for every pair of item blockIdx.y. One warp per row; the row's
 // weights stay in registers while the warp walks the item's tokens.
-template <int WARPS>
+template <int WARPS, bool Z = false>
 __global__ void pairs_gate_up_k(const PairItem* __restrict__ items, const Pair* __restrict__ pairs,
                                 const float* __restrict__ X, float* __restrict__ act, const int* __restrict__ nitems = nullptr) {
     if (nitems && (int)blockIdx.y >= *nitems) return;  // MTP round graph: the item count is on the device
@@ -653,11 +693,11 @@ __global__ void pairs_gate_up_k(const PairItem* __restrict__ items, const Pair* 
     const uint4* g = reinterpret_cast<const uint4*>(it.slot + (size_t)row * (EH / 2));
     const uint4* u = reinterpret_cast<const uint4*>(it.slot + (size_t)(EI + row) * (EH / 2));
     const float* sc = reinterpret_cast<const float*>(it.slot + EXPERT_Q_BYTES);
-    uint4 qg[2], qu[2]; float sg[2], su[2];
+    uint4 qg[2], qu[2]; float2 sg[2], su[2];
     for (int i = 0; i < 2; i++) {  // EH/32 = 64 uint4 per row: two per lane
         int c = lane + 32 * i;
         qg[i] = __ldcs(g + c); qu[i] = __ldcs(u + c);
-        sg[i] = sc[row * (EH / EGS) + (c >> 1)]; su[i] = sc[EI * (EH / EGS) + row * (EH / EGS) + (c >> 1)];
+        sg[i] = ld_sm<Z>(sc, (size_t)row * (EH / 32) + c); su[i] = ld_sm<Z>(sc, (size_t)(EI + row) * (EH / 32) + c);
     }
     for (int j = 0; j < it.count; j++) {
         const Pair pr = pairs[it.start + j];
@@ -665,8 +705,8 @@ __global__ void pairs_gate_up_k(const PairItem* __restrict__ items, const Pair* 
         float ag = 0.f, au = 0.f;
         for (int i = 0; i < 2; i++) {
             int c = lane + 32 * i;
-            ag += dot32_i4(qg[i], x + 32 * c) * sg[i];
-            au += dot32_i4(qu[i], x + 32 * c) * su[i];
+            ag += dotq<Z>(qg[i], x + 32 * c, sg[i]);
+            au += dotq<Z>(qu[i], x + 32 * c, su[i]);
         }
         ag = warp_sum(ag); au = warp_sum(au);
         if (lane == 0) act[(size_t)pr.p * EI + row] = ag / (1.f + __expf(-ag)) * au;
@@ -675,19 +715,19 @@ __global__ void pairs_gate_up_k(const PairItem* __restrict__ items, const Pair* 
 
 // ypair[p][d] = w_p * (down . act_p). One warp per output row; the row (256 B) is one uint4 per lane of a
 // half-warp, and the two half-warps take alternate tokens.
-template <int WARPS>
+template <int WARPS, bool Z = false>
 __global__ void pairs_down_k(const PairItem* __restrict__ items, const Pair* __restrict__ pairs,
                              const float* __restrict__ act, float* __restrict__ ypair, const int* __restrict__ nitems = nullptr) {
     if (nitems && (int)blockIdx.y >= *nitems) return;
     const PairItem it = items[blockIdx.y];
     const int d = blockIdx.x * WARPS + (threadIdx.x >> 5), lane = threadIdx.x & 31, half_ = lane >> 4, c = lane & 15;
     const uint4 q = __ldcs(reinterpret_cast<const uint4*>(it.slot + (size_t)2 * EI * (EH / 2) + (size_t)d * (EI / 2)) + c);
-    const float s = reinterpret_cast<const float*>(it.slot + EXPERT_Q_BYTES)[2 * EI * (EH / EGS) + d * (EI / EGS) + (c >> 1)];
+    const float2 s = ld_sm<Z>(reinterpret_cast<const float*>(it.slot + EXPERT_Q_BYTES), (size_t)2 * EI * (EH / 32) + d * (EI / 32) + c);
     for (int j0 = 0; j0 < it.count; j0 += 2) {
         int j = j0 + half_;
         float v = 0.f;
         Pair pr = pairs[it.start + (j < it.count ? j : j0)];
-        if (j < it.count) v = s * dot32_i4(q, act + (size_t)pr.p * EI + 32 * c);
+        if (j < it.count) v = dotq<Z>(q, act + (size_t)pr.p * EI + 32 * c, s);
         for (int o = 8; o; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);  // sum within each half-warp
         if (c == 0 && j < it.count) ypair[(size_t)pr.p * EH + d] = pr.w * v;
     }
@@ -710,6 +750,11 @@ __global__ void pairs_reduce_k(const float* __restrict__ ypair, const float* __r
 inline void pairs_forward_dev(const PairItem* items, const int* nitems, int max_items, const Pair* pairs, const float* X,
                               float* act, float* ypair, cudaStream_t st) {
     constexpr int WARPS = 8;
+    if (g_zp) {
+        pairs_gate_up_k<WARPS, true><<<dim3(EI / WARPS, max_items), WARPS * 32, 0, st>>>(items, pairs, X, act, nitems);
+        pairs_down_k<WARPS, true><<<dim3(EH / WARPS, max_items), WARPS * 32, 0, st>>>(items, pairs, act, ypair, nitems);
+        return;
+    }
     pairs_gate_up_k<WARPS><<<dim3(EI / WARPS, max_items), WARPS * 32, 0, st>>>(items, pairs, X, act, nitems);
     pairs_down_k<WARPS><<<dim3(EH / WARPS, max_items), WARPS * 32, 0, st>>>(items, pairs, act, ypair, nitems);
 }
@@ -717,6 +762,11 @@ inline void pairs_forward(const PairItem* items, int n_items, const Pair* pairs,
                           cudaStream_t st = 0) {
     constexpr int WARPS = 8;
     if (!n_items) return;
+    if (g_zp) {
+        pairs_gate_up_k<WARPS, true><<<dim3(EI / WARPS, n_items), WARPS * 32, 0, st>>>(items, pairs, X, act);
+        pairs_down_k<WARPS, true><<<dim3(EH / WARPS, n_items), WARPS * 32, 0, st>>>(items, pairs, act, ypair);
+        return;
+    }
     pairs_gate_up_k<WARPS><<<dim3(EI / WARPS, n_items), WARPS * 32, 0, st>>>(items, pairs, X, act);
     pairs_down_k<WARPS><<<dim3(EH / WARPS, n_items), WARPS * 32, 0, st>>>(items, pairs, act, ypair);
 }
@@ -738,6 +788,22 @@ __device__ __forceinline__ void dq32_i4(uint4 u, float s, half* __restrict__ dst
             d2[n / 2] = __floats2half2_rn((__int_as_float(0x4B000000u | ((q[j] >> (4 * n)) & 0xFu)) - 8388616.f) * s,
                                           (__int_as_float(0x4B000000u | ((q[j] >> (4 * n + 4)) & 0xFu)) - 8388616.f) * s);
     }
+}
+// Zero-point format: s * u + m.
+__device__ __forceinline__ void dq32_u4(uint4 u, float2 sm, half* __restrict__ dst) {
+    const uint32_t q[4] = {u.x, u.y, u.z, u.w};
+#pragma unroll
+    for (int j = 0; j < 4; j++) {
+        half2* d2 = reinterpret_cast<half2*>(dst + 8 * j);
+#pragma unroll
+        for (int n = 0; n < 8; n += 2)
+            d2[n / 2] = __floats2half2_rn((__int_as_float(0x4B000000u | ((q[j] >> (4 * n)) & 0xFu)) - 8388608.f) * sm.x + sm.y,
+                                          (__int_as_float(0x4B000000u | ((q[j] >> (4 * n + 4)) & 0xFu)) - 8388608.f) * sm.x + sm.y);
+    }
+}
+template <bool Z>
+__device__ __forceinline__ void dq32(uint4 u, float2 sm, half* __restrict__ dst) {
+    if constexpr (Z) dq32_u4(u, sm, dst); else dq32_i4(u, sm.x, dst);
 }
 
 // C[128][16 * nj] (fp32, shared, aliasing As) = A rows . B^T over K = nk * TC_BK, nj = 1 or 2 token fragments.
@@ -782,6 +848,7 @@ struct TcSmem {
 static_assert(128 * TC_LD * sizeof(half) >= 128 * TC_BN * sizeof(float), "Cs must fit over As");
 
 // act[p][r0..r0+63] = silu(gate . x_t) * (up . x_t). Block (r0 / 64, item): local rows 0-63 gate, 64-127 up.
+template <bool Z = false>
 __global__ void __launch_bounds__(128) tc_gate_up_k(const PairItem* __restrict__ items, const Pair* __restrict__ pairs,
                                                     const float* __restrict__ X, float* __restrict__ act) {
     __shared__ TcSmem sm;
@@ -794,14 +861,14 @@ __global__ void __launch_bounds__(128) tc_gate_up_k(const PairItem* __restrict__
         const int nb = min(TC_BN, it.count - j0), nj = nb > 16 ? 2 : 1;
         if (tid < TC_BN) { const Pair pr = pairs[it.start + j0 + min(tid, nb - 1)]; tok[tid] = pr.t; pid[tid] = pr.p; }
         __syncthreads();
-        uint4 ua[2]; float sa[2], xb[TC_BN * TC_BK / 128];
+        uint4 ua[2]; float2 sa[2]; float xb[TC_BN * TC_BK / 128];
         tc_tile(EH / TC_BK, nj, As, Bs, sm.Cs(),
             [&](int k0) {  // 128 rows x 64 = two uint4 per row; gate row g is merged row g, up row g is EI + g
 #pragma unroll
                 for (int i = 0; i < 2; i++) {
                     const int e = tid + 128 * i, r = e >> 1, h = e & 1, gr = r < 64 ? r0 + r : EI + r0 + r - 64;
                     ua[i] = __ldg(reinterpret_cast<const uint4*>(it.slot + (size_t)gr * (EH / 2) + (k0 + 32 * h) / 2));
-                    sa[i] = sc[gr * (EH / EGS) + k0 / EGS];
+                    sa[i] = ld_sm<Z>(sc, (size_t)gr * (EH / 32) + (k0 + 32 * h) / 32);
                 }
 #pragma unroll
                 for (int i = 0; i < TC_BN * TC_BK / 128; i++) {
@@ -811,7 +878,7 @@ __global__ void __launch_bounds__(128) tc_gate_up_k(const PairItem* __restrict__
             },
             [&] {
 #pragma unroll
-                for (int i = 0; i < 2; i++) { const int e = tid + 128 * i; dq32_i4(ua[i], sa[i], As + (e >> 1) * TC_LD + 32 * (e & 1)); }
+                for (int i = 0; i < 2; i++) { const int e = tid + 128 * i; dq32<Z>(ua[i], sa[i], As + (e >> 1) * TC_LD + 32 * (e & 1)); }
 #pragma unroll
                 for (int i = 0; i < TC_BN * TC_BK / 128; i++) {
                     const int e = tid + 128 * i;
@@ -831,6 +898,7 @@ __global__ void __launch_bounds__(128) tc_gate_up_k(const PairItem* __restrict__
 }
 
 // ypair[p][d0..d0+127] = w_p * (down . act_p). Block (d0 / 128, item).
+template <bool Z = false>
 __global__ void __launch_bounds__(128) tc_down_k(const PairItem* __restrict__ items, const Pair* __restrict__ pairs,
                                                  const float* __restrict__ act, float* __restrict__ ypair) {
     __shared__ TcSmem sm;
@@ -839,20 +907,20 @@ __global__ void __launch_bounds__(128) tc_down_k(const PairItem* __restrict__ it
     const PairItem it = items[blockIdx.y];
     const int d0 = blockIdx.x * 128, tid = threadIdx.x;
     const uint8_t* dq = it.slot + (size_t)2 * EI * (EH / 2);
-    const float* sc = reinterpret_cast<const float*>(it.slot + EXPERT_Q_BYTES) + 2 * EI * (EH / EGS);
+    const float* sc = reinterpret_cast<const float*>(it.slot + EXPERT_Q_BYTES) + (Z ? 2 * EI * (EH / 32) : 2 * EI * (EH / EGS));
     half *As = sm.As(), *Bs = sm.Bs();
     for (int j0 = 0; j0 < it.count; j0 += TC_BN) {
         const int nb = min(TC_BN, it.count - j0), nj = nb > 16 ? 2 : 1;
         if (tid < TC_BN) { const Pair pr = pairs[it.start + j0 + min(tid, nb - 1)]; pid[tid] = pr.p; wt[tid] = pr.w; }
         __syncthreads();
-        uint4 ua[2]; float sa[2], xb[TC_BN * TC_BK / 128];
+        uint4 ua[2]; float2 sa[2]; float xb[TC_BN * TC_BK / 128];
         tc_tile(EI / TC_BK, nj, As, Bs, sm.Cs(),
             [&](int k0) {
 #pragma unroll
                 for (int i = 0; i < 2; i++) {
                     const int e = tid + 128 * i, d = d0 + (e >> 1), h = e & 1;
                     ua[i] = __ldg(reinterpret_cast<const uint4*>(dq + (size_t)d * (EI / 2) + (k0 + 32 * h) / 2));
-                    sa[i] = sc[d * (EI / EGS) + k0 / EGS];
+                    sa[i] = ld_sm<Z>(sc, (size_t)d * (EI / 32) + (k0 + 32 * h) / 32);
                 }
 #pragma unroll
                 for (int i = 0; i < TC_BN * TC_BK / 128; i++) {
@@ -862,7 +930,7 @@ __global__ void __launch_bounds__(128) tc_down_k(const PairItem* __restrict__ it
             },
             [&] {
 #pragma unroll
-                for (int i = 0; i < 2; i++) { const int e = tid + 128 * i; dq32_i4(ua[i], sa[i], As + (e >> 1) * TC_LD + 32 * (e & 1)); }
+                for (int i = 0; i < 2; i++) { const int e = tid + 128 * i; dq32<Z>(ua[i], sa[i], As + (e >> 1) * TC_LD + 32 * (e & 1)); }
 #pragma unroll
                 for (int i = 0; i < TC_BN * TC_BK / 128; i++) {
                     const int e = tid + 128 * i;
@@ -881,6 +949,11 @@ __global__ void __launch_bounds__(128) tc_down_k(const PairItem* __restrict__ it
 inline void pairs_forward_tc(const PairItem* items, int n_items, const Pair* pairs, const float* X, float* act, float* ypair,
                              cudaStream_t st = 0) {
     if (!n_items) return;
+    if (g_zp) {
+        tc_gate_up_k<true><<<dim3(EI / 64, n_items), 128, 0, st>>>(items, pairs, X, act);
+        tc_down_k<true><<<dim3(EH / 128, n_items), 128, 0, st>>>(items, pairs, act, ypair);
+        return;
+    }
     tc_gate_up_k<<<dim3(EI / 64, n_items), 128, 0, st>>>(items, pairs, X, act);
     tc_down_k<<<dim3(EH / 128, n_items), 128, 0, st>>>(items, pairs, act, ypair);
 }

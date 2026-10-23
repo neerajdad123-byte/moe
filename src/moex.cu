@@ -213,7 +213,15 @@ struct Engine {
     bool prof = false;
     double tp[8] = {};
 
-    explicit Engine(const char* root, int ctx_) : C(root), ctx(ctx_) {}
+    explicit Engine(const char* root, int ctx_) : C(root), ctx(ctx_) {
+        // the expert format, from the scales' type: F32 = int4 gs64 symmetric, F16 = (scale, zero point) per 32 inputs
+        const StTensor& qs = C.at("model.layers.0.mlp.experts.0.qs");
+        g_zp = qs.dtype == "F16";
+        EXPERT_BYTES = g_zp ? EXPERT_BYTES_ZP : EXPERT_BYTES_SYM;
+        if (qs.bytes != EXPERT_BYTES - EXPERT_Q_BYTES) { fprintf(stderr, "unexpected expert scales (%s, %llu bytes)\n", qs.dtype.c_str(), (unsigned long long)qs.bytes); exit(1); }
+        cpu.zp = g_zp;
+        RS = EXPERT_BYTES - EXPERT_Q_BYTES + 4096; RSLOT = RQ + RS;
+    }
     ~Engine() {
         if (pinner.joinable()) pinner.join();
         { std::lock_guard<std::mutex> g(mu); stop_loader = true; }
@@ -301,7 +309,8 @@ struct Engine {
     // them at layer l+1 (MOEX_AHEAD=k, default 3: two layers before they're needed; 0 = off).
     // An expert not in the cache is still read through the file map (slow, correct).
     // The file offsets aren't 4 KB aligned: each part is read as its aligned superset, so a slot is [Q+4K][S+4K].
-    static constexpr size_t RQ = EXPERT_Q_BYTES + 4096, RS = EXPERT_BYTES - EXPERT_Q_BYTES + 4096, RSLOT = RQ + RS;
+    static constexpr size_t RQ = EXPERT_Q_BYTES + 4096;
+    size_t RS = 0, RSLOT = 0;  // set with the expert format (constructor)
     int rc_n = 0, ahead_k = 0;
     bool rc_victim = false;
     uint8_t* rc_base = nullptr;
@@ -913,6 +922,7 @@ struct Engine {
             std::string ep = (l < NL ? "model.layers." + std::to_string(l) + "." : std::string("mtp.layers.0.")) + "mlp.experts." + std::to_string(e) + ".";
             eq[l * E + e] = C.map(ep + "merged_weight");
             es[l * E + e] = (const float*)C.map(ep + "qs");
+            if (C.at(ep + "qs").bytes != EXPERT_BYTES - EXPERT_Q_BYTES) { fprintf(stderr, "%sqs: not the model's expert format\n", ep.c_str()); exit(1); }
         }
         low_ram = low_ram_machine();
         admit_min = getenv("MOEX_ADMIT_MIN") ? atof(getenv("MOEX_ADMIT_MIN")) : low_ram ? 0.0 : admit_min;
