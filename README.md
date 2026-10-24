@@ -135,13 +135,14 @@ moex chat --model C:\models\Qwen3.6-35B-A3B-Q4_K_M-moex
   uncensored / abliterated builds, ...). Other models are refused with the reason.
 - **Which quants:** Q8_0, Q6_K, Q5_K, Q4_K, Q3_K, Q2_K, Q4_0/1, Q5_0/1, IQ4_XS, IQ4_NL, IQ3_S, IQ3_XXS, MXFP4, BF16,
   F16 (any mix, e.g. Unsloth's UD files). Not IQ2 / IQ1.
-- **Disk and time:** a ~23 GB folder next to the GGUF (`--out DIR` to choose), ~2-5 minutes. The GGUF is not
+- **Disk and time:** a ~24 GB folder next to the GGUF (`--out DIR` to choose), ~2-5 minutes. The GGUF is not
   changed or needed afterwards.
 - **Accuracy:** Q4_K experts are carried over exactly; moex runs them in its own format (a scale and a zero point per
   32 weights). Other quant types are refit to 4 bits. On the ggml-org Q4_K_M file moex stays as close to the
   default model's outputs as llama.cpp running the same file (mean KL 0.026 vs 0.020 on prose, 0.0007 vs 0.0012 on
   code): the difference you see is mostly the GGUF's own quantization.
-- **Speed:** these experts take 11% more memory than the default model's, so expect slightly fewer tokens/s.
+- **Speed:** these experts take 2.8% more memory than the default model's: Ornith-1.5 ran at 68.8 tok/s with MTP
+  on the test laptop (default model 73.4 in the same run).
 - **MTP:** files with the MTP layer (`-MTP` in the name, `nextn` in llama.cpp) keep it; files without run without
   multi-token prediction.
 - **Chat format:** the GGUF's own chat template is kept and honored (Qwen's, Unsloth's and Ornith's variants are

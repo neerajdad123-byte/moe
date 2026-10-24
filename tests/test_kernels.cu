@@ -274,7 +274,7 @@ int main(int argc, char** argv) {
             const float* sf = (const float*)sv.data();
             zp[k].assign(EXPERT_BYTES_ZP, 0);
             wf[k].resize((size_t)3 * EI * EH);
-            std::vector<float> row(EH), tmp(256);
+            std::vector<float> row(EH), tmp(EH);
             for (int r = 0; r < 2 * EI + EH; r++) {  // gate, up rows (EH inputs), then down rows (EI inputs)
                 const int cols = r < 2 * EI ? EH : EI, rr = r < 2 * EI ? r : r - 2 * EI;
                 const size_t w0 = r < 2 * EI ? (size_t)r * EH : (size_t)2 * EI * EH + (size_t)rr * EI;  // weight index of the row

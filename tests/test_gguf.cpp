@@ -69,6 +69,12 @@ int main() {
         threw = false;
         try { Gguf t(cut2); } catch (const std::exception&) { threw = true; }
         check(threw, "truncated header is refused");
+        std::string z = b;  // tensor "w" with a zero dimension: refused, not a division by zero
+        z.replace(z.find(std::string("w\x02\0\0\0", 5)) + 5, 8, std::string(8, '\0'));
+        f = fopen((cut + "3").c_str(), "wb"); fwrite(z.data(), 1, z.size(), f); fclose(f);
+        threw = false;
+        try { Gguf t(cut + "3"); } catch (const std::exception&) { threw = true; }
+        check(threw, "zero tensor dimension is refused");
     }
     {  // llama.cpp puts HF value head 2 * (j % 16) + j / 16 at GGUF head j; un-permuting must invert that exactly
         bool inv = true;
@@ -92,7 +98,7 @@ int main() {
             std::vector<float> want(h[1]);
             fread(raw.data(), 1, raw.size(), f); fread(want.data(), 4, h[1], f);
             if (h[0] != GG_Q4_K && h[0] != GG_Q6_K) continue;
-            std::vector<uint8_t> qb(h[1] / 2); std::vector<uint8_t> cs(h[1] / 32 * 2); std::vector<uint16_t> sup(h[1] / 256 * 2); std::vector<float> tmp(256);
+            std::vector<uint8_t> qb(h[1] / 2); std::vector<uint8_t> cs(h[1] / 32 * 2); std::vector<uint16_t> sup(h[1] / 256 * 2); std::vector<float> tmp(h[1]);
             gg_zp_row(h[0], raw.data(), (int)h[1], qb.data(), cs.data(), sup.data(), tmp.data());
             double amax = 0, err = 0, ss = 0, ee = 0;
             for (uint32_t i = 0; i < h[1]; i++) {

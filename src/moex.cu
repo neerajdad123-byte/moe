@@ -2322,8 +2322,8 @@ int main(int argc, char** argv) {
                 "  moex chat              chat in this terminal (/reset new conversation, /exit quit)\n"
                 "  moex serve             OpenAI-compatible API on http://127.0.0.1:8765/v1\n"
                 "  moex bench             measure speed on this PC (~2-4 min): MTP off / on / --fast, specs, a line to share\n"
-                "  moex import FILE.gguf  convert a Qwen3.5/3.6-35B-A3B GGUF (or a finetune) once to run it (~21 GB; --out DIR)\n"
-                "  moex install          put moex on your PATH, so `moex` works in any terminal\n"
+                "  moex import FILE.gguf  convert a Qwen3.5/3.6-35B-A3B GGUF (or a finetune) once to run it (~24 GB; --out DIR)\n"
+                "  moex install           put moex on your PATH, so `moex` works in any terminal\n"
                 "  moex help | -h | --help, moex --version\n\n"
                 "Options:\n"
                 "  --load                 load everything before the prompt (~30 s), then every reply is full speed\n"
@@ -2354,8 +2354,10 @@ int main(int argc, char** argv) {
         if (import_src.empty()) { fprintf(stderr, "usage: moex import FILE.gguf [--out DIR]\n"); return 2; }
         return import_gguf(import_src, out_dir);
     }
-    if (std::filesystem::path(model).extension() == ".gguf") {
-        fprintf(stderr, "moex runs its own model format. Convert this GGUF once (~21 GB of disk, a few minutes):\n"
+    std::string ext = std::filesystem::path(model).extension().string();
+    for (auto& ch : ext) ch = (char)tolower((unsigned char)ch);
+    if (ext == ".gguf") {
+        fprintf(stderr, "moex runs its own model format. Convert this GGUF once (~24 GB of disk, a few minutes):\n"
                         "  moex import \"%s\"\nthen pass the folder it prints to --model.\n", model.c_str());
         return 1;
     }

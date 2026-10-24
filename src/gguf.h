@@ -298,8 +298,8 @@ static void gg_zp_group(const float* x, uint8_t* u, float& s, float& m) {
 
 // One row of a GGUF expert tensor (cols inputs) -> nibble bytes (element 2k low, 2k + 1 high), [sc, mn] per 32 and
 // (d, dm) per 256. Other types than Q4_K: (s, m) fitted per 32, then d = max s / 255, dm = max |m| / 127 over the 256,
-// and the nibbles rounded again on the final grid.
-static void gg_zp_row(uint32_t type, const uint8_t* src, int cols, uint8_t* qb, uint8_t* cs, uint16_t* sup, float* tmp) {
+// and the nibbles rounded again on the final grid; w[cols] gets the row's values (not for Q4_K, which is copied).
+static void gg_zp_row(uint32_t type, const uint8_t* src, int cols, uint8_t* qb, uint8_t* cs, uint16_t* sup, float* w) {
     uint8_t u[256];
     for (int b = 0; b < cols / 256; b++) {
         uint8_t* c = cs + 16 * b;
@@ -307,6 +307,7 @@ static void gg_zp_row(uint32_t type, const uint8_t* src, int cols, uint8_t* qb, 
         else {
             int bn, bb;
             gg_block(type, bn, bb);
+            float* tmp = w + 256 * b;
             gg_dequant(type, src + (size_t)b * 256 / bn * bb, 256, tmp);
             float s[8], m[8], smax = 0, mmax = 0;
             for (int g = 0; g < 8; g++) {
@@ -423,13 +424,18 @@ private:
             Tensor x;
             const uint32_t nd = rd<uint32_t>();
             if (nd < 1 || nd > 4) throw std::runtime_error("tensor " + name + " has " + std::to_string(nd) + " dimensions");
-            for (uint32_t d = 0; d < nd; d++) { x.ne.push_back((int64_t)rd<uint64_t>()); x.n *= x.ne.back(); }
+            for (uint32_t d = 0; d < nd; d++) {
+                x.ne.push_back((int64_t)rd<uint64_t>());
+                if (x.ne.back() <= 0 || x.ne.back() > (int64_t)(size + 1) * 2 || (x.n *= x.ne.back()) > (int64_t)(size + 1) * 2)  // 2 elements per byte at most
+                    throw std::runtime_error("tensor " + name + " has an invalid shape (corrupt GGUF?)");
+            }
             x.type = rd<uint32_t>();
             offs.push_back({name, rd<uint64_t>()});
             t[name] = x;
         }
         const Kv* al = get("general.alignment");
         const uint64_t align = al ? (uint64_t)al->num : 32;
+        if (align == 0 || (align & (align - 1)) || align > 65536) throw std::runtime_error("GGUF general.alignment " + std::to_string(align) + " is invalid");
         const uint64_t start = (pos + align - 1) / align * align;
         for (auto& [name, off] : offs) {
             Tensor& x = t[name];
@@ -655,15 +661,15 @@ static void gg_dense_layer(const Gguf& g, int l, const std::string& pre, std::ve
 }
 
 // Block l's 256 experts -> moex zero-point int4: per expert [gate IxH | up IxH | down HxI] packed nibbles, then the
-// scale part (gg_zp_row). Returns the largest per-expert relative RMS error against the GGUF's own values (Q4_K: 0),
-// for the log.
+// scale part (gg_zp_row). Returns the largest per-expert relative RMS error against the GGUF's own values (Q4_K
+// tensors are copied, error 0, not recomputed), for the log.
 static double gg_experts(const Gguf& g, int l, std::vector<uint8_t>& q, std::vector<uint8_t>& s) {
     const std::string p = "blk." + std::to_string(l) + ".";
     const Gguf::Tensor* t[3] = {&g.at(p + "ffn_gate_exps.weight"), &g.at(p + "ffn_up_exps.weight"), &g.at(p + "ffn_down_exps.weight")};
     q.resize(GG_E * GG_EXPERT_Q); s.resize(GG_E * GG_EXPERT_S);
     std::vector<double> err(GG_E);
     gg_par_for(GG_E, [&](int64_t e) {
-        std::vector<float> w(GG_D), tmp(256);
+        std::vector<float> w(GG_D);
         uint8_t* qe = q.data() + e * GG_EXPERT_Q;
         uint8_t* se = s.data() + e * GG_EXPERT_S;
         double ee = 0, ss = 0;
@@ -675,9 +681,8 @@ static double gg_experts(const Gguf& g, int l, std::vector<uint8_t>& q, std::vec
                 const size_t c0 = part < 2 ? (size_t)row * (GG_D / 32) : (size_t)2 * GG_I * (GG_D / 32) + (size_t)r * (GG_I / 32);
                 uint8_t* cr = se + 2 * c0;
                 uint16_t* sr = (uint16_t*)(se + GG_CHUNKS * 2) + 2 * (c0 / 8);
-                gg_zp_row(t[part]->type, t[part]->data + (e * rows + r) * t[part]->row_bytes, cols, qr, cr, sr, tmp.data());
-                g.rows(*t[part], e * rows + r, 1, w.data());
-                for (int i = 0; i < cols; i++) {
+                gg_zp_row(t[part]->type, t[part]->data + (e * rows + r) * t[part]->row_bytes, cols, qr, cr, sr, w.data());
+                for (int i = 0; t[part]->type != GG_Q4_K && i < cols; i++) {
                     const float v = gg_zp_at(qr, cr, sr, i);
                     ee += (double)(w[i] - v) * (w[i] - v); ss += (double)w[i] * w[i];
                 }
@@ -725,6 +730,7 @@ static int import_gguf(const std::string& src, std::string out) {
             fprintf(stderr, "%s already holds a model. Use it: moex chat --model \"%s\" (or delete the folder to import again)\n", out.c_str(), out.c_str());
             return 1;
         }
+        if (fs::exists(out)) { fprintf(stderr, "%s already exists: choose another folder with --out DIR\n", out.c_str()); return 1; }
         Gguf g(src);
         bool mtp = false;
         gg_check_shape(g, mtp);
