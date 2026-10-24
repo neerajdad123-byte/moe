@@ -6,6 +6,10 @@ KL uses llama's top N and spreads the rest of its mass evenly over the other tok
 outside llama's top N is printed: when it is ~0 the KL is exact to that size.
 
   python tools/llama_check.py GGUF SET... [--server PATH] [--n-probs 1000]
+
+--dump DIR also writes llama.cpp's own outputs as a --check set per SET (DIR/<set name>: meta.json and per position
+the log-probabilities, the tail spread evenly), so `moex --check DIR/<set name> --model IMPORTED` measures moex
+against llama.cpp on the same GGUF: the test for finetunes, which have no reference of their own.
 """
 import argparse, json, math, os, subprocess, sys, time, urllib.request
 import numpy as np
@@ -16,6 +20,7 @@ ap.add_argument("sets", nargs="+")
 ap.add_argument("--server", default=r"C:\Users\neera\tools\llama.cpp-b11756\bin\llama-server.exe")
 ap.add_argument("--n-probs", type=int, default=1000)
 ap.add_argument("--port", type=int, default=8093)
+ap.add_argument("--dump")
 a = ap.parse_args()
 V = 248320
 URL = f"http://127.0.0.1:{a.port}"
@@ -42,6 +47,10 @@ try:
     for s in a.sets:
         m = json.load(open(os.path.join(s, "meta.json")))
         ids, np_ = m["ids"], m["n_prompt"]
+        out = os.path.join(a.dump, os.path.basename(os.path.normpath(s))) if a.dump else None
+        if out:
+            os.makedirs(out, exist_ok=True)
+            json.dump(m, open(os.path.join(out, "meta.json"), "w"))
         kls, agree, n, tail = [], 0, 0, []
         for pos in range(np_ - 1, len(ids)):
             f = os.path.join(s, f"p{pos:03d}_logits.bin")
@@ -52,6 +61,7 @@ try:
             rest = max(1.0 - sum(q.values()), 1e-30) / (V - len(q))
             lq = np.full(V, math.log(rest))
             for i, p in q.items(): lq[i] = math.log(max(p, 1e-30))
+            if out: lq.astype(np.float32).tofile(os.path.join(out, f"p{pos:03d}_logits.bin"))
             kls.append(float((pr * (lp - lq)).sum()))
             agree += max(q, key=q.get) == int(ref.argmax())
             tail.append(float(1.0 - pr[list(q)].sum()))
