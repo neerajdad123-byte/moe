@@ -145,15 +145,14 @@ Refused: openbmb MiniCPM-V-4.7-35B-A3B (vocabulary 248,144, not 248,320).
 |---|---|---|---|
 | `C:\models\qwen36_i4_gs64` | 24 GB | the default model (colibri int4 + MTP head) | yes |
 | `C:\models\gguf\Qwen3.6-35B-A3B-Q4_K_M.gguf` | 20 GB (19.0 GiB) | ggml-org GGUF, downloaded 2026-10-12 | the test file |
-| `C:\models\gguf\Qwen3.6-35B-A3B-Q4_K_M-zp` | 22 GB | its moex import, compact zero-point format | delete when done testing |
-| `C:\models\gguf\dl\Ornith-1.5-35B-Q4_K_M.gguf` | 21.7 GB | Ornith-1.5 GGUF, downloaded 2026-10-24 07:18-08:54 | tests done: user's call |
-| `C:\models\gguf\dl\Ornith-1.5-35B-Q4_K_M-moex` | 23 GB | its moex import (runs with `--model`), made 18:54 | user's call |
 | `moe-v2\build\llamaref_ornith\` | ~300 MB | llama.cpp's outputs on Ornith as `--check` sets | test data (not in git) |
 | `C:\models\gguf\dl\ornith_curl.log`, `C:\models\gguf\curl.log` | <1 MB | download logs | can delete |
 | `moe-v2\build\llamaref_qwen36\` | 314 MB | llama.cpp's outputs on the ggml-org GGUF as `--check` sets | test data (not in git) |
 | `moe-v2\build\*.sh`, `*.bat` | small | gate scripts: `zp_gate.sh`, `z8_gate.sh`, `llama_ref_gate.sh`, `zp_test.bat` | not in git |
 
 Free on C: 38 GB at 18:51, ~16 GB after the Ornith import at 18:55 (424 GB disk).
+Deleted on the user's request at 2026-10-24 ~19:10: the Qwen3.6 `-zp` import (22 GB), the Ornith GGUF (21.7 GB) and
+its import (23 GB). Free on C: afterwards: 79.7 GB.
 
 Hand-over notes: `C:\Users\neera\AppData\Local\Claude-Data\claude_pzs8sxrjxfjjc\side-session-notes\local_4825b7a9-af6b-4b01-870b-59d11a1b098c\gguf-import-state.md`.
 GPU queue logs: `C:\Users\neera\OneDrive\Desktop\gpu-queue\logs\` (job names `gguf-*`, `zp-*`, `z8-*`, `llamaref-*`, `tpl-*`).
