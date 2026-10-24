@@ -1,19 +1,31 @@
-"""moex serve's prompts vs Qwen3.6's official chat template, token for token (tools, tool calls, tool responses,
-thinking, multi-turn). Start the server with the prompt dump on, then run this:
+"""moex's prompts vs the chat template, token for token (tools, tool calls, tool responses, thinking, multi-turn).
+Against moex serve: start the server with the prompt dump on, then run this:
 
   set MOEX_DUMP_PROMPT=build\\prompt_ids.txt & moex serve
   python tools/check_template.py [http://127.0.0.1:8765] [build/prompt_ids.txt]
 
-Needs jinja2 and tokenizers (pip install jinja2 tokenizers); the template comes from Hugging Face.
+Offline (no model, no GPU): moex's renderer through build/test_template.exe, e.g. against the template a
+`moex import` kept (TEMPLATE_DIR/chat_template.jinja; Qwen's own when the folder has none):
+
+  python tools/check_template.py --offline [TEMPLATE_DIR]
+
+Needs jinja2 and tokenizers (pip install jinja2 tokenizers); without a chat_template.jinja the template comes from
+Hugging Face. The tokenizer is QWEN36_MODEL's.
 """
-import json, os, sys, urllib.request
+import json, os, subprocess, sys, urllib.request
 import jinja2
 from tokenizers import Tokenizer
 
-BASE = sys.argv[1] if len(sys.argv) > 1 else "http://127.0.0.1:8765"
-DUMP = sys.argv[2] if len(sys.argv) > 2 else os.path.join("build", "prompt_ids.txt")
+OFFLINE = "--offline" in sys.argv
+args = [a for a in sys.argv[1:] if a != "--offline"]
 MODEL = os.environ.get("QWEN36_MODEL", r"C:\models\qwen36_i4_gs64")
-TPL = urllib.request.urlopen("https://huggingface.co/Qwen/Qwen3.6-35B-A3B/resolve/main/chat_template.jinja").read().decode()
+BASE = args[0] if args and not OFFLINE else "http://127.0.0.1:8765"
+DUMP = args[1] if len(args) > 1 and not OFFLINE else os.path.join("build", "prompt_ids.txt")
+TPL_DIR = args[0] if args and OFFLINE else MODEL
+TPL_FILE = os.path.join(TPL_DIR, "chat_template.jinja")  # an imported GGUF's own template (moex import)
+TPL = open(TPL_FILE, encoding="utf-8").read() if os.path.exists(TPL_FILE) else \
+    urllib.request.urlopen("https://huggingface.co/Qwen/Qwen3.6-35B-A3B/resolve/main/chat_template.jinja").read().decode()
+print("template:", TPL_FILE if os.path.exists(TPL_FILE) else "Qwen/Qwen3.6-35B-A3B (Hugging Face)")
 tok = Tokenizer.from_file(os.path.join(MODEL, "tokenizer.json"))
 
 def raise_exception(m): raise ValueError(m)
@@ -34,6 +46,12 @@ def reference(messages, tools, think):
     return tok.encode(text, add_special_tokens=False).ids
 
 def moex(messages, tools, think):
+    if OFFLINE:
+        req = os.path.join("build", "template_request.json")
+        json.dump({"messages": messages, "tools": tools or [], "think": think}, open(req, "w", encoding="utf-8"), ensure_ascii=False)
+        out = subprocess.run([os.path.join("build", "test_template.exe"), os.path.join(MODEL, "tokenizer.json"), TPL_DIR, req],
+                             capture_output=True, text=True, check=True).stdout
+        return [int(x) for x in out.strip().split(",")]
     body = {"messages": messages, "max_tokens": 1, "chat_template_kwargs": {"enable_thinking": think}}
     if tools: body["tools"] = tools
     req = urllib.request.Request(BASE + "/v1/chat/completions", data=json.dumps(body).encode(), headers={"Content-Type": "application/json"})
@@ -67,7 +85,23 @@ cases = [
         {"role": "assistant", "content": "", "tool_calls": [call(3, "write_file", {"path": "a/b.txt", "content": "line 1\nline 2", "options": {"mode": "w", "n": 2}})]},
         {"role": "tool", "tool_call_id": "call_3", "content": "ok"},
         {"role": "user", "content": "Thanks. What did you save?"}], [write], False),
+    ("multi-turn, earlier turn with reasoning", [{"role": "user", "content": "2+2?"},
+                                                 {"role": "assistant", "content": "4", "reasoning_content": "Simple sum."},
+                                                 {"role": "user", "content": "And 3+3?"}], None, True),
 ]
+if "merged_system" in TPL:  # finetunes' variant (Unsloth's fixes): developer role, two leading system messages, str() args
+    flags = {"type": "function", "function": {"name": "search", "description": "Search",
+             "parameters": {"type": "object", "properties": {"q": {"type": "string"}, "exact": {"type": "boolean"},
+                                                             "limit": {"type": "integer"}, "tags": {"type": "array"}}}}}
+    cases += [
+        ("developer + system messages merged", [{"role": "developer", "content": "Be brief."}, {"role": "system", "content": "Answer in French."},
+                                                {"role": "user", "content": "Hi"}], None, False),
+        ("developer + tools", [{"role": "developer", "content": "Use tools."}, {"role": "user", "content": "Find moex"}], [flags], False),
+        ("tool args: bool, null, list", [
+            {"role": "user", "content": "Search."},
+            {"role": "assistant", "content": "", "tool_calls": [call(4, "search", {"q": "moex", "exact": True, "limit": None, "tags": ["a", "b"]})]},
+            {"role": "tool", "tool_call_id": "call_4", "content": "3 results"}], [flags], False),
+    ]
 
 bad = 0
 for name, messages, tools, think in cases:

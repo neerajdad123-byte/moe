@@ -26,5 +26,6 @@ if "%1"=="dev" set FAT=-arch=native
 cl /nologo /std:c++20 /O2 /EHsc /utf-8 /I "%CUDA_PATH%\include" tests\test_tokenizer.cpp /Fe:build\test_tokenizer.exe /Fo:build\ > build\cl_tok.log || exit /b 1
 cl /nologo /std:c++20 /O2 /EHsc tests\test_spec.cpp /Fe:build\test_spec.exe /Fo:build\ > build\cl_spec.log || exit /b 1
 cl /nologo /std:c++20 /O2 /EHsc /utf-8 tests\test_dense.cpp /Fe:build\test_dense.exe /Fo:build\ > build\cl_dense.log || exit /b 1
+cl /nologo /std:c++20 /O2 /EHsc /utf-8 /D_CRT_SECURE_NO_WARNINGS tests\test_template.cpp /Fe:build\test_template.exe /Fo:build\ > build\cl_template.log || exit /b 1
 cl /nologo /std:c++20 /O2 /EHsc /utf-8 tests\test_gguf.cpp /Fe:build\test_gguf.exe /Fo:build\ > build\cl_gguf.log || exit /b 1
 cl /nologo /O2 /EHsc tests\ram_balloon.cpp /Fe:build\ram_balloon.exe /Fo:build\ > build\cl_balloon.log || exit /b 1

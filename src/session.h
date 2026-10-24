@@ -100,9 +100,24 @@ struct Session {
     struct Reply { std::string head; std::vector<int> ids; };
     std::map<std::string, Reply> replies;
     int im_start, im_end, eot;
+    // Finetunes' variants of the template (chat_template.jinja that `moex import` keeps from the GGUF): Unsloth's fixes
+    // (also in Ornith) merge up to two leading system/developer messages with "\n" and drop later ones, and print
+    // non-string tool arguments with Python's str(); Ornith keeps every assistant turn's reasoning in the history.
+    bool tpl_merge_sys = false, tpl_py_args = false, tpl_keep_reasoning = false;
 
     Session(Engine& e, Tokenizer& t) : eng(e), tk(t) {
         im_start = tk.id_of("<|im_start|>"); im_end = tk.id_of("<|im_end|>"); eot = tk.id_of("<|endoftext|>");
+    }
+    void load_template(const std::string& model_dir) {  // none (the downloaded model): Qwen3.6's own template
+        FILE* f = fopen((model_dir + "/chat_template.jinja").c_str(), "rb");
+        if (!f) return;
+        std::string j;
+        char b[4096];
+        for (size_t n; (n = fread(b, 1, sizeof b, f)) > 0;) j.append(b, n);
+        fclose(f);
+        tpl_merge_sys = j.find("merged_system") != std::string::npos;
+        tpl_py_args = j.find("tool_call.arguments is mapping") != std::string::npos;
+        tpl_keep_reasoning = j.find("reasoning_content") != std::string::npos && j.find("loop.index0 > ns.last_query_index") == std::string::npos;
     }
 
     static std::string key_of(const std::string& content, const std::vector<ToolCall>& calls) {
@@ -118,14 +133,16 @@ struct Session {
         auto add = [&](const std::string& s) { auto v = tk.encode(s); ids.insert(ids.end(), v.begin(), v.end()); };
         auto turn = [&](const std::string& s) { ids.push_back(im_start); add(s); ids.push_back(im_end); add("\n"); };
         const bool has_sys = !msgs.empty() && msgs[0].role == "system";
-        const std::string sys = has_sys ? trim(msgs[0].content) : "";
+        std::string sys = has_sys ? trim(msgs[0].content) : "";
+        int first = has_sys ? 1 : 0;
+        if (tpl_merge_sys && has_sys && msgs.size() > 1 && msgs[1].role == "system") { sys += "\n" + trim(msgs[1].content); first = 2; }
         if (!tools.empty()) {
             std::string s = "system\n" + TOOLS_HEAD;
             for (auto& t : tools) s += "\n" + t.dump();
             s += TOOLS_RULES;
             if (!sys.empty()) s += "\n\n" + sys;
             turn(s);
-        } else if (has_sys) turn("system\n" + sys);
+        } else if (has_sys && !(tpl_merge_sys && sys.empty())) turn("system\n" + sys);
         // the last real user query (not wrapped tool responses): assistant turns after it keep their thinking
         int last_query = (int)msgs.size() - 1;
         for (int i = (int)msgs.size() - 1; i >= 0; i--) {
@@ -133,8 +150,9 @@ struct Session {
             const std::string c = trim(msgs[i].content);
             if (!(starts_with(c, "<tool_response>") && ends_with(c, "</tool_response>"))) { last_query = i; break; }
         }
-        for (int i = has_sys ? 1 : 0; i < (int)msgs.size(); i++) {
+        for (int i = first; i < (int)msgs.size(); i++) {
             const ChatMsg& m = msgs[i];
+            if (tpl_merge_sys && m.role == "system") continue;
             const std::string c = trim(m.content);
             if (m.role == "assistant") {
                 ids.push_back(im_start);
@@ -151,11 +169,11 @@ struct Session {
                         const size_t nl = body.find_first_not_of('\n');
                         body.erase(0, nl == std::string::npos ? body.size() : nl);
                     }
-                    std::string s = i > last_query ? "assistant\n<think>\n" + trim(rc) + "\n</think>\n\n" + body : "assistant\n" + body;
+                    std::string s = i > last_query || tpl_keep_reasoning ? "assistant\n<think>\n" + trim(rc) + "\n</think>\n\n" + body : "assistant\n" + body;
                     for (size_t j = 0; j < m.tool_calls.size(); j++) {
                         const ToolCall& tc = m.tool_calls[j];
                         s += std::string(j ? "\n<tool_call>\n<function=" : !trim(body).empty() ? "\n\n<tool_call>\n<function=" : "<tool_call>\n<function=") + tc.name + ">\n";
-                        for (auto& kv : tc.args.o) s += "<parameter=" + kv.first + ">\n" + (kv.second.t == Json::STR ? kv.second.s : kv.second.dump()) + "\n</parameter>\n";
+                        for (auto& kv : tc.args.o) s += "<parameter=" + kv.first + ">\n" + arg_text(kv.second) + "\n</parameter>\n";
                         s += "</function>\n</tool_call>";
                     }
                     add(s);
@@ -170,6 +188,14 @@ struct Session {
         ids.push_back(im_start);
         add("assistant\n" + gen_head());
         return ids;
+    }
+    // a tool-call argument as the template prints it: strings as they are, else JSON (Python's str() for true, false,
+    // null in the finetunes' variant; shortcut: numbers keep their JSON text, which str() would print as 100000.0 for 1e5)
+    std::string arg_text(const Json& v) const {
+        if (v.t == Json::STR) return v.s;
+        if (tpl_py_args && v.t == Json::BOOL) return v.b ? "True" : "False";
+        if (tpl_py_args && v.t == Json::NUL) return "None";
+        return v.dump();
     }
     static inline const std::string EMPTY_THINK = "<think>\n\n</think>\n\n";
     std::string gen_head() const { return think ? "<think>\n" : EMPTY_THINK; }
