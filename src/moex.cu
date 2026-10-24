@@ -2405,6 +2405,7 @@ int main(int argc, char** argv) {
     if (mode == "serve") {
         Tokenizer tk(model + "/tokenizer.json");
         Session ss(eng, tk);
+        ss.load_template(model);
         ss.think = think;  // the default for requests that don't say (chat_template_kwargs.enable_thinking, reasoning_effort)
         serve(ss, tk, host, port, "qwen3.6-35b-a3b", allow_origins);
         return 0;
@@ -2415,6 +2416,7 @@ int main(int argc, char** argv) {
 #endif
         Tokenizer tk(model + "/tokenizer.json");
         Session ss(eng, tk);
+        ss.load_template(model);
         ss.think = think;
         std::vector<ChatMsg> msgs;
         if (!system_prompt.empty()) msgs.push_back({"system", system_prompt});
