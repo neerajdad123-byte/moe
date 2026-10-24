@@ -2181,6 +2181,7 @@ struct Engine {
 #include "session.h"
 #include "serve.h"
 #include "download.h"
+#include "gguf.h"
 #include "bench.h"
 
 // One line of user input as UTF-8 (the Windows console delivers non-ASCII input correctly only as UTF-16).
@@ -2250,6 +2251,8 @@ int main(int argc, char** argv) {
     std::vector<std::string> allow_origins;  // serve: web pages (Origin) besides localhost ones that may call
     int port = 8765;
     if (argc > 1 && argv[1][0] != '-') { mode = argv[1]; argv++; argc--; }  // moex chat | moex serve
+    std::string import_src, out_dir;
+    if (mode == "import" && argc > 1 && argv[1][0] != '-') { import_src = argv[1]; argv++; argc--; }  // moex import FILE.gguf
     std::vector<int> ids, stop;
     int n = 32, ctx = 2048;
     bool ctx_set = false;  // --ctx given: chat/serve/bench keep it, even 2048
@@ -2264,6 +2267,7 @@ int main(int argc, char** argv) {
         else if (s == "--n") { n = std::stoi(next()); n_set = true; }
         else if (s == "--model") model = next();
         else if (s == "--only") only = next();
+        else if (s == "--out") out_dir = next();
         else if (s == "--system") system_prompt = next();
         else if (s == "--think") think = true;
         else if (s == "--load") warm = true;
@@ -2308,7 +2312,7 @@ int main(int argc, char** argv) {
         ids = parse_ids(m.substr(a, b - a));
     }
     if (mode == "version") { printf("moex %s\n", VERSION); return 0; }
-    const bool bad = !mode.empty() && mode != "help" && mode != "download" && mode != "chat" && mode != "serve" && mode != "install" && mode != "bench";
+    const bool bad = !mode.empty() && mode != "help" && mode != "download" && mode != "chat" && mode != "serve" && mode != "install" && mode != "bench" && mode != "import";
     if (bad && mode != "badarg") fprintf(stderr, "unknown command: %s\n\n", mode.c_str());
     if (bad || mode == "help" || (mode.empty() && ids.empty() && batch.empty())) {  // unknown input: the help page, exit 2
         fprintf(mode == "help" ? stdout : stderr,
@@ -2318,6 +2322,7 @@ int main(int argc, char** argv) {
                 "  moex chat              chat in this terminal (/reset new conversation, /exit quit)\n"
                 "  moex serve             OpenAI-compatible API on http://127.0.0.1:8765/v1\n"
                 "  moex bench             measure speed on this PC (~2-4 min): MTP off / on / --fast, specs, a line to share\n"
+                "  moex import FILE.gguf  convert a Qwen3.5/3.6-35B-A3B GGUF (or a finetune) once to run it (~24 GB; --out DIR)\n"
                 "  moex install           put moex on your PATH, so `moex` works in any terminal\n"
                 "  moex help | -h | --help, moex --version\n\n"
                 "Options:\n"
@@ -2345,6 +2350,17 @@ int main(int argc, char** argv) {
     if ((mode == "chat" || mode == "serve" || mode == "bench") && !ctx_set) ctx = 8192;
     if (mode == "bench") { warm = true; if (!samp.seed) samp.seed = 1; }  // what `moex chat --load` gets, same text every run
     if (mode == "download") return download_model(model, only);
+    if (mode == "import") {
+        if (import_src.empty()) { fprintf(stderr, "usage: moex import FILE.gguf [--out DIR]\n"); return 2; }
+        return import_gguf(import_src, out_dir);
+    }
+    std::string ext = std::filesystem::path(model).extension().string();
+    for (auto& ch : ext) ch = (char)tolower((unsigned char)ch);
+    if (ext == ".gguf") {
+        fprintf(stderr, "moex runs its own model format. Convert this GGUF once (~24 GB of disk, a few minutes):\n"
+                        "  moex import \"%s\"\nthen pass the folder it prints to --model.\n", model.c_str());
+        return 1;
+    }
     if (!std::filesystem::exists(std::filesystem::path(model) / "config.json")) {
         fprintf(stderr, "No model at %s.\nRun `moex download` first (or pass --model DIR).\n", model.c_str());
         return 1;
