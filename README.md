@@ -130,17 +130,24 @@ moex import C:\models\Qwen3.6-35B-A3B-Q4_K_M.gguf
 moex chat --model C:\models\Qwen3.6-35B-A3B-Q4_K_M-moex
 ```
 
-- **Which files:** any GGUF of **Qwen3.5-35B-A3B / Qwen3.6-35B-A3B** and their finetunes (architecture
-  `qwen35moe`: Ornith-1.5, Qwen3.8-35B-A3B-Distill, Tiel-Coder, Qwopus3.6-Coder, Holo-3.1, Qwen-AgentWorld,
-  uncensored / abliterated builds, ...). Other models are refused with the reason.
+- **Which files:** any GGUF of **Qwen3.5-35B-A3B / Qwen3.6-35B-A3B** and their finetunes (llama.cpp architecture
+  `qwen35moe`). Other models are refused with the reason.
+
+| Model (GGUF) | Status |
+|---|---|
+| Qwen3.6-35B-A3B (ggml-org, Unsloth, bartowski, LM Studio, ...) | tested: ggml-org Q4_K_M imported and checked against llama.cpp |
+| Ornith-1.5-35B-A3B | tested: Q4_K_M with its MTP layer, checked against llama.cpp, 68.8 tok/s |
+| Qwen3.5-35B-A3B, Qwen3.8-35B-A3B-Distill, Tiel-Coder, Cyber-Tiel-Coder, Qwopus3.6-Coder, Holo-3.1, Qwen-AgentWorld, uncensored / abliterated builds (HauhauCS, huihui, Genesis-Hermes, APEX) | same architecture and quant types (file headers checked), not run yet |
+| MiniCPM-V-4.7-35B-A3B | not supported (different vocabulary) |
+
 - **Which quants:** Q8_0, Q6_K, Q5_K, Q4_K, Q3_K, Q2_K, Q4_0/1, Q5_0/1, IQ4_XS, IQ4_NL, IQ3_S, IQ3_XXS, MXFP4, BF16,
   F16 (any mix, e.g. Unsloth's UD files). Not IQ2 / IQ1.
 - **Disk and time:** a ~24 GB folder next to the GGUF (`--out DIR` to choose), ~2-5 minutes. The GGUF is not
   changed or needed afterwards.
-- **Accuracy:** Q4_K experts are carried over exactly; moex runs them in its own format (a scale and a zero point per
-  32 weights). Other quant types are refit to 4 bits. On the ggml-org Q4_K_M file moex stays as close to the
-  default model's outputs as llama.cpp running the same file (mean KL 0.026 vs 0.020 on prose, 0.0007 vs 0.0012 on
-  code): the difference you see is mostly the GGUF's own quantization.
+- **Accuracy:** Q4_K experts are carried over bit for bit; moex runs them in its own format (a scale and a zero point
+  per 32 weights). Other quant types are refit to 4 bits. Against llama.cpp running the same file (`--check` on
+  prose / code / agent text, mean KL and top-1 agreement): Qwen3.6 Q4_K_M 0.005 / 0.0003 / 0.005, 97-99%; Ornith-1.5
+  Q4_K_M 0.009 / 0.003 / 0.031, 92-100% (its 6-bit layers become 4-bit in moex).
 - **Speed:** these experts take 2.8% more memory than the default model's: Ornith-1.5 ran at 68.8 tok/s with MTP
   on the test laptop (default model 73.4 in the same run).
 - **MTP:** files with the MTP layer (`-MTP` in the name, `nextn` in llama.cpp) keep it; files without run without
@@ -292,7 +299,7 @@ Credits), so it is not identical to the original BF16 weights.
 
 | | |
 |---|---|
-| Model | **Qwen3.6-35B-A3B** (int4 gs64 weights from `moex download`), and GGUFs of Qwen3.5/3.6-35B-A3B and its finetunes via `moex import`. Text only. |
+| Model | **Qwen3.6-35B-A3B** (int4 gs64 weights from `moex download`). **GGUFs** of Qwen3.5/3.6-35B-A3B and their finetunes (Ornith-1.5, Qwen3.8-Distill, Tiel-Coder, Qwopus, Holo, AgentWorld, ...) via `moex import`, see [Use a GGUF you already have](#use-a-gguf-you-already-have). Text only. |
 | GPU | NVIDIA RTX 20 / 30 / 40 / 50 series and newer datacenter cards, 6 GB VRAM or more |
 | OS | Windows 10/11; Linux (build from source with `./build.sh`; builds on Ubuntu 24.04 under WSL2, speed test pending) |
 | RAM | 24 GB recommended. 16 GB works: moex keeps its own RAM cache of experts and reads the rest straight from the SSD (~25-34 tokens/s on the test laptop, +20% since v0.1.3); moex prints a tip to free RAM |
