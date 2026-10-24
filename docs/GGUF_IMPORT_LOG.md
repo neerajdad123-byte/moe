@@ -85,6 +85,24 @@ Same order as moex vs its own reference on the default model: moex runs the GGUF
 
 Earlier the same day the default model gave 58.2 / 65.5 / 55.4 with only 1.7-11 GB RAM free (user working).
 
+### Ornith-1.5-35B-A3B Q4_K_M (finetune, MTP layer, Q4_K + Q6_K experts), 2026-10-24 18:54-19:02
+
+- Import: 98 s, 24.4 GB folder, MTP head written. Worst expert error vs the GGUF 0.051 relative RMS (the Q6_K
+  experts of 21 layers refit to 4 bits; Q4_K experts exact).
+- llama.cpp on Ornith vs the default model's reference outputs: KL 0.49 / 0.087 / 0.28, top-1 77.8 / 99.2 / 86.0%
+  (a different model, as expected for a finetune).
+- moex vs llama.cpp on the same Ornith file (`llama_check.py --dump`):
+
+| | prose | code | agent |
+|---|---|---|---|
+| moex default | 9.44e-3, 97.2% | 3.27e-3, 100% | 3.11e-2, 92.2% |
+| moex --load --mtp (Ornith's own MTP head, imported) | 1.33e-2, 93.1% | 1.57e-3, 100% | 2.79e-2, 92.2% |
+
+  Further from llama.cpp than on the ggml-org file (5e-3 / 3e-4 / 5e-3): Ornith's Q6_K experts (and Q6_K dense
+  tensors) are rounded to 4 / 8 bits by moex, where llama.cpp keeps 6 bits.
+- Speed (same job, idle laptop): Ornith MTP off 60.2, MTP on 68.8, MTP on + --fast 68.6 tok/s; default model
+  61.5 / 73.4 / 76.2. The imported MTP head works (+14% with MTP).
+
 ### Unit tests (no GPU)
 
 - `build\test_gguf.exe`: all 18 types decode exactly as gguf-py (max error 0), header parsing, truncated files
@@ -128,12 +146,14 @@ Refused: openbmb MiniCPM-V-4.7-35B-A3B (vocabulary 248,144, not 248,320).
 | `C:\models\qwen36_i4_gs64` | 24 GB | the default model (colibri int4 + MTP head) | yes |
 | `C:\models\gguf\Qwen3.6-35B-A3B-Q4_K_M.gguf` | 20 GB (19.0 GiB) | ggml-org GGUF, downloaded 2026-10-12 | the test file |
 | `C:\models\gguf\Qwen3.6-35B-A3B-Q4_K_M-zp` | 22 GB | its moex import, compact zero-point format | delete when done testing |
-| `C:\models\gguf\dl\Ornith-1.5-35B-Q4_K_M.gguf` | 21.7 GB | Ornith-1.5 GGUF, downloaded 2026-10-24 07:18-08:54 | delete after its tests |
+| `C:\models\gguf\dl\Ornith-1.5-35B-Q4_K_M.gguf` | 21.7 GB | Ornith-1.5 GGUF, downloaded 2026-10-24 07:18-08:54 | tests done: user's call |
+| `C:\models\gguf\dl\Ornith-1.5-35B-Q4_K_M-moex` | 23 GB | its moex import (runs with `--model`), made 18:54 | user's call |
+| `moe-v2\build\llamaref_ornith\` | ~300 MB | llama.cpp's outputs on Ornith as `--check` sets | test data (not in git) |
 | `C:\models\gguf\dl\ornith_curl.log`, `C:\models\gguf\curl.log` | <1 MB | download logs | can delete |
 | `moe-v2\build\llamaref_qwen36\` | 314 MB | llama.cpp's outputs on the ggml-org GGUF as `--check` sets | test data (not in git) |
 | `moe-v2\build\*.sh`, `*.bat` | small | gate scripts: `zp_gate.sh`, `z8_gate.sh`, `llama_ref_gate.sh`, `zp_test.bat` | not in git |
 
-Free on C: 38 GB at 18:51 (424 GB disk).
+Free on C: 38 GB at 18:51, ~16 GB after the Ornith import at 18:55 (424 GB disk).
 
 Hand-over notes: `C:\Users\neera\AppData\Local\Claude-Data\claude_pzs8sxrjxfjjc\side-session-notes\local_4825b7a9-af6b-4b01-870b-59d11a1b098c\gguf-import-state.md`.
 GPU queue logs: `C:\Users\neera\OneDrive\Desktop\gpu-queue\logs\` (job names `gguf-*`, `zp-*`, `z8-*`, `llamaref-*`, `tpl-*`).
@@ -170,8 +190,9 @@ GPU queue logs: `C:\Users\neera\OneDrive\Desktop\gpu-queue\logs\` (job names `gg
 
 ## Not done yet
 
-1. Ornith-1.5 (downloaded): import, moex vs llama.cpp on it, `--load --mtp` (first real MTP-layer import), bench.
-2. Speed on an idle laptop (zero-point import vs default model, with MTP where the GGUF has it).
+1. Ornith-1.5 is done (above). Its 6-bit experts lose accuracy when rounded to 4 bits (agent set KL 3.1e-2 vs
+   llama.cpp); keeping Q5_K/Q6_K experts at more bits would close that, at more memory.
+2. Speed of the ggml-org import on an idle laptop (Ornith's is above).
 3. Converters for other downloads: FP8, GPTQ / AutoRound (lossless), AWQ (lossless into the zero-point format), NVFP4.
 4. IQ2 / IQ1 GGUF types; Tiel-Coder's custom template; MiniCPM-V's different vocabulary.
 5. Merge to main and release: the user's decision.
