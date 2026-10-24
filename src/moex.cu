@@ -214,9 +214,9 @@ struct Engine {
     double tp[8] = {};
 
     explicit Engine(const char* root, int ctx_) : C(root), ctx(ctx_) {
-        // the expert format, from the scales' type: F32 = int4 gs64 symmetric, F16 = (scale, zero point) per 32 inputs
+        // the expert format, from the scales' type: F32 = int4 gs64 symmetric, U8 = scale and zero point per 32 inputs
         const StTensor& qs = C.at("model.layers.0.mlp.experts.0.qs");
-        g_zp = qs.dtype == "F16";
+        g_zp = qs.dtype == "U8";
         EXPERT_BYTES = g_zp ? EXPERT_BYTES_ZP : EXPERT_BYTES_SYM;
         if (qs.bytes != EXPERT_BYTES - EXPERT_Q_BYTES) { fprintf(stderr, "unexpected expert scales (%s, %llu bytes)\n", qs.dtype.c_str(), (unsigned long long)qs.bytes); exit(1); }
         cpu.zp = g_zp;

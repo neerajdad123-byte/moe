@@ -253,17 +253,18 @@ static void gg_dequant(uint32_t t, const uint8_t* p, int64_t n, float* y) {
     throw std::runtime_error("cannot dequantize " + gg_type_name(t));
 }
 
-// Experts are written in moex's zero-point form: unsigned nibbles u, w = s * u + m, one (s, m) per 32 inputs
-// (kernels.cuh). One GGUF Q4_K superblock (256 weights, 8 sub-blocks of 32 with a 6-bit scale and min each) is
-// exactly that form: s = d * scale, m = -dmin * min, u = the nibble. Q4_K keeps sub-block j's 32 values in the low
-// nibbles of 32 bytes and sub-block j + 1's in the high ones; the element order is restored here.
-static void gg_q4k_zp(const uint8_t* p, uint8_t* u, float* s, float* m) {
-    const float d = gg_h2f(p), dmin = gg_h2f(p + 2);
+// Experts are written in moex's zero-point form (kernels.cuh): unsigned nibbles u, w = d * sc * u + dm * mn with
+// sc (uint8) and mn (int8) per 32 inputs and (d, dm) fp16 per 256. One GGUF Q4_K superblock (256 weights, 8 sub-blocks
+// of 32 with a 6-bit scale and min each, fp16 d and dmin) is exactly that: sc = scale, mn = -min, dm = dmin, the same
+// bits. Q4_K keeps sub-block j's 32 values in the low nibbles of 32 bytes and sub-block j + 1's in the high ones; the
+// element order is restored here.
+static void gg_q4k_zp(const uint8_t* p, uint8_t* u, uint8_t* cs, uint16_t* sup) {
+    memcpy(sup, p, 4);  // d, dmin
     const uint8_t *sc = p + 4, *q = p + 16;
     for (int j = 0; j < 4; j++, q += 32) {
         int a, b;
-        gg_scale_min_k4(2 * j, sc, a, b); s[2 * j] = d * a; m[2 * j] = -dmin * b;
-        gg_scale_min_k4(2 * j + 1, sc, a, b); s[2 * j + 1] = d * a; m[2 * j + 1] = -dmin * b;
+        gg_scale_min_k4(2 * j, sc, a, b); cs[4 * j] = (uint8_t)a; cs[4 * j + 1] = (uint8_t)(int8_t)-b;
+        gg_scale_min_k4(2 * j + 1, sc, a, b); cs[4 * j + 2] = (uint8_t)a; cs[4 * j + 3] = (uint8_t)(int8_t)-b;
         for (int l = 0; l < 32; l++) { u[64 * j + l] = q[l] & 0xF; u[64 * j + 32 + l] = q[l] >> 4; }
     }
 }
@@ -295,21 +296,41 @@ static void gg_zp_group(const float* x, uint8_t* u, float& s, float& m) {
     }
 }
 
-// One row of a GGUF expert tensor (cols inputs) -> nibble bytes (element 2k low, 2k + 1 high) and half2 (s, m) per 32
-static void gg_zp_row(uint32_t type, const uint8_t* src, int cols, uint8_t* qb, uint16_t* sm, float* tmp) {
+// One row of a GGUF expert tensor (cols inputs) -> nibble bytes (element 2k low, 2k + 1 high), [sc, mn] per 32 and
+// (d, dm) per 256. Other types than Q4_K: (s, m) fitted per 32, then d = max s / 255, dm = max |m| / 127 over the 256,
+// and the nibbles rounded again on the final grid.
+static void gg_zp_row(uint32_t type, const uint8_t* src, int cols, uint8_t* qb, uint8_t* cs, uint16_t* sup, float* tmp) {
     uint8_t u[256];
-    float s[8], m[8];
     for (int b = 0; b < cols / 256; b++) {
-        if (type == GG_Q4_K) gg_q4k_zp(src + (size_t)b * 144, u, s, m);
+        uint8_t* c = cs + 16 * b;
+        if (type == GG_Q4_K) gg_q4k_zp(src + (size_t)b * 144, u, c, sup + 2 * b);
         else {
             int bn, bb;
             gg_block(type, bn, bb);
             gg_dequant(type, src + (size_t)b * 256 / bn * bb, 256, tmp);
-            for (int g = 0; g < 8; g++) gg_zp_group(tmp + 32 * g, u + 32 * g, s[g], m[g]);
+            float s[8], m[8], smax = 0, mmax = 0;
+            for (int g = 0; g < 8; g++) {
+                gg_zp_group(tmp + 32 * g, u + 32 * g, s[g], m[g]);
+                smax = std::max(smax, s[g]); mmax = std::max(mmax, std::fabs(m[g]));
+            }
+            sup[2 * b] = gg_f2h(smax / 255); sup[2 * b + 1] = gg_f2h(mmax / 127);
+            const float d = gg_half(sup[2 * b]), dm = gg_half(sup[2 * b + 1]);
+            for (int g = 0; g < 8; g++) {
+                const int sc = d > 0 ? std::clamp((int)std::nearbyint(s[g] / d), 0, 255) : 0;
+                const int mn = dm > 0 ? std::clamp((int)std::nearbyint(m[g] / dm), -127, 127) : 0;
+                c[2 * g] = (uint8_t)sc; c[2 * g + 1] = (uint8_t)(int8_t)mn;
+                const float s1 = d * sc, m1 = dm * mn;
+                for (int i = 0; i < 32; i++)
+                    u[32 * g + i] = s1 > 0 ? (uint8_t)std::clamp((int)std::nearbyint((tmp[32 * g + i] - m1) / s1), 0, 15) : 0;
+            }
         }
         for (int i = 0; i < 128; i++) qb[b * 128 + i] = (uint8_t)(u[2 * i] | u[2 * i + 1] << 4);
-        for (int g = 0; g < 8; g++) { sm[(b * 8 + g) * 2] = gg_f2h(s[g]); sm[(b * 8 + g) * 2 + 1] = gg_f2h(m[g]); }
     }
+}
+// The zero-point weight i of a row decoded back (cs, sup as gg_zp_row wrote them; for the error check and tests)
+static inline float gg_zp_at(const uint8_t* qb, const uint8_t* cs, const uint16_t* sup, int i) {
+    const int g = i / 32, b = i / 256;
+    return gg_half(sup[2 * b]) * cs[2 * g] * ((qb[i / 2] >> (i % 2 * 4)) & 0xF) + gg_half(sup[2 * b + 1]) * (int8_t)cs[2 * g + 1];
 }
 
 static void gg_par_for(int64_t n, const std::function<void(int64_t)>& f) {
@@ -504,7 +525,8 @@ static void gg_write_st(const std::string& path, const std::vector<GgOut>& ts) {
 }
 
 static const int GG_D = 2048, GG_E = 256, GG_I = 512, GG_VH = 32, GG_HD = 128;
-static const uint64_t GG_EXPERT_Q = 3ull * GG_I * GG_D / 2, GG_EXPERT_S = 3ull * GG_I * GG_D / 32 * 4;  // half2 per 32
+static const uint64_t GG_EXPERT_Q = 3ull * GG_I * GG_D / 2, GG_CHUNKS = 3ull * GG_I * GG_D / 32,
+                      GG_EXPERT_S = GG_CHUNKS * 2 + GG_CHUNKS / 8 * 4;  // [sc, mn] per 32, then (d, dm) per 256
 
 // llama.cpp's converter stores Qwen3.5's DeltaNet value heads reordered: GGUF head j holds HF head 2 * (j % 16) + j / 16.
 static inline int gg_vhead_src(int hf) { return (hf % 2) * 16 + hf / 2; }  // HF value head -> GGUF value head
@@ -632,29 +654,31 @@ static void gg_dense_layer(const Gguf& g, int l, const std::string& pre, std::ve
     std::sort(out.begin(), out.end(), [](auto& a, auto& b) { return a.name < b.name; });
 }
 
-// Block l's 256 experts -> moex zero-point int4: per expert [gate IxH | up IxH | down HxI] packed nibbles and half2
-// (s, m) per 32 inputs. Returns the largest per-expert relative RMS error against the GGUF's own values (Q4_K: only
-// the fp16 rounding of s and m), for the log.
-static double gg_experts(const Gguf& g, int l, std::vector<uint8_t>& q, std::vector<uint16_t>& s) {
+// Block l's 256 experts -> moex zero-point int4: per expert [gate IxH | up IxH | down HxI] packed nibbles, then the
+// scale part (gg_zp_row). Returns the largest per-expert relative RMS error against the GGUF's own values (Q4_K: 0),
+// for the log.
+static double gg_experts(const Gguf& g, int l, std::vector<uint8_t>& q, std::vector<uint8_t>& s) {
     const std::string p = "blk." + std::to_string(l) + ".";
     const Gguf::Tensor* t[3] = {&g.at(p + "ffn_gate_exps.weight"), &g.at(p + "ffn_up_exps.weight"), &g.at(p + "ffn_down_exps.weight")};
-    q.resize(GG_E * GG_EXPERT_Q); s.resize(GG_E * GG_EXPERT_S / 2);
+    q.resize(GG_E * GG_EXPERT_Q); s.resize(GG_E * GG_EXPERT_S);
     std::vector<double> err(GG_E);
     gg_par_for(GG_E, [&](int64_t e) {
         std::vector<float> w(GG_D), tmp(256);
         uint8_t* qe = q.data() + e * GG_EXPERT_Q;
-        uint16_t* se = s.data() + e * GG_EXPERT_S / 2;
+        uint8_t* se = s.data() + e * GG_EXPERT_S;
         double ee = 0, ss = 0;
         for (int part = 0; part < 3; part++) {
             const int rows = part < 2 ? GG_I : GG_D, cols = part < 2 ? GG_D : GG_I;
             for (int r = 0; r < rows; r++) {
                 const int64_t row = (int64_t)part * GG_I + r;  // row of the merged [gate | up | down] layout
                 uint8_t* qr = part < 2 ? qe + (size_t)row * (GG_D / 2) : qe + (size_t)GG_I * GG_D + (size_t)r * (GG_I / 2);
-                uint16_t* sr = se + (part < 2 ? row * (GG_D / 32) : (size_t)2 * GG_I * (GG_D / 32) + (size_t)r * (GG_I / 32)) * 2;
-                gg_zp_row(t[part]->type, t[part]->data + (e * rows + r) * t[part]->row_bytes, cols, qr, sr, tmp.data());
+                const size_t c0 = part < 2 ? (size_t)row * (GG_D / 32) : (size_t)2 * GG_I * (GG_D / 32) + (size_t)r * (GG_I / 32);
+                uint8_t* cr = se + 2 * c0;
+                uint16_t* sr = (uint16_t*)(se + GG_CHUNKS * 2) + 2 * (c0 / 8);
+                gg_zp_row(t[part]->type, t[part]->data + (e * rows + r) * t[part]->row_bytes, cols, qr, cr, sr, tmp.data());
                 g.rows(*t[part], e * rows + r, 1, w.data());
                 for (int i = 0; i < cols; i++) {
-                    const float v = gg_half(sr[i / 32 * 2]) * ((qr[i / 2] >> (i % 2 * 4)) & 0xF) + gg_half(sr[i / 32 * 2 + 1]);
+                    const float v = gg_zp_at(qr, cr, sr, i);
                     ee += (double)(w[i] - v) * (w[i] - v); ss += (double)w[i] * w[i];
                 }
             }
@@ -666,11 +690,11 @@ static double gg_experts(const Gguf& g, int l, std::vector<uint8_t>& q, std::vec
 
 // One layer's (or the MTP layer's) safetensors file, laid out like the downloaded container: scales, dense, packed
 static void gg_write_layer(const Gguf& g, int l, const std::string& pre, const std::string& path, const std::vector<GgOut>& extra, double& err) {
-    std::vector<uint8_t> q; std::vector<uint16_t> s;
+    std::vector<uint8_t> q, s;
     err = gg_experts(g, l, q, s);
     std::vector<GgOut> ts, dense(extra);
     for (int e = 0; e < GG_E; e++)
-        ts.push_back({pre + "mlp.experts." + std::to_string(e) + ".qs", "F16", {(int64_t)GG_EXPERT_S / 2}, GG_EXPERT_S,
+        ts.push_back({pre + "mlp.experts." + std::to_string(e) + ".qs", "U8", {(int64_t)GG_EXPERT_S}, GG_EXPERT_S,
                       [&s, e](uint8_t* d) { memcpy(d, (const uint8_t*)s.data() + e * GG_EXPERT_S, GG_EXPERT_S); }});
     gg_dense_layer(g, l, pre, dense);
     ts.insert(ts.end(), dense.begin(), dense.end());

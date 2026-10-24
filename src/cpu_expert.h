@@ -106,9 +106,15 @@ static inline float hsum(__m256 v) {
     return _mm_cvtss_f32(s);
 }
 
-// Zero-point format (unsigned nibbles, w = s * u + m per 32 inputs): (s, m) of a 64-group's two halves as floats.
-static inline void zp_sm(const float* ws, int g, float v[4]) {
-    _mm_storeu_ps(v, _mm_cvtph_ps(_mm_loadl_epi64((const __m128i*)(ws + 2 * g))));  // s_a m_a s_b m_b
+// Zero-point format (kernels.cuh: unsigned nibbles, w = d * sc * u + dm * mn): (s, m) of the 64-group that starts at
+// chunk c (even) of the expert whose scale part is sc, as floats s_a m_a s_b m_b. Both chunks share one (d, dm).
+static constexpr size_t ZP_CHUNKS = (size_t)3 * 2048 * 512 / 32;  // = EXPERT_CHUNKS
+static inline void zp_sm(const float* sc, size_t c, float v[4]) {
+    const uint8_t* b = (const uint8_t*)sc;
+    int dd; memcpy(&dd, b + ZP_CHUNKS * 2 + 4 * (c >> 3), 4);
+    alignas(16) float f[4];
+    _mm_store_ps(f, _mm_cvtph_ps(_mm_cvtsi32_si128(dd)));
+    v[0] = f[0] * b[2 * c]; v[1] = f[1] * (int8_t)b[2 * c + 1]; v[2] = f[0] * b[2 * c + 2]; v[3] = f[1] * (int8_t)b[2 * c + 3];
 }
 // One 64-group in fp32: chunk c of 16 nibble bytes covers inputs 16c..16c+15, so chunks 0-1 are half a, 2-3 half b.
 static inline float dot_group_zp(const uint8_t* q, const float* xe, const float* xo, const float v[4]) {
@@ -126,14 +132,16 @@ static inline float dot_group_zp(const uint8_t* q, const float* xe, const float*
     return v[0] * hsum(g[0]) + v[1] * hsum(sx[0]) + v[2] * hsum(g[1]) + v[3] * hsum(sx[1]);
 }
 
-// Row dot over I inputs: I/64 groups, scales sc[I/64] (zero point: half2 sc[I/32]).
+// Row dot over I inputs: I/64 groups. sc = the expert's scale part, c0 = the row's first 32-chunk (kernels.cuh's g32):
+// symmetric scales sc[c0 / 2 ..], zero point chunks c0 ...
 template <bool Z = false>
-static inline float row_dot(const uint8_t* q, const float* sc, const float* xe, const float* xo, int I) {
+static inline float row_dot(const uint8_t* q, const float* sc, size_t c0, const float* xe, const float* xo, int I) {
     if constexpr (Z) {
         float acc = 0.f, v[4];
-        for (int g = 0; g < I / 64; g++) { zp_sm(sc, g, v); acc += dot_group_zp(q + 32 * g, xe + 32 * g, xo + 32 * g, v); }
+        for (int g = 0; g < I / 64; g++) { zp_sm(sc, c0 + 2 * g, v); acc += dot_group_zp(q + 32 * g, xe + 32 * g, xo + 32 * g, v); }
         return acc;
     }
+    sc += c0 / 2;
     __m256 acc = _mm256_setzero_ps();
     for (int g = 0; g < I / 64; g++) acc = dot_group(q + 32 * g, xe + 32 * g, xo + 32 * g, acc, sc[g]);
     return hsum(acc);
@@ -216,21 +224,22 @@ static inline void quant_groups(const float* x, int n, int8_t* e, int8_t* o, flo
         h[2 * g] = sc * ha; h[2 * g + 1] = sc * hb;
     }
 }
-// Row dot over `groups` 64-groups: weights q (nibbles), weight scales ws[groups] (zero point: half2 ws[2 * groups]).
+// Row dot over `groups` 64-groups: weights q (nibbles); ws, c0 as row_dot's sc, c0.
 // The int32 lanes of a group's dot are inputs 8l..8l+7: lanes 0-3 are its first 32-half, 4-7 the second.
 template <bool VNNI, bool Z = false>
-static inline float row_dot_i8(const uint8_t* q, const float* ws, const QAct& x, int groups) {
+static inline float row_dot_i8(const uint8_t* q, const float* ws, size_t c0, const QAct& x, int groups) {
     __m256 acc = _mm256_setzero_ps();
     float corr = 0.f;
     if constexpr (Z) {
         for (int g = 0; g < groups; g++) {
-            float v[4]; zp_sm(ws, g, v);
+            float v[4]; zp_sm(ws, c0 + 2 * g, v);
             const __m256 sv = _mm256_mul_ps(_mm256_set_m128(_mm_set1_ps(v[2]), _mm_set1_ps(v[0])), _mm256_set1_ps(x.s[g]));
             acc = _mm256_fmadd_ps(_mm256_cvtepi32_ps(group_u8<VNNI>(q + 32 * g, x.e + 32 * g, x.o + 32 * g)), sv, acc);
             corr += v[1] * x.h[2 * g] + v[3] * x.h[2 * g + 1];
         }
         return hsum(acc) + corr;
     }
+    ws += c0 / 2;
     for (int g = 0; g < groups; g++) {
         acc = _mm256_fmadd_ps(_mm256_cvtepi32_ps(group_i8<VNNI>(q + 32 * g, x.e + 32 * g, x.o + 32 * g)), _mm256_set1_ps(ws[g] * x.s[g]), acc);
         corr += ws[g] * x.c[g];
@@ -255,7 +264,7 @@ struct CpuExperts {
     long long calls = 0, items = 0;
     std::atomic<long long> ns_gu{0}, ns_act{0}, ns_dn{0};
     QAct qx, qa[8];  // x; each expert's down input
-    bool zp = false;  // zero-point experts (g_zp): scales are half2 (s, m) per 32 inputs
+    bool zp = false;  // zero-point experts (g_zp, kernels.cuh)
     void run(int m, const uint8_t* const* q, const float* const* sc, const float* w, const float* x, float* out) {
         if (zp) { if (vnni) run_i8<true, true>(m, q, sc, w, x, out); else run_i8<false, true>(m, q, sc, w, x, out); }
         else if (vnni) run_i8<true>(m, q, sc, w, x, out); else run_i8<false>(m, q, sc, w, x, out);
@@ -263,7 +272,6 @@ struct CpuExperts {
     template <bool VNNI, bool Z = false>
     void run_i8(int m, const uint8_t* const* q, const float* const* sc, const float* w, const float* x, float* out) {
         constexpr int NG = I / GS, DB = 64;  // gate/up items per expert; down rows per item
-        constexpr int SH = Z ? H / 32 : H / GS, SI = Z ? I / 32 : I / GS;  // scale floats per gate/up, down row
         if (qx.buf.empty()) { qx.resize(H); for (auto& a : qa) a.resize(I); }
         using clk = std::chrono::steady_clock;
         auto sec = [](clk::time_point a, clk::time_point b) { return std::chrono::duration<double>(b - a).count(); };
@@ -276,8 +284,8 @@ struct CpuExperts {
             const auto i0 = clk::now();
             alignas(32) float a[GS];
             for (int r = 0; r < GS; r++) {
-                const float gt = row_dot_i8<VNNI, Z>(q[j] + (size_t)(r0 + r) * (H / 2), sc[j] + (r0 + r) * SH, qx, H / GS);
-                const float u = row_dot_i8<VNNI, Z>(q[j] + (size_t)(I + r0 + r) * (H / 2), sc[j] + (I + r0 + r) * SH, qx, H / GS);
+                const float gt = row_dot_i8<VNNI, Z>(q[j] + (size_t)(r0 + r) * (H / 2), sc[j], (size_t)(r0 + r) * (H / 32), qx, H / GS);
+                const float u = row_dot_i8<VNNI, Z>(q[j] + (size_t)(I + r0 + r) * (H / 2), sc[j], (size_t)(I + r0 + r) * (H / 32), qx, H / GS);
                 a[r] = w[j] * gt / (1.f + expf(-gt)) * u;  // the routing weight folded in before quantizing
             }
             const auto i1 = clk::now();
@@ -292,7 +300,7 @@ struct CpuExperts {
             for (int d = it * DB; d < it * DB + DB; d++) {
                 float acc = 0.f;
                 for (int j = 0; j < m; j++)
-                    acc += row_dot_i8<VNNI, Z>(q[j] + (size_t)2 * I * (H / 2) + (size_t)d * (I / 2), sc[j] + 2 * I * SH + d * SI, qa[j], I / GS);
+                    acc += row_dot_i8<VNNI, Z>(q[j] + (size_t)2 * I * (H / 2) + (size_t)d * (I / 2), sc[j], (size_t)2 * I * (H / 32) + (size_t)d * (I / 32), qa[j], I / GS);
                 out[d] = acc;
             }
             ns_dn += ns(i0, clk::now());
@@ -317,7 +325,6 @@ struct CpuExperts {
     void run_pairs_i8(const std::vector<Job>& jobs, const float* X, int T, float* ypair) {
         if (jobs.empty()) return;
         constexpr int NG = I / GS, DB = 64;
-        constexpr int SH = Z ? H / 32 : H / GS, SI = Z ? I / 32 : I / GS;
         if ((int)qxt.size() < T) { qxt.resize(T); for (auto& a : qxt) if (a.buf.empty()) a.resize(H); }
         int np = 0; for (auto& jb : jobs) for (int p : jb.pids) np = std::max(np, p + 1);
         if ((int)qp.size() < np) { qp.resize(np); for (auto& a : qp) if (a.buf.empty()) a.resize(I); }
@@ -330,8 +337,8 @@ struct CpuExperts {
             for (int r = 0; r < GS; r++)
                 for (int k = 0; k < nk; k++) {
                     const QAct& x = qxt[jb.toks[k]];
-                    const float gt = row_dot_i8<VNNI, Z>(jb.q + (size_t)(r0 + r) * (H / 2), jb.sc + (r0 + r) * SH, x, H / GS);
-                    const float u = row_dot_i8<VNNI, Z>(jb.q + (size_t)(I + r0 + r) * (H / 2), jb.sc + (I + r0 + r) * SH, x, H / GS);
+                    const float gt = row_dot_i8<VNNI, Z>(jb.q + (size_t)(r0 + r) * (H / 2), jb.sc, (size_t)(r0 + r) * (H / 32), x, H / GS);
+                    const float u = row_dot_i8<VNNI, Z>(jb.q + (size_t)(I + r0 + r) * (H / 2), jb.sc, (size_t)(I + r0 + r) * (H / 32), x, H / GS);
                     a[k][r] = jb.ws[k] * gt / (1.f + expf(-gt)) * u;
                 }
             for (int k = 0; k < nk; k++) { QAct& d = qp[jb.pids[k]]; quant_groups(a[k], GS, d.e + 32 * g, d.o + 32 * g, d.s + g, d.c + g, d.h + 2 * g); }
@@ -341,7 +348,7 @@ struct CpuExperts {
             for (const Job& jb : jobs)
                 for (int d = it * DB; d < it * DB + DB; d++)
                     for (int p : jb.pids)
-                        ypair[(size_t)p * H + d] = row_dot_i8<VNNI, Z>(jb.q + (size_t)2 * I * (H / 2) + (size_t)d * (I / 2), jb.sc + 2 * I * SH + d * SI, qp[p], I / GS);
+                        ypair[(size_t)p * H + d] = row_dot_i8<VNNI, Z>(jb.q + (size_t)2 * I * (H / 2) + (size_t)d * (I / 2), jb.sc, (size_t)2 * I * (H / 32) + (size_t)d * (I / 32), qp[p], I / GS);
         };
         pool.parallel_for(H / DB, dn);
     }
@@ -353,7 +360,6 @@ struct CpuExperts {
     template <bool Z>
     void run_pairs_f(const std::vector<Job>& jobs, const float* X, int T, int npairs, float* ypair) {
         if (jobs.empty()) return;
-        constexpr int SH = Z ? H / 32 : H / GS, SI = Z ? I / 32 : I / GS;
         pxe.resize((size_t)T * H / 2); pxo.resize((size_t)T * H / 2);
         for (int t = 0; t < T; t++) deinterleave(X + (size_t)t * H, pxe.data() + (size_t)t * H / 2, pxo.data() + (size_t)t * H / 2, H);
         pact.resize((size_t)npairs * I); pae.resize((size_t)npairs * I / 2); pao.resize((size_t)npairs * I / 2);
@@ -365,8 +371,8 @@ struct CpuExperts {
             for (int r = r0; r < r0 + RB; r++)
                 for (size_t k = 0; k < jb.toks.size(); k++) {
                     const float *xe = pxe.data() + (size_t)jb.toks[k] * H / 2, *xo = pxo.data() + (size_t)jb.toks[k] * H / 2;
-                    float g = row_dot<Z>(jb.q + (size_t)r * (H / 2), jb.sc + r * SH, xe, xo, H);
-                    float u = row_dot<Z>(jb.q + (size_t)(I + r) * (H / 2), jb.sc + I * SH + r * SH, xe, xo, H);
+                    float g = row_dot<Z>(jb.q + (size_t)r * (H / 2), jb.sc, (size_t)r * (H / 32), xe, xo, H);
+                    float u = row_dot<Z>(jb.q + (size_t)(I + r) * (H / 2), jb.sc, (size_t)(I + r) * (H / 32), xe, xo, H);
                     pact[(size_t)jb.pids[k] * I + r] = g / (1.f + expf(-g)) * u;
                 }
         };
@@ -382,7 +388,7 @@ struct CpuExperts {
                 for (size_t k = 0; k < jb.toks.size(); k++) {
                     int p = jb.pids[k];
                     ypair[(size_t)p * H + d] = jb.ws[k] * row_dot<Z>(jb.q + (size_t)2 * I * (H / 2) + (size_t)d * (I / 2),
-                                                                     jb.sc + 2 * I * SH + d * SI,
+                                                                     jb.sc, (size_t)2 * I * (H / 32) + (size_t)d * (I / 32),
                                                                   pae.data() + (size_t)p * I / 2, pao.data() + (size_t)p * I / 2, I);
                 }
         };

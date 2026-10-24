@@ -11,6 +11,7 @@
 #include "../src/st.h"
 #include "../src/kernels.cuh"
 #include "../src/cpu_expert.h"
+#include "../src/gguf.h"  // the importer's zero-point requantizer (KZ)
 #include <chrono>
 
 static const char* MODEL = getenv("QWEN36_MODEL") ? getenv("QWEN36_MODEL") : "C:\\models\\qwen36_i4_gs64";
@@ -261,76 +262,91 @@ int main(int argc, char** argv) {
     }
 
     if (want(filt, "KZ")) {
-        printf("KZ zero-point experts ((s, m) per 32, unsigned nibbles) vs the same weights as int4 gs64, every path\n");
-        // Exact conversion of real experts: nibble ^ 8 = v + 8 = u, s32 = half(s), m = half(-8 s) = -8 half(s); so the
-        // only difference is the scale rounded to fp16 (~5e-4 relative)
+        printf("KZ zero-point experts (sc, mn per 32, d, dm per 256) on every path vs a float reference of the same weights\n");
+        // real experts (layer 0, dequantized from the container) requantized with the importer's own code (gguf.h)
         const int K = 8, T = 4;
         auto h = golden(P + "L00_moe_in");
-        std::vector<std::vector<uint8_t>> sym(K), zp(K);
+        std::vector<std::vector<uint8_t>> zp(K);
+        std::vector<std::vector<float>> wf(K);  // the zero-point weights decoded, [gate | up | down] rows
         for (int k = 0; k < K; k++) {
             std::string ep = "model.layers.0.mlp.experts." + std::to_string(17 * k + 3) + ".";
-            auto q = C.read(ep + "merged_weight"), s = C.read(ep + "qs");
-            sym[k] = q; sym[k].insert(sym[k].end(), s.begin(), s.end());
-            zp[k] = q;
-            for (auto& b : zp[k]) b ^= 0x88;
-            const float* sf = (const float*)s.data();
-            const size_t g32 = (EXPERT_BYTES_ZP - EXPERT_Q_BYTES) / 4;
-            zp[k].resize(EXPERT_BYTES_ZP);
-            __half2* sm = (__half2*)(zp[k].data() + EXPERT_Q_BYTES);
-            for (size_t i = 0; i < g32; i++) { const half hs = __float2half(sf[i / 2]); sm[i] = __halves2half2(hs, __float2half(-8.f * __half2float(hs))); }
+            auto q = C.read(ep + "merged_weight"), sv = C.read(ep + "qs");
+            const float* sf = (const float*)sv.data();
+            zp[k].assign(EXPERT_BYTES_ZP, 0);
+            wf[k].resize((size_t)3 * EI * EH);
+            std::vector<float> row(EH), tmp(256);
+            for (int r = 0; r < 2 * EI + EH; r++) {  // gate, up rows (EH inputs), then down rows (EI inputs)
+                const int cols = r < 2 * EI ? EH : EI, rr = r < 2 * EI ? r : r - 2 * EI;
+                const size_t w0 = r < 2 * EI ? (size_t)r * EH : (size_t)2 * EI * EH + (size_t)rr * EI;  // weight index of the row
+                for (int i = 0; i < cols; i++) { const int v = (q[(w0 + i) / 2] >> ((w0 + i) % 2 * 4)) & 0xF; row[i] = (v >= 8 ? v - 16 : v) * sf[(w0 + i) / 64]; }
+                const size_t c0 = w0 / 32;
+                uint8_t *qb = zp[k].data() + w0 / 2, *cs = zp[k].data() + EXPERT_Q_BYTES + 2 * c0;
+                uint16_t* sup = (uint16_t*)(zp[k].data() + EXPERT_Q_BYTES + EXPERT_CHUNKS * 2) + 2 * (c0 / 8);
+                gg_zp_row(GG_F32, (const uint8_t*)row.data(), cols, qb, cs, sup, tmp.data());
+                for (int i = 0; i < cols; i++) wf[k][w0 + i] = gg_zp_at(qb, cs, sup, i);
+            }
         }
         std::vector<float> rw = {0.3f, 0.2f, 0.15f, 0.1f, 0.1f, 0.06f, 0.05f, 0.04f};
         std::vector<float> X((size_t)T * D);
         for (int t = 0; t < T; t++) for (int i = 0; i < D; i++) X[(size_t)t * D + i] = h[i] * (1.f + 0.1f * t);
+        auto expert = [&](int k, const float* x, float* y) {  // float reference: y[D] = down(silu(gate x) * up x)
+            std::vector<double> a(EI);
+            for (int r = 0; r < EI; r++) {
+                double g = 0, u = 0;
+                for (int i = 0; i < EH; i++) { g += (double)wf[k][(size_t)r * EH + i] * x[i]; u += (double)wf[k][(size_t)(EI + r) * EH + i] * x[i]; }
+                a[r] = g / (1 + exp(-g)) * u;
+            }
+            for (int d = 0; d < EH; d++) {
+                double o = 0;
+                for (int i = 0; i < EI; i++) o += (double)wf[k][(size_t)2 * EI * EH + (size_t)d * EI + i] * a[i];
+                y[d] = (float)o;
+            }
+        };
+        std::vector<float> ref_dec(D, 0.f), ref_pairs((size_t)T * K * D), y(D);
+        for (int k = 0; k < K; k++) {
+            for (int t = 0; t < T; t++) {
+                expert(k, X.data() + (size_t)t * D, y.data());
+                for (int d = 0; d < D; d++) ref_pairs[((size_t)t * K + k) * D + d] = rw[k] * y[d];
+            }
+            for (int d = 0; d < D; d++) ref_dec[d] += ref_pairs[(size_t)k * D + d];  // t = 0 is h
+        }
+        g_zp = true; EXPERT_BYTES = EXPERT_BYTES_ZP;
         float *xd = up(X), *wd = up(rw), *act = dalloc((size_t)T * K * EI, true), *out = dalloc(D), *yp = dalloc((size_t)T * K * D, true);
-        const uint8_t** slots; CK(cudaMalloc(&slots, K * sizeof(void*)));
+        uint8_t* arena; CK(cudaMalloc(&arena, K * EXPERT_BYTES));
+        std::vector<const uint8_t*> ds(K), hq(K); std::vector<const float*> hs(K);
         std::vector<Pair> pairs; std::vector<PairItem> items;
         for (int k = 0; k < K; k++) {
+            CK(cudaMemcpy(arena + k * EXPERT_BYTES, zp[k].data(), EXPERT_BYTES, cudaMemcpyHostToDevice));
+            ds[k] = arena + k * EXPERT_BYTES; hq[k] = zp[k].data(); hs[k] = (const float*)(zp[k].data() + EXPERT_Q_BYTES);
             for (int t = 0; t < T; t++) pairs.push_back({t, t * K + k, rw[k]});
-            items.push_back({nullptr, k * T, T});
+            items.push_back({ds[k], k * T, T});
         }
-        Pair* pairs_d = up(pairs);
-        PairItem* items_d; CK(cudaMalloc(&items_d, K * sizeof(PairItem)));
-        struct Res { std::vector<float> dec, gemv, tc, cpu, cpu_pairs, cpu_small; };
-        auto run = [&](bool z) {
-            g_zp = z; EXPERT_BYTES = z ? EXPERT_BYTES_ZP : EXPERT_BYTES_SYM;
-            auto& blobs = z ? zp : sym;
-            uint8_t* arena; CK(cudaMalloc(&arena, K * EXPERT_BYTES));
-            std::vector<const uint8_t*> ds(K), hq(K); std::vector<const float*> hs(K);
-            for (int k = 0; k < K; k++) {
-                CK(cudaMemcpy(arena + k * EXPERT_BYTES, blobs[k].data(), EXPERT_BYTES, cudaMemcpyHostToDevice));
-                ds[k] = arena + k * EXPERT_BYTES; items[k].slot = ds[k];
-                hq[k] = blobs[k].data(); hs[k] = (const float*)(blobs[k].data() + EXPERT_Q_BYTES);
-            }
-            CK(cudaMemcpy(slots, ds.data(), K * sizeof(void*), cudaMemcpyHostToDevice));
-            CK(cudaMemcpy(items_d, items.data(), K * sizeof(PairItem), cudaMemcpyHostToDevice));
-            Res r;
-            experts_forward(slots, wd, K, xd, act, out); r.dec = down(out, D);
-            pairs_forward(items_d, K, pairs_d, xd, act, yp); r.gemv = down(yp, (size_t)T * K * D);
-            pairs_forward_tc(items_d, K, pairs_d, xd, act, yp); r.tc = down(yp, (size_t)T * K * D);
-            CpuExperts ce(4); ce.zp = z;
-            r.cpu.resize(D); ce.run(K, hq.data(), hs.data(), rw.data(), h.data(), r.cpu.data());
-            std::vector<CpuExperts::Job> jobs;
-            for (int k = 0; k < K; k++) {
-                CpuExperts::Job jb{hq[k], hs[k], {}, {}, {}};
-                for (int t = 0; t < T; t++) { jb.toks.push_back(t); jb.pids.push_back(t * K + k); jb.ws.push_back(rw[k]); }
-                jobs.push_back(jb);
-            }
-            r.cpu_pairs.assign((size_t)T * K * D, 0.f); ce.run_pairs(jobs, X.data(), T, T * K, r.cpu_pairs.data());
-            r.cpu_small.assign((size_t)T * K * D, 0.f); ce.run_pairs_small(jobs, X.data(), T, r.cpu_small.data());
-            CK(cudaFree(arena));
-            return r;
-        };
-        Res a = run(false), b = run(true);
+        const uint8_t** slots; CK(cudaMalloc(&slots, K * sizeof(void*)));
+        CK(cudaMemcpy(slots, ds.data(), K * sizeof(void*), cudaMemcpyHostToDevice));
+        Pair* pairs_d = up(pairs); PairItem* items_d = up(items);
+        experts_forward(slots, wd, K, xd, act, out);
+        check("GPU decode experts_forward", down(out, D), ref_dec, 1e-3f);
+        pairs_forward(items_d, K, pairs_d, xd, act, yp);
+        check("GPU prefill pairs_forward (GEMV)", down(yp, (size_t)T * K * D), ref_pairs, 1e-3f);
+        pairs_forward_tc(items_d, K, pairs_d, xd, act, yp);
+        check("GPU prefill pairs_forward_tc (fp16)", down(yp, (size_t)T * K * D), ref_pairs, 5e-3f);
+        CpuExperts ce(4); ce.zp = true;
+        std::vector<float> cpu(D);
+        ce.run(K, hq.data(), hs.data(), rw.data(), h.data(), cpu.data());
+        check("CPU decode (int8 activations)", cpu, ref_dec, 2e-2f);
+        std::vector<CpuExperts::Job> jobs;
+        for (int k = 0; k < K; k++) {
+            CpuExperts::Job jb{hq[k], hs[k], {}, {}, {}};
+            for (int t = 0; t < T; t++) { jb.toks.push_back(t); jb.pids.push_back(t * K + k); jb.ws.push_back(rw[k]); }
+            jobs.push_back(jb);
+        }
+        std::vector<float> yc((size_t)T * K * D, 0.f);
+        ce.run_pairs(jobs, X.data(), T, T * K, yc.data());
+        check("CPU prefill run_pairs (fp32)", yc, ref_pairs, 1e-3f);
+        ce.run_pairs_small(jobs, X.data(), T, yc.data());
+        check("CPU run_pairs_small (int8 activations)", yc, ref_pairs, 2e-2f);
         g_zp = false; EXPERT_BYTES = EXPERT_BYTES_SYM;
-        check("decode experts_forward", b.dec, a.dec, 3e-3f);
-        check("prefill pairs_forward (GEMV)", b.gemv, a.gemv, 3e-3f);
-        check("prefill pairs_forward_tc", b.tc, a.tc, 3e-3f);
-        check("CPU decode (int8 activations)", b.cpu, a.cpu, 3e-3f);
-        check("CPU prefill run_pairs (fp32)", b.cpu_pairs, a.cpu_pairs, 3e-3f);
-        check("CPU run_pairs_small (int8)", b.cpu_small, a.cpu_small, 3e-3f);
-        check("CPU vs GPU decode, zero point", b.cpu, b.dec, 2e-2f);  // int8 activations on the CPU, as K14
-        for (void* p : {(void*)xd, (void*)wd, (void*)act, (void*)out, (void*)yp, (void*)slots, (void*)pairs_d, (void*)items_d}) CK(cudaFree(p));
+        for (void* p : {(void*)xd, (void*)wd, (void*)act, (void*)out, (void*)yp, (void*)slots, (void*)pairs_d, (void*)items_d, (void*)arena}) CK(cudaFree(p));
     }
 
     if (want(filt, "K10")) {

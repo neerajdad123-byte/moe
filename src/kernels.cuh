@@ -413,14 +413,17 @@ inline void router_topk(const float* logits, int E, int K, bool norm, int* idx, 
 // ---- K4: routed experts, int4 gs64 symmetric ----
 // Slot layout (= container): [gate IxH | up IxH | down HxI] packed int4 (low nibble first),
 // then f32 scales [gate Ix(H/64) | up Ix(H/64) | down Hx(I/64)].
-// Zero-point format (g_zp, a container whose expert .qs are F16): nibbles are unsigned u in [0, 15], w = s * u + m
-// with one half2 (s, m) per 32 inputs, same order. It holds GGUF Q4_K, AWQ and other asymmetric int4 exactly.
+// Zero-point format (g_zp, a container whose expert .qs are U8): nibbles are unsigned u in [0, 15] and
+// w = d * sc * u + dm * mn, with sc (uint8) and mn (int8) per 32 inputs and one (d, dm) half2 per 256 - the way GGUF
+// Q4_K stores its scales, so Q4_K experts are held exactly, at 2.8% more than the symmetric format (AWQ and other
+// asymmetric int4 fit too). Scale part: [sc, mn] per 32-chunk, then (d, dm) per 256, chunks in the same order.
 // Every kernel reads 32 weights (one uint4) at a time, so g32 = row * (cols / 32) + c indexes both: f32 scale g32 / 2
-// (symmetric) or half2 g32 (zero point).
+// (symmetric) or chunk g32 (zero point).
 constexpr int EH = 2048, EI = 512, EGS = 64, EGS_DENSE = 64;
 constexpr size_t EXPERT_Q_BYTES = (size_t)3 * EH * EI / 2;                             // 1,572,864
 constexpr size_t EXPERT_BYTES_SYM = EXPERT_Q_BYTES + (size_t)3 * EI * (EH / EGS) * 4;  // + 196,608
-constexpr size_t EXPERT_BYTES_ZP = EXPERT_Q_BYTES + (size_t)3 * EI * (EH / 32) * 4;    // + 393,216
+constexpr size_t EXPERT_CHUNKS = (size_t)3 * EI * EH / 32;                             // 98,304
+constexpr size_t EXPERT_BYTES_ZP = EXPERT_Q_BYTES + EXPERT_CHUNKS * 2 + EXPERT_CHUNKS / 8 * 4;  // + 245,760
 inline bool g_zp = false;                          // set once at load, before any expert is touched
 inline size_t EXPERT_BYTES = EXPERT_BYTES_SYM;     // = EXPERT_BYTES_ZP with g_zp
 
@@ -460,11 +463,14 @@ __device__ __forceinline__ float dot32_u4(uint4 u, const float* __restrict__ x, 
     }
     return sm.x * acc + sm.y * sx;
 }
-// The scale (and zero point) of 32-weight chunk g32; symmetric: (s, 0).
+// The scale and zero point of 32-weight chunk g32 of an expert (sc = its scale part); symmetric: (s, 0).
 template <bool Z>
 __device__ __forceinline__ float2 ld_sm(const float* __restrict__ sc, size_t g32) {
-    if constexpr (Z) return __half22float2(reinterpret_cast<const __half2*>(sc)[g32]);
-    else return make_float2(sc[g32 >> 1], 0.f);
+    if constexpr (Z) {
+        const uint8_t* b = reinterpret_cast<const uint8_t*>(sc);
+        const float2 dd = __half22float2(reinterpret_cast<const __half2*>(b + EXPERT_CHUNKS * 2)[g32 >> 3]);
+        return make_float2(dd.x * b[2 * g32], dd.y * (float)(int8_t)b[2 * g32 + 1]);
+    } else return make_float2(sc[g32 >> 1], 0.f);
 }
 template <bool Z>
 __device__ __forceinline__ float dotq(uint4 q, const float* __restrict__ x, float2 sm) {
@@ -907,7 +913,7 @@ __global__ void __launch_bounds__(128) tc_down_k(const PairItem* __restrict__ it
     const PairItem it = items[blockIdx.y];
     const int d0 = blockIdx.x * 128, tid = threadIdx.x;
     const uint8_t* dq = it.slot + (size_t)2 * EI * (EH / 2);
-    const float* sc = reinterpret_cast<const float*>(it.slot + EXPERT_Q_BYTES) + (Z ? 2 * EI * (EH / 32) : 2 * EI * (EH / EGS));
+    const float* sc = reinterpret_cast<const float*>(it.slot + EXPERT_Q_BYTES);
     half *As = sm.As(), *Bs = sm.Bs();
     for (int j0 = 0; j0 < it.count; j0 += TC_BN) {
         const int nb = min(TC_BN, it.count - j0), nj = nb > 16 ? 2 : 1;
@@ -920,7 +926,7 @@ __global__ void __launch_bounds__(128) tc_down_k(const PairItem* __restrict__ it
                 for (int i = 0; i < 2; i++) {
                     const int e = tid + 128 * i, d = d0 + (e >> 1), h = e & 1;
                     ua[i] = __ldg(reinterpret_cast<const uint4*>(dq + (size_t)d * (EI / 2) + (k0 + 32 * h) / 2));
-                    sa[i] = ld_sm<Z>(sc, (size_t)d * (EI / 32) + (k0 + 32 * h) / 32);
+                    sa[i] = ld_sm<Z>(sc, (size_t)2 * EI * (EH / 32) + (size_t)d * (EI / 32) + (k0 + 32 * h) / 32);
                 }
 #pragma unroll
                 for (int i = 0; i < TC_BN * TC_BK / 128; i++) {

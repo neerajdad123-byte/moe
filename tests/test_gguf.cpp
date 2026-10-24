@@ -82,7 +82,7 @@ int main() {
             for (int r = 0; r < 6; r++) { const int j = gg_vhead_src(h); ok &= u[2 + h * 6 + r] == w[2 + j * 6 + r]; }
         check(inv && ok, "value-head un-permutation inverts llama.cpp's reorder and leaves the leading rows");
     }
-    {  // zero-point experts: Q4_K is carried over exactly (only s, m rounded to fp16); other types refit per 32
+    {  // zero-point experts: Q4_K is carried over exactly (the same bits); other types refit per 32
         FILE* f = fopen("tests/gguf_blocks.bin", "rb");
         uint32_t h[2];
         while (f && fread(h, 4, 2, f) == 2) {
@@ -92,15 +92,15 @@ int main() {
             std::vector<float> want(h[1]);
             fread(raw.data(), 1, raw.size(), f); fread(want.data(), 4, h[1], f);
             if (h[0] != GG_Q4_K && h[0] != GG_Q6_K) continue;
-            std::vector<uint8_t> qb(h[1] / 2); std::vector<uint16_t> sm(h[1] / 32 * 2); std::vector<float> tmp(256);
-            gg_zp_row(h[0], raw.data(), (int)h[1], qb.data(), sm.data(), tmp.data());
+            std::vector<uint8_t> qb(h[1] / 2); std::vector<uint8_t> cs(h[1] / 32 * 2); std::vector<uint16_t> sup(h[1] / 256 * 2); std::vector<float> tmp(256);
+            gg_zp_row(h[0], raw.data(), (int)h[1], qb.data(), cs.data(), sup.data(), tmp.data());
             double amax = 0, err = 0, ss = 0, ee = 0;
             for (uint32_t i = 0; i < h[1]; i++) {
-                const float v = gg_half(sm[i / 32 * 2]) * ((qb[i / 2] >> (i % 2 * 4)) & 0xF) + gg_half(sm[i / 32 * 2 + 1]);
+                const float v = gg_zp_at(qb.data(), cs.data(), sup.data(), (int)i);
                 amax = std::max(amax, (double)std::fabs(want[i])); err = std::max(err, (double)std::fabs(v - want[i]));
                 ss += (double)want[i] * want[i]; ee += (double)(v - want[i]) * (v - want[i]);
             }
-            if (h[0] == GG_Q4_K) check(err <= 2e-3 * amax, "zero point: Q4_K experts carried over exactly (max err " + std::to_string(err / amax) + " of max, fp16 s/m)");
+            if (h[0] == GG_Q4_K) check(err <= 1e-6 * amax, "zero point: Q4_K experts carried over exactly (max err " + std::to_string(err / amax) + " of max)");
             else check(std::sqrt(ee / ss) < 0.1, "zero point: Q6_K requantized to 4 bits, relative RMS " + std::to_string(std::sqrt(ee / ss)));
         }
         if (f) fclose(f);
