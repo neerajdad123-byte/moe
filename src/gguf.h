@@ -19,8 +19,11 @@
 #include <vector>
 #include "plat.h"
 #include "json.h"
+#include "gguf_iq.h"
 
-enum GgType : uint32_t { GG_F32 = 0, GG_F16 = 1, GG_Q8_0 = 8, GG_Q4_K = 12, GG_Q5_K = 13, GG_Q6_K = 14, GG_BF16 = 30 };
+enum GgType : uint32_t { GG_F32 = 0, GG_F16 = 1, GG_Q4_0 = 2, GG_Q4_1 = 3, GG_Q5_0 = 6, GG_Q5_1 = 7, GG_Q8_0 = 8, GG_Q2_K = 10,
+                         GG_Q3_K = 11, GG_Q4_K = 12, GG_Q5_K = 13, GG_Q6_K = 14, GG_IQ3_XXS = 18, GG_IQ4_NL = 20, GG_IQ3_S = 21,
+                         GG_IQ4_XS = 23, GG_BF16 = 30, GG_MXFP4 = 39 };
 
 static std::string gg_type_name(uint32_t t) {
     static const char* n[] = {"F32", "F16", "Q4_0", "Q4_1", "4", "5", "Q5_0", "Q5_1", "Q8_0", "Q8_1", "Q2_K", "Q3_K", "Q4_K",
@@ -28,7 +31,8 @@ static std::string gg_type_name(uint32_t t) {
                               "IQ4_XS", "I8", "I16", "I32", "I64", "F64", "IQ1_M", "BF16"};
     return t < sizeof n / sizeof *n ? n[t] : t == 39 ? "MXFP4" : "type " + std::to_string(t);
 }
-static const char* GG_SUPPORTED = "F32, F16, BF16, Q8_0, Q4_K, Q5_K, Q6_K";
+static const char* GG_SUPPORTED = "F32, F16, BF16, Q8_0, Q4_0, Q4_1, Q5_0, Q5_1, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, IQ4_NL, IQ4_XS, "
+                                   "IQ3_XXS, IQ3_S, MXFP4";
 
 // elements and bytes per block; false for a type moex does not read
 static bool gg_block(uint32_t t, int& n, int& bytes) {
@@ -36,6 +40,16 @@ static bool gg_block(uint32_t t, int& n, int& bytes) {
         case GG_F32: n = 1; bytes = 4; return true;
         case GG_F16: case GG_BF16: n = 1; bytes = 2; return true;
         case GG_Q8_0: n = 32; bytes = 34; return true;
+        case GG_Q4_0: case GG_IQ4_NL: n = 32; bytes = 18; return true;
+        case GG_Q4_1: n = 32; bytes = 20; return true;
+        case GG_Q5_0: n = 32; bytes = 22; return true;
+        case GG_Q5_1: n = 32; bytes = 24; return true;
+        case GG_MXFP4: n = 32; bytes = 17; return true;
+        case GG_Q2_K: n = 256; bytes = 84; return true;
+        case GG_Q3_K: n = 256; bytes = 110; return true;
+        case GG_IQ4_XS: n = 256; bytes = 136; return true;
+        case GG_IQ3_XXS: n = 256; bytes = 98; return true;
+        case GG_IQ3_S: n = 256; bytes = 110; return true;
         case GG_Q4_K: n = 256; bytes = 144; return true;
         case GG_Q5_K: n = 256; bytes = 176; return true;
         case GG_Q6_K: n = 256; bytes = 210; return true;
@@ -121,6 +135,118 @@ static void gg_dequant(uint32_t t, const uint8_t* p, int64_t n, float* y) {
                     y[l + 64] = d * sc[is + 4] * (((ql[l] >> 4) | ((qh[l] >> 4 & 3) << 4)) - 32);
                     y[l + 96] = d * sc[is + 6] * (((ql[l + 32] >> 4) | ((qh[l] >> 6 & 3) << 4)) - 32);
                 }
+        }
+        return;
+    case GG_Q4_0: case GG_Q4_1: case GG_Q5_0: case GG_Q5_1: case GG_IQ4_NL: case GG_MXFP4: {  // 32 per block
+        static const int8_t kv_iq4[16] = {-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113};
+        static const int8_t kv_fp4[16] = {0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12};  // E2M1, doubled
+        int bn, bb;
+        gg_block(t, bn, bb);
+        for (int64_t b = 0; b < n / 32; b++, p += bb, y += 32) {
+            float d, m = 0;
+            const uint8_t* q;
+            uint32_t qh = 0;
+            if (t == GG_MXFP4) {  // E8M0 scale, halved for the doubled values
+                const uint32_t bits = p[0] < 2 ? 0x00200000u << p[0] : (uint32_t)(p[0] - 1) << 23;
+                memcpy(&d, &bits, 4); q = p + 1;
+            } else {
+                d = gg_h2f(p);
+                q = p + (t == GG_Q4_1 || t == GG_Q5_1 ? 4 : 2);
+                if (t == GG_Q4_1 || t == GG_Q5_1) m = gg_h2f(p + 2);
+                if (t == GG_Q5_0 || t == GG_Q5_1) { memcpy(&qh, q, 4); q += 4; }
+            }
+            for (int j = 0; j < 16; j++) {  // element j in the low nibble of byte j, element j + 16 in the high one
+                int lo = q[j] & 0xF, hi = q[j] >> 4;
+                if (t == GG_Q5_0 || t == GG_Q5_1) { lo |= (qh >> j & 1) << 4; hi |= (qh >> (j + 16) & 1) << 4; }
+                if (t == GG_IQ4_NL) { y[j] = d * kv_iq4[lo]; y[j + 16] = d * kv_iq4[hi]; }
+                else if (t == GG_MXFP4) { y[j] = d * kv_fp4[lo]; y[j + 16] = d * kv_fp4[hi]; }
+                else {
+                    const int off = t == GG_Q4_0 ? 8 : t == GG_Q5_0 ? 16 : 0;
+                    y[j] = d * (lo - off) + m; y[j + 16] = d * (hi - off) + m;
+                }
+            }
+        }
+        return;
+    }
+    case GG_IQ4_XS: {
+        static const int8_t kv[16] = {-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113};
+        for (int64_t b = 0; b < n / 256; b++, p += 136) {
+            const float d = gg_h2f(p);
+            const uint16_t sh = (uint16_t)(p[2] | p[3] << 8);
+            const uint8_t *sl = p + 4, *q = p + 8;
+            for (int ib = 0; ib < 8; ib++, q += 16, y += 32) {
+                const int ls = ((sl[ib / 2] >> 4 * (ib % 2)) & 0xF) | ((sh >> 2 * ib) & 3) << 4;
+                const float dl = d * (ls - 32);
+                for (int j = 0; j < 16; j++) { y[j] = dl * kv[q[j] & 0xF]; y[j + 16] = dl * kv[q[j] >> 4]; }
+            }
+        }
+        return;
+    }
+    case GG_Q2_K:
+        for (int64_t b = 0; b < n / 256; b++, p += 84) {
+            const uint8_t *sc = p, *q = p + 16;
+            const float d = gg_h2f(p + 80), dmin = gg_h2f(p + 82);
+            int is = 0;
+            for (int h = 0; h < 2; h++, q += 32)
+                for (int shift = 0; shift < 8; shift += 2)
+                    for (int part = 0; part < 2; part++, is++) {
+                        const float dl = d * (sc[is] & 0xF), ml = dmin * (sc[is] >> 4);
+                        for (int l = 0; l < 16; l++) *y++ = dl * ((q[l + 16 * part] >> shift) & 3) - ml;
+                    }
+        }
+        return;
+    case GG_Q3_K:
+        for (int64_t b = 0; b < n / 256; b++, p += 110) {
+            const uint8_t *hm = p, *q = p + 32;
+            const float d = gg_h2f(p + 108);
+            uint32_t aux[4];
+            memcpy(aux, p + 96, 12);
+            const uint32_t tmp = aux[2], k1 = 0x03030303, k2 = 0x0f0f0f0f;
+            aux[2] = ((aux[0] >> 4) & k2) | (((tmp >> 4) & k1) << 4);
+            aux[3] = ((aux[1] >> 4) & k2) | (((tmp >> 6) & k1) << 4);
+            aux[0] = (aux[0] & k2) | (((tmp >> 0) & k1) << 4);
+            aux[1] = (aux[1] & k2) | (((tmp >> 2) & k1) << 4);
+            int8_t sc[16];
+            memcpy(sc, aux, 16);
+            int is = 0;
+            uint8_t m = 1;
+            for (int h = 0; h < 2; h++, q += 32)
+                for (int shift = 0; shift < 8; shift += 2, m <<= 1)
+                    for (int part = 0; part < 2; part++, is++) {
+                        const float dl = d * (sc[is] - 32);
+                        for (int l = 0; l < 16; l++) {
+                            const int k = l + 16 * part;
+                            *y++ = dl * (((q[k] >> shift) & 3) - ((hm[k] & m) ? 0 : 4));
+                        }
+                    }
+        }
+        return;
+    case GG_IQ3_XXS:
+        for (int64_t b = 0; b < n / 256; b++, p += 98) {
+            const float d = gg_h2f(p);
+            const uint8_t *q = p + 2, *sa = p + 66;
+            for (int ib = 0; ib < 8; ib++) {  // 32 values: 8 grid indices, a 4-bit scale and 4 x 7 sign bits
+                uint32_t aux;
+                memcpy(&aux, sa + 4 * ib, 4);
+                const float db = d * (0.5f + (aux >> 28)) * 0.5f;
+                for (int l = 0; l < 4; l++) {
+                    const uint8_t signs = iq_ksigns[(aux >> 7 * l) & 127];
+                    const uint8_t *g1 = iq3xxs_grid[q[8 * ib + 2 * l]], *g2 = iq3xxs_grid[q[8 * ib + 2 * l + 1]];
+                    for (int j = 0; j < 4; j++) *y++ = db * g1[j] * (signs >> j & 1 ? -1.f : 1.f);
+                    for (int j = 0; j < 4; j++) *y++ = db * g2[j] * (signs >> (j + 4) & 1 ? -1.f : 1.f);
+                }
+            }
+        }
+        return;
+    case GG_IQ3_S:
+        for (int64_t b = 0; b < n / 256; b++, p += 110) {
+            const float d = gg_h2f(p);
+            const uint8_t *q = p + 2, *qh = p + 66, *sg = p + 74, *sc = p + 106;
+            for (int i = 0; i < 64; i++) {  // grid index i covers elements 4i .. 4i + 3; one 4-bit scale per 32
+                const float db = d * (1 + 2 * ((sc[i / 16] >> 4 * (i / 8 % 2)) & 0xF));
+                const uint8_t* g = iq3s_grid[q[i] | ((qh[i / 8] >> (i % 8)) & 1) << 8];
+                for (int j = 0; j < 4; j++) { const int e = 4 * i + j; *y++ = db * g[j] * (sg[e / 8] >> (e % 8) & 1 ? -1.f : 1.f); }
+            }
         }
         return;
     }
