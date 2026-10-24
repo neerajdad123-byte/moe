@@ -54,6 +54,9 @@ jobs:
           build/moex.exe > /dev/null 2>&1; rc=$?; echo "no arguments: rc $rc"; [ $rc -eq 2 ] || exit 1
           build/moex.exe nosuchcommand > /dev/null 2>&1; rc=$?; echo "unknown command: rc $rc"; [ $rc -eq 2 ] || exit 1
           out=$(build/moex.exe chat --model no_model_here 2>&1); rc=$?; echo "missing model: rc $rc | $out"; [ $rc -eq 1 ] && [[ "$out" == *"No model at"* ]] || exit 1
+          out=$(build/moex.exe chat --model some.gguf 2>&1); rc=$?; echo "GGUF as --model: rc $rc"; [ $rc -eq 1 ] && [[ "$out" == *"moex import"* ]] || { echo "$out"; exit 1; }
+          build/moex.exe import > /dev/null 2>&1; rc=$?; echo "import without a file: rc $rc"; [ $rc -eq 2 ] || exit 1
+          out=$(build/moex.exe import no_such.gguf 2>&1); rc=$?; echo "import of a missing file: rc $rc | $out"; [ $rc -eq 1 ] && [[ "$out" == *"cannot open"* ]] || exit 1
 
       - name: Download and PATH helpers (no GPU, no internet)
         shell: cmd
@@ -79,6 +82,12 @@ jobs:
         shell: cmd
         run: cl /nologo /std:c++20 /O2 /EHsc /utf-8 tests\test_tokenizer.cpp /Fe:build\test_tokenizer.exe /Fo:build\
 
+      - name: GGUF reader (dequantization vs llama.cpp's reference, header, value-head order, int4 requantizer)
+        shell: cmd
+        run: |
+          cl /nologo /std:c++20 /O2 /EHsc /utf-8 /D_CRT_SECURE_NO_WARNINGS tests\test_gguf.cpp /Fe:build\test_gguf.exe /Fo:build\ || exit /b 1
+          build\test_gguf.exe
+
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
@@ -90,3 +99,13 @@ jobs:
           mkdir -p tok
           curl -sSfL -o tok/tokenizer.json https://huggingface.co/Kreuzzelg/qwen36-35b-a3b-colibri-i4-gs64/resolve/main/tokenizer.json
           QWEN36_MODEL=tok python tools/check_tokenizer.py
+
+      - name: Build test_template.exe
+        shell: cmd
+        run: cl /nologo /std:c++20 /O2 /EHsc /utf-8 /D_CRT_SECURE_NO_WARNINGS tests\test_template.cpp /Fe:build\test_template.exe /Fo:build\
+
+      - name: Chat prompts vs Qwen3.6's chat template (offline, no model)
+        shell: bash
+        run: |
+          pip install jinja2
+          QWEN36_MODEL=tok python tools/check_template.py --offline tok
