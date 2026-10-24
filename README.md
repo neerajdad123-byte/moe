@@ -97,6 +97,7 @@ downloads to that folder instead.
 | `moex chat` | chat in the terminal |
 | `moex serve` | OpenAI-compatible API for other apps |
 | `moex bench` | measure speed on your PC (~2-4 min, one model load): MTP off, MTP on and --fast tok/s, your PC's specs, a line to share |
+| `moex import FILE.gguf` | convert a Qwen3.5/3.6-35B-A3B GGUF you already have (or a finetune of it) to run it, see below |
 | `moex install` | put moex on your PATH (for zip users) |
 | `moex help`, `-h`, `--help` | all commands and options |
 | `moex --version`, `-v` | the version |
@@ -119,6 +120,32 @@ Type a message and press Enter. `/reset` starts a new conversation, `/exit` quit
 | `--seed N` | the same answer every time for the same input |
 | `--ctx 8192` | context length in tokens; long contexts work (26,500 tested), each 1,000 tokens costs ~10 MB of VRAM |
 | `--model DIR` | model folder (default: `models\` next to `moex.exe`) |
+
+## Use a GGUF you already have
+
+Already downloaded a GGUF for llama.cpp, LM Studio or Ollama? Convert it once, then run it like the default model:
+
+```bat
+moex import C:\models\Qwen3.6-35B-A3B-Q4_K_M.gguf
+moex chat --model C:\models\Qwen3.6-35B-A3B-Q4_K_M-moex
+```
+
+- **Which files:** any GGUF of **Qwen3.5-35B-A3B / Qwen3.6-35B-A3B** and their finetunes (architecture
+  `qwen35moe`: Ornith-1.5, Qwen3.8-35B-A3B-Distill, Tiel-Coder, Qwopus3.6-Coder, Holo-3.1, Qwen-AgentWorld,
+  uncensored / abliterated builds, ...). Other models are refused with the reason.
+- **Which quants:** Q8_0, Q6_K, Q5_K, Q4_K, Q3_K, Q2_K, Q4_0/1, Q5_0/1, IQ4_XS, IQ4_NL, IQ3_S, IQ3_XXS, MXFP4, BF16,
+  F16 (any mix, e.g. Unsloth's UD files). Not IQ2 / IQ1.
+- **Disk and time:** a ~23 GB folder next to the GGUF (`--out DIR` to choose), ~2-5 minutes. The GGUF is not
+  changed or needed afterwards.
+- **Accuracy:** Q4_K experts are carried over exactly; moex runs them in its own format (a scale and a zero point per
+  32 weights). Other quant types are refit to 4 bits. On the ggml-org Q4_K_M file moex stays as close to the
+  default model's outputs as llama.cpp running the same file (mean KL 0.026 vs 0.020 on prose, 0.0007 vs 0.0012 on
+  code): the difference you see is mostly the GGUF's own quantization.
+- **Speed:** these experts take 11% more memory than the default model's, so expect slightly fewer tokens/s.
+- **MTP:** files with the MTP layer (`-MTP` in the name, `nextn` in llama.cpp) keep it; files without run without
+  multi-token prediction.
+- **Chat format:** the GGUF's own chat template is kept and honored (Qwen's, Unsloth's and Ornith's variants are
+  checked token for token). A template moex does not know (e.g. Tiel-Coder's) falls back to Qwen3.6's format.
 
 ## Use it from other apps
 
@@ -264,7 +291,7 @@ Credits), so it is not identical to the original BF16 weights.
 
 | | |
 |---|---|
-| Model | **Qwen3.6-35B-A3B** (int4 gs64 weights from `moex download`). Text only. |
+| Model | **Qwen3.6-35B-A3B** (int4 gs64 weights from `moex download`), and GGUFs of Qwen3.5/3.6-35B-A3B and its finetunes via `moex import`. Text only. |
 | GPU | NVIDIA RTX 20 / 30 / 40 / 50 series and newer datacenter cards, 6 GB VRAM or more |
 | OS | Windows 10/11; Linux (build from source with `./build.sh`; builds on Ubuntu 24.04 under WSL2, speed test pending) |
 | RAM | 24 GB recommended. 16 GB works: moex keeps its own RAM cache of experts and reads the rest straight from the SSD (~25-34 tokens/s on the test laptop, +20% since v0.1.3); moex prints a tip to free RAM |
@@ -273,8 +300,8 @@ Credits), so it is not identical to the original BF16 weights.
 ## Roadmap
 
 - **Linux** release binary (today: build from source). Next.
-- **GGUF support** and **more models:** load the GGUF files people already have, and other mixture-of-experts
-  families (Qwen, DeepSeek, GLM, gpt-oss).
+- **More models:** other mixture-of-experts families (Qwen, DeepSeek, GLM, gpt-oss), and converters for the other
+  downloads people have (FP8, GPTQ / AutoRound, AWQ, NVFP4). GGUFs of the Qwen3.5/3.6-35B-A3B family: `moex import`.
 - **More speed:** further lossless experiments, and opt-in modes that trade a little accuracy for speed, measured
   and labelled like `--fast`.
 - **A chat page** in the browser, served by `moex serve`.
@@ -302,6 +329,10 @@ model with `build/moex download`, then `build/moex chat --load`.
 | prompts vs Qwen's chat template | `MOEX_DUMP_PROMPT=build\prompt_ids.txt moex serve`, then `python tools/check_template.py` |
 | server security and robustness | `moex serve`, then `python tools/test_security.py` and `python tools/test_robust.py` |
 | `/reset` in chat | `python tools/test_reset.py` |
+| GGUF reader: dequantization vs llama.cpp's reference, import pieces (no GPU) | `build	est_gguf.exe` |
+| prompts vs a chat template without the model (no GPU) | `python tools/check_template.py --offline [MODEL_DIR]` |
+| an imported GGUF vs the default model, tensor by tensor | `python tools/gguf_import_check.py IMPORTED_DIR` |
+| llama.cpp on a GGUF vs the `--check` reference outputs | `python tools/llama_check.py FILE.gguf ref/eval1` |
 | download and PATH helpers (no GPU) | `build\test_download.exe`, `build\test_userenv.exe` |
 | the release benchmark | `python tools/bench.py` (1K / 8K prompts, MTP and `--fast`, prompt reading, VRAM, KL) |
 
