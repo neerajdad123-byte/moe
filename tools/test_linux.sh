@@ -37,7 +37,9 @@ install_check() {
 step "moex install (link in ~/.local/bin, twice)" install_check
 step "GGUF reader (test_gguf)" build/test_gguf
 step "speculative sampling (test_spec)" build/test_spec
-step "dense int4/int6 decoder (test_dense)" bash -c "$PY tools/quant_dense.py --selftest > /dev/null && build/test_dense"
+if $PY -c "import torch, numpy" 2> /dev/null; then  # tools/quant_dense.py writes the reference with torch
+    step "dense int4/int6 decoder (test_dense)" bash -c "$PY tools/quant_dense.py --selftest > /dev/null && build/test_dense"
+else summary+="SKIP  dense int4/int6 decoder (test_dense: no torch in $PY)"$'\n'; fi
 TOK=$MODEL; [ -f "$TOK/tokenizer.json" ] || TOK=tok
 if [ ! -f "$TOK/tokenizer.json" ]; then mkdir -p tok && curl -sSfL -o tok/tokenizer.json https://huggingface.co/Kreuzzelg/qwen36-35b-a3b-colibri-i4-gs64/resolve/main/tokenizer.json; fi
 step "tokenizer vs Hugging Face (check_tokenizer.py)" env QWEN36_MODEL="$TOK" $PY tools/check_tokenizer.py
