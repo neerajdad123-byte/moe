@@ -49,7 +49,8 @@ if [ "$WHAT" = gpu ]; then
     step "kernels (test_kernels)" with_env QWEN36_MODEL="$MODEL" build/test_kernels
     check_set() {  # set, options...
         local out; out=$(timeout 1800 build/moex --check "$@" --model "$MODEL" 2>&1); local rc=$?
-        echo "$out" | grep -a "\[check\]\|\[mtp\]\|\[ram\]\|slots\|error\|failed"; [ $rc -eq 0 ] && [[ "$out" == *"-> PASS"* ]]
+        echo "$out" | grep -a "\[check\]\|\[mtp\]\|\[ram\]\|\[load\]\|error\|failed"
+        [ $rc -eq 0 ] && [[ "$out" == *"-> PASS"* ]] || { echo "rc $rc, last lines:"; echo "$out" | tail -8; return 1; }
     }
     for s in $SETS; do
         step "--check $s" check_set "$s"
