@@ -11,9 +11,21 @@
 #include <string>
 #include <thread>
 #include <vector>
+#ifdef _WIN32
 #include <winsock2.h>
 #include <windows.h>
 #pragma comment(lib, "ws2_32.lib")
+#else
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <unistd.h>
+#include "../src/plat.h"  // GlobalMemoryStatusEx for mem_report
+typedef int SOCKET;
+#define INVALID_SOCKET (-1)
+#define SD_SEND SHUT_WR
+#define closesocket close
+#endif
 #define CK(x) do { cudaError_t e_ = (x); if (e_ != cudaSuccess) { fprintf(stderr, "%s\n", cudaGetErrorString(e_)); exit(1); } } while (0)
 static double now() { return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
 #include "../src/json.h"
@@ -62,10 +74,14 @@ int main() {
     check("shell_quote: empty", shell_quote("") == "''");
 
     // resuming a .part file
+#ifdef _WIN32
     WSADATA wsa; WSAStartup(MAKEWORD(2, 2), &wsa);
+    int alen = sizeof(sockaddr_in);
+#else
+    socklen_t alen = sizeof(sockaddr_in);
+#endif
     SOCKET ls = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
     sockaddr_in a{}; a.sin_family = AF_INET; a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    int alen = sizeof a;
     if (bind(ls, (sockaddr*)&a, sizeof a) || listen(ls, 4) || getsockname(ls, (sockaddr*)&a, &alen)) { printf("cannot listen\n"); return 1; }
     std::thread(http_server, ls).detach();
     const std::string url = "http://127.0.0.1:" + std::to_string(ntohs(a.sin_port)) + "/f.bin";
