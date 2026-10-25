@@ -344,8 +344,18 @@ struct Engine {
         rc_n = std::min((int)(want * 1e9 / RSLOT), NL * E);
         rc_base = (uint8_t*)VirtualAlloc(nullptr, (size_t)rc_n * RSLOT, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
         if (!rc_base) { fprintf(stderr, "[ram] cannot allocate %.1f GB\n", want); exit(1); }
-        for (size_t o = 0, step = (size_t)512 * RSLOT; o < (size_t)rc_n * RSLOT; o += step)  // pinned: async copy-back
-            CK(cudaHostRegister(rc_base + o, std::min(step, (size_t)rc_n * RSLOT - o), cudaHostRegisterDefault));
+        // pinned: async copy-back. The driver may pin less (WSL2 stops at a few GB): keep what it pinned, minus 1 GB
+        // for the pinned buffers allocated later, instead of failing; the slots past that are never used
+        const size_t step = (size_t)512 * RSLOT;
+        for (size_t o = 0; o < (size_t)rc_n * RSLOT; o += step)
+            if (cudaHostRegister(rc_base + o, std::min(step, (size_t)rc_n * RSLOT - o), cudaHostRegisterDefault) != cudaSuccess) {
+                cudaGetLastError();  // clear it
+                for (const size_t keep = o > (1ull << 30) ? o - (1ull << 30) : 0; o > keep;) { o -= step; CK(cudaHostUnregister(rc_base + o)); }
+                rc_n = (int)(o / RSLOT);
+                fprintf(stderr, "[ram] the driver pins only part of RAM: own expert cache cut to %d slots (%.1f GB)\n", rc_n, o / 1e9);
+                break;
+            }
+        if (!rc_n) { fprintf(stderr, "[ram] nothing could be pinned: experts come through the file cache\n"); return; }
         rc_victim = !getenv("MOEX_VICTIM") || atoi(getenv("MOEX_VICTIM"));
         ahead_k = getenv("MOEX_AHEAD") ? atoi(getenv("MOEX_AHEAD")) : 3;
         mapq = eq; maps = es;
