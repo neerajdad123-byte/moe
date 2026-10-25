@@ -1,7 +1,7 @@
 #!/bin/sh
 # build.sh       -> build/moex (Linux; RTX 20/30/40/50, A100, H100 + PTX) and the test programs (as build.bat).
 #                   Needs the CUDA toolkit (nvcc) and g++.
-# build.sh dev   -> moex for this machine's GPU only (fast rebuilds)
+# build.sh dev   -> the same, moex for this machine's GPU only (fast rebuilds)
 # build.sh moex  -> moex only (the release build)
 set -e
 cd "$(dirname "$0")"
