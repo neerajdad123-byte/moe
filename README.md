@@ -40,6 +40,14 @@ No CUDA toolkit, no Python.
   `.\moex chat`. To use plain `moex` from anywhere later, run `.\moex install` once. On a driver older than 580
   (check with `nvidia-smi`), take `moex-windows-x64-cuda12.zip` instead (the installer does this by itself).
 
+- **Linux (x86-64, new; from the next release on):** `curl -fsSL https://raw.githubusercontent.com/neerajdad123-byte/moe/main/install.sh | sh`
+  puts moex in `~/.local/share/moex` and links `~/.local/bin/moex` to it, no sudo. Or by hand: download
+  `moex-linux-x64.tar.gz` (driver 580+) or `moex-linux-x64-cuda12.tar.gz` (driver 570+) from the
+  [releases](https://github.com/neerajdad123-byte/moe/releases/latest), then
+  `tar -xzf moex-linux-x64.tar.gz && cd moex && ./moex download && ./moex chat --load`. Needs only the NVIDIA driver
+  (no CUDA toolkit) and glibc 2.35+ (Ubuntu 22.04 or newer). Until a release has the tarball: build from source
+  (below). Tested under WSL2 (Ubuntu 24.04) on the RTX 4050 laptop, not yet on a native Linux install.
+
 **2. Download the model.** In any terminal:
 
 ```bat
@@ -301,13 +309,13 @@ Credits), so it is not identical to the original BF16 weights.
 |---|---|
 | Model | **Qwen3.6-35B-A3B** (int4 gs64 weights from `moex download`). **GGUFs** of Qwen3.5/3.6-35B-A3B and their finetunes (Ornith-1.5, Qwen3.8-Distill, Tiel-Coder, Qwopus, Holo, AgentWorld, ...) via `moex import`, see [Use a GGUF you already have](#use-a-gguf-you-already-have). Text only. |
 | GPU | NVIDIA RTX 20 / 30 / 40 / 50 series and newer datacenter cards, 6 GB VRAM or more |
-| OS | Windows 10/11; Linux (build from source with `./build.sh`; builds on Ubuntu 24.04 under WSL2, speed test pending) |
+| OS | Windows 10/11; Linux x86-64 (tested under WSL2 Ubuntu 24.04; native Linux not tested yet) |
 | RAM | 24 GB recommended. 16 GB works: moex keeps its own RAM cache of experts and reads the rest straight from the SSD (~25-34 tokens/s on the test laptop, +20% since v0.1.3); moex prints a tip to free RAM |
 | Use | one conversation at a time, one GPU |
 
 ## Roadmap
 
-- **Linux** release binary (today: build from source). Next.
+- **Linux:** a test on a native (non-WSL) Linux install; the release tarball ships with the next release.
 - **More models:** other mixture-of-experts families (Qwen, DeepSeek, GLM, gpt-oss), and converters for the other
   downloads people have (FP8, GPTQ / AutoRound, AWQ, NVFP4). GGUFs of the Qwen3.5/3.6-35B-A3B family: `moex import`.
 - **More speed:** further lossless experiments, and opt-in modes that trade a little accuracy for speed, measured
@@ -324,8 +332,12 @@ Visual Studio 2026 (C++) and CUDA 13.x. `build.bat` builds `build\moex.exe` for 
 (`build.bat dev` builds for your GPU only, faster; `build.bat cuda12` builds the older-driver version with CUDA 12.8);
 `package.bat` makes the release zips.
 
-Linux: the CUDA toolkit (12.8 or newer) and g++, then `./build.sh` (or `./build.sh dev`) builds `build/moex`. Get the
-model with `build/moex download`, then `build/moex chat --load`.
+Linux: the CUDA toolkit (12.8 or newer) and g++, then `./build.sh` (or `./build.sh dev`) builds `build/moex` and the
+test programs (`./build.sh moex`: moex only). Get the model with `build/moex download`, then `build/moex chat --load`.
+`tools/test_linux.sh cpu` runs the checks below that need no GPU; `tools/test_linux.sh gpu MODEL_DIR` runs all of them.
+Under WSL2: install the CUDA toolkit for WSL inside Ubuntu (never a Linux display driver: WSL uses the Windows one).
+WSL2 gets half the PC's RAM by default and pins only part of it, so moex runs in its low-RAM mode there (on the RTX
+4050 laptop with `memory=20GB` in `.wslconfig`: ~37-41 tokens/s in `moex bench`, vs ~68-78 on Windows itself).
 
 | Check | Command |
 |---|---|
