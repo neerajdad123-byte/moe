@@ -59,15 +59,17 @@ if [ "$WHAT" = gpu ]; then
     step "--check ref/eval1, low-RAM path (MOEX_LOW_RAM=1)" with_env MOEX_LOW_RAM=1 check_set ref/eval1
 
     serve_tests() {
-        MOEX_DUMP_PROMPT=build/prompt_ids.txt build/moex serve --model "$MODEL" > "$TMP/serve.log" 2>&1 & SRV=$!
-        local t=0; until curl -sf http://127.0.0.1:8765/health > /dev/null; do
+        # its own port: a moex serve already on 8765 (with WSL's mirrored networking, even a Windows one) would answer
+        local port=18765 url=http://127.0.0.1:18765
+        MOEX_DUMP_PROMPT=build/prompt_ids.txt build/moex serve --model "$MODEL" --port $port > "$TMP/serve.log" 2>&1 & SRV=$!
+        local t=0; until curl -sf $url/health > /dev/null; do
             sleep 2; t=$((t + 2)); kill -0 $SRV 2>/dev/null && [ $t -lt 1200 ] || { tail -20 "$TMP/serve.log"; return 1; }
         done
         grep -a "load\|slots\|\[ram\]" "$TMP/serve.log" | head -20
         local rc=0
-        $PY tools/test_server.py > "$TMP/ts.log" 2>&1 || rc=1; cat "$TMP/ts.log"; grep -q FAIL "$TMP/ts.log" && rc=1
-        for t in test_tools test_security test_robust; do echo "-- $t"; $PY tools/$t.py || rc=1; done
-        echo "-- check_template (vs the running server)"; QWEN36_MODEL="$MODEL" $PY tools/check_template.py || rc=1
+        $PY tools/test_server.py $url > "$TMP/ts.log" 2>&1 || rc=1; cat "$TMP/ts.log"; grep -q FAIL "$TMP/ts.log" && rc=1
+        for t in test_tools test_security test_robust; do echo "-- $t"; $PY tools/$t.py $url || rc=1; done
+        echo "-- check_template (vs the running server)"; QWEN36_MODEL="$MODEL" $PY tools/check_template.py $url || rc=1
         kill $SRV; wait $SRV 2>/dev/null; SRV=
         return $rc
     }
