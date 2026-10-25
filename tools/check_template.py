@@ -13,6 +13,7 @@ Needs jinja2 and tokenizers (pip install jinja2 tokenizers); without a chat_temp
 Hugging Face. The tokenizer is QWEN36_MODEL's.
 """
 import json, os, subprocess, sys, urllib.request
+EXE = ".exe" if os.name == "nt" else ""  # Linux: build/test_x (a .exe there would be the Windows one, via WSL)
 import jinja2
 from tokenizers import Tokenizer
 
@@ -49,7 +50,7 @@ def moex(messages, tools, think):
     if OFFLINE:
         req = os.path.join("build", "template_request.json")
         json.dump({"messages": messages, "tools": tools or [], "think": think}, open(req, "w", encoding="utf-8"), ensure_ascii=False)
-        out = subprocess.run([os.path.join("build", "test_template.exe"), os.path.join(MODEL, "tokenizer.json"), TPL_DIR, req],
+        out = subprocess.run([os.path.join("build", "test_template" + EXE), os.path.join(MODEL, "tokenizer.json"), TPL_DIR, req],
                              capture_output=True, text=True, check=True).stdout
         return [int(x) for x in out.strip().split(",")]
     body = {"messages": messages, "max_tokens": 1, "chat_template_kwargs": {"enable_thinking": think}}

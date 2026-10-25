@@ -5,7 +5,7 @@ question must be exactly what a fresh process replies (greedy decoding).
 """
 import os, subprocess, sys
 
-EXE = sys.argv[1] if len(sys.argv) > 1 else os.path.join("build", "moex.exe")
+EXE = sys.argv[1] if len(sys.argv) > 1 else os.path.join("build", "moex" + (".exe" if os.name == "nt" else ""))
 MODEL = sys.argv[2] if len(sys.argv) > 2 else os.environ.get("MOEX_MODEL", r"C:\models\qwen36_i4_gs64")
 Q = "What is the secret word? If you were never told one, answer exactly: UNKNOWN."
 

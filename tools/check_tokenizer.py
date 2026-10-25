@@ -3,6 +3,7 @@
   python tools/check_tokenizer.py
 """
 import glob, os, shutil, subprocess, sys
+EXE = ".exe" if os.name == "nt" else ""  # Linux: build/test_x (a .exe there would be the Windows one, via WSL)
 from tokenizers import Tokenizer
 
 MODEL = os.environ.get("QWEN36_MODEL", r"C:\models\qwen36_i4_gs64")
@@ -36,7 +37,7 @@ for pat in ("data/*.txt", "*.md", "src/*.cu", "src/*.h", "tools/*.py", "ref/*.py
 shutil.rmtree(OUT, ignore_errors=True); os.makedirs(OUT)
 for i, c in enumerate(cases):
     open(os.path.join(OUT, f"{i:04d}.txt"), "w", encoding="utf-8", newline="").write(c)
-r = subprocess.run([os.path.join("build", "test_tokenizer.exe"), TJ, OUT], capture_output=True, text=True)
+r = subprocess.run([os.path.join("build", "test_tokenizer" + EXE), TJ, OUT], capture_output=True, text=True)
 if r.returncode: print(r.stderr); sys.exit(1)
 got = {}
 for line in r.stdout.splitlines():
