@@ -120,10 +120,11 @@ static const char* MTP_URL = "https://github.com/neerajdad123-byte/moe/releases/
 static const uint64_t MTP_BYTES = 531715224;
 
 // A file name from the Hugging Face listing, as a path inside the model folder `dir`. false for any name that could
-// write elsewhere: absolute, with a drive ("C:x") or a ':' (alternate stream), with a ".." part, or empty.
+// write elsewhere: absolute, with a drive ("C:x") or a ':' (alternate stream), with a ".." part, or empty. A '\' too:
+// a separator on Windows, and on Linux "..\x" would be a strange file name (Hugging Face names use '/').
 static bool model_file_path(const std::filesystem::path& dir, const std::string& name, std::filesystem::path& out) {
     namespace fs = std::filesystem;
-    if (name.empty() || name.find(':') != std::string::npos) return false;
+    if (name.empty() || name.find_first_of(":\\") != std::string::npos) return false;
     const fs::path rel(name);
     if (rel.is_absolute() || rel.has_root_name() || rel.has_root_directory()) return false;
     for (auto& part : rel) if (part == "..") return false;
