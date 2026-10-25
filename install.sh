@@ -15,8 +15,12 @@ URL="${MOEX_URL:-https://github.com/neerajdad123-byte/moe/releases/latest/downlo
 if pgrep -x moex >/dev/null 2>&1; then echo "moex is running: close it first, then run the installer again." >&2; exit 1; fi
 
 echo "Downloading moex..."
+TMPF=$(mktemp); trap 'rm -f "$TMPF"' EXIT
+# to a file first: in a pipe, sh would hide curl's error behind tar's
+curl -fsSL -o "$TMPF" "$URL" || { echo "Cannot download $URL. If the latest release has no Linux build yet, build moex from source:
+  https://github.com/neerajdad123-byte/moe#building-from-source" >&2; exit 1; }
 mkdir -p "$DIR"
-curl -fsSL "$URL" | tar -xz -C "$DIR" --strip-components=1  # the tarball holds moex/{moex,moex_hot.bin,README.md,LICENSE}
+tar -xzf "$TMPF" -C "$DIR" --strip-components=1  # the tarball holds moex/{moex,moex_hot.bin,README.md,LICENSE}
 "$DIR/moex" install  # the ~/.local/bin/moex link
 
 echo "Installed to $DIR"
