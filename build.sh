@@ -13,7 +13,8 @@ FAT="-gencode arch=compute_75,code=sm_75 -gencode arch=compute_80,code=sm_80 -ge
 NV="nvcc -std=c++20 -O3 -lineinfo -Xcompiler -mavx2,-mfma,-mf16c,-pthread"
 CXX="g++ -std=c++20 -O2 -mavx2 -mfma -mf16c -pthread"
 if [ "$1" != "moex" ]; then
-  $NV -arch=native tests/test_kernels.cu -o build/test_kernels
+  KARCH=-arch=native; nvidia-smi > /dev/null 2>&1 || KARCH=-arch=sm_89  # no GPU (CI): it builds, it cannot run
+  $NV $KARCH tests/test_kernels.cu -o build/test_kernels
   $NV tests/test_download.cu -o build/test_download
   CUDA_INC="$(dirname "$(dirname "$(command -v nvcc)")")/include"
   $CXX -I "$CUDA_INC" tests/test_tokenizer.cpp -o build/test_tokenizer
