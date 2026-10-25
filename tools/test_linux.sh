@@ -4,7 +4,8 @@
 #   tools/test_linux.sh gpu [MODEL]    + test_kernels, --check (default and --load --mtp), serve + its tests, /reset,
 #                                      bench, and the low-RAM path (MOEX_LOW_RAM=1); MODEL defaults to $MOEX_MODEL
 # CHECK_SETS: the --check sets (default ref/eval1). PY: a python with tokenizers, jinja2, openai, anthropic.
-# NOBUILD=1 skips ./build.sh. Every model run has a time limit, so a hang (e.g. on exit) is a FAIL, not a stuck gate.
+# NOBUILD=1 skips ./build.sh. --check, /reset, bench and the server start have time limits, so a hang there (e.g. on
+# exit) is a FAIL, not a stuck gate; test_kernels and the server test scripts have none.
 set -u
 cd "$(dirname "$0")/.."
 WHAT=${1:-cpu}
