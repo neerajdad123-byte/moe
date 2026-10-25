@@ -117,7 +117,9 @@ struct PlatIo {
             __atomic_store_n(&o->state, 2, __ATOMIC_RELEASE);
         }
     }
-    static PlatIo& get() { static PlatIo p; return p; }
+    // never destroyed: its detached threads wait on cv until the process ends, and glibc's condition variable
+    // destructor (run at exit for a static) waits for its waiters: moex hung on exit after any low-RAM run
+    static PlatIo& get() { static PlatIo* p = new PlatIo; return *p; }
 };
 inline BOOL ReadFile(HANDLE h, void* buf, DWORD n, DWORD* got, OVERLAPPED* o) {
     if (!o) {
