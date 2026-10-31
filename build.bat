@@ -20,6 +20,7 @@ if "%1"=="cuda12" (
 )
 if "%1"=="dev" set FAT=-arch=native
 %NV% -arch=native tests\test_kernels.cu -o build\test_kernels.exe || exit /b 1
+%NV% -arch=native tests\test_fa.cu -o build\test_fa.exe || exit /b 1
 %NV% tests\test_userenv.cu -o build\test_userenv.exe -ladvapi32 -luser32 || exit /b 1
 %NV% tests\test_download.cu -o build\test_download.exe -ladvapi32 -luser32 || exit /b 1
 %NV% %FAT% %MANI% src\moex.cu -o build\moex.exe || exit /b 1

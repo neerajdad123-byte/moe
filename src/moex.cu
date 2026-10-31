@@ -112,6 +112,9 @@ struct Engine {
     half* qtmp = nullptr;  // F16 staging for quantization, freed after load
     const half* embed;  // mmapped, stays in RAM
     int ctx;
+    // MOEX_KV=turbo (local): K 4-bit / V 3-bit TurboQuant KV cache (kernels.cuh, KVCache) instead of int8: 240 bytes per
+    // (kv head, position) instead of 520, the difference becomes expert slots
+    const int kv_turbo = getenv("MOEX_KV") && !strcmp(getenv("MOEX_KV"), "turbo");
     // MTP (multi-token prediction): the model's own draft head (mtp.safetensors from tools/fetch_mtp.py). Each decode
     // round runs [token, draft] through the model as one 2-token chunk; a right draft gives 2 tokens for ~1.3x the cost.
     bool has_mtp = false, want_mtp = false;
@@ -879,7 +882,7 @@ struct Engine {
                 w.o = wmat({{a + "o_proj.weight", D}}, AH * AHD, "attn_o");
                 w.qn = wup(a + "q_norm.weight", AHD);
                 w.kn = wup(a + "k_norm.weight", AHD);
-                w.kv = kv_alloc(AKV, ctx);
+                w.kv = kv_alloc(AKV, ctx, kv_turbo);
             } else {
                 std::string a = p + "linear_attn.";
                 w.dn_in = wmat({{a + "in_proj_qkv.weight", DC}, {a + "in_proj_z.weight", DVH * DNV},
@@ -953,17 +956,17 @@ struct Engine {
         CK(cudaMemGetInfo(&vf[4], &vtot));
         {
             const double MB = 1 << 20;
-            const size_t kv = (size_t)(NL / 4) * (2 * (size_t)AKV * ctx * AHD + 2 * (size_t)AKV * ctx * 4);
+            const size_t kv = (size_t)(NL / 4 + has_mtp) * kv_bytes(AKV, ctx, kv_turbo);
             const size_t dn = (size_t)(NL - NL / 4) * ((size_t)DC * (CONVK - 1) + (size_t)DVH * DNK * DNV) * 4;
             const size_t lmh = f16 ? (size_t)V * D * 2 : is_q6("lm_head") ? (size_t)V * D * 3 / 4 + (size_t)V * (D / 64) * 4 : (size_t)V * D + (size_t)V * 4;
             const size_t router = (size_t)(NL + has_mtp) * E * D * 2;
             const size_t weights = vf[0] - vf[1] - (f16 ? 0 : (size_t)V * D * 2) - kv - dn;  // minus the F16 staging
             const size_t snapb = snap_bytes;
             fprintf(stderr, "[vram] total %.0f MB, in use before load %.0f (CUDA context, display, other apps) | lm_head %.0f | "
-                            "dense + MTP head %.0f (incl. routers f16 %.0f) | KV cache %.0f (ctx %d) | DeltaNet state %.0f | "
+                            "dense + MTP head %.0f (incl. routers f16 %.0f) | KV cache %.0f (ctx %d%s) | DeltaNet state %.0f | "
                             "decode/MTP scratch %.0f (incl. MTP snapshot %.0f) | expert cache %d slots = %.0f MB (prefill borrows %d) | "
                             "free %.0f (reserve)\n",
-                    vtot / MB, (vtot - vf[0]) / MB, lmh / MB, (weights - lmh) / MB, router / MB, kv / MB, ctx, dn / MB,
+                    vtot / MB, (vtot - vf[0]) / MB, lmh / MB, (weights - lmh) / MB, router / MB, kv / MB, ctx, kv_turbo ? ", turbo4/turbo3" : ", int8", dn / MB,
                     (vf[2] - vf[3]) / MB, snapb / MB, nslots, nslots * (double)EXPERT_BYTES / MB, nres, vf[4] / MB);
         }
         carve_prefill(arena + (size_t)(nslots - nres) * EXPERT_BYTES);
@@ -1008,6 +1011,64 @@ struct Engine {
             CK(cudaMemsetAsync(L[l].ring, 0, (size_t)DC * (CONVK - 1) * 4, cs));
             CK(cudaMemsetAsync(L[l].S, 0, (size_t)DVH * DNK * DNV * 4, cs));
         }
+    }
+
+    // ---- prompt checkpoints (local) ----
+    // A changed history (a client re-tokenizing a reply, editing or trimming messages, a regenerated answer) used to
+    // restart the prompt at position 0: the DeltaNet state cannot be rewound. A checkpoint is that state (conv ring and
+    // recurrent S of the 30 linear-attention layers, 63 MB) at one position, in host memory. K/V rows need no copy (a
+    // position's rows never change, later ones are overwritten), and the MTP layer is attention only. Session::generate
+    // restores the latest checkpoint inside the unchanged prefix and reads only the rest.
+    // MOEX_CKPT=N checkpoints kept (default 4, 0 = off); MOEX_CKPT_EVERY=N: one at the first chunk end past every
+    // multiple of N prompt positions (default 8192), plus one before every prompt's last token (Session::generate).
+    struct Ckpt { int pos; std::vector<float> st; };
+    std::vector<Ckpt> ckpts;   // sorted by pos; each holds the state after positions [0, pos)
+    std::vector<float> ckpt_spare;  // an evicted checkpoint's buffer, reused by the next save
+    const int ckpt_max = getenv("MOEX_CKPT") ? std::max(0, atoi(getenv("MOEX_CKPT"))) : 4;
+    const int ckpt_every = getenv("MOEX_CKPT_EVERY") ? std::max(0, atoi(getenv("MOEX_CKPT_EVERY"))) : 8192;
+    static constexpr size_t CKPT_RING = (size_t)DC * (CONVK - 1);
+    void ckpt_save(int pos) {
+        if (ckpt_max <= 0 || pos <= 0) return;
+        Ckpt c{pos, std::move(ckpt_spare)};
+        ckpt_spare.clear();
+        c.st.resize(NDN * (CKPT_RING + (size_t)DVH * DNK * DNV));
+        CK(cudaStreamSynchronize(cs));
+        size_t o = 0;
+        for (int l = 0; l < NL; l++) if (!is_attn(l)) {
+            CK(cudaMemcpyAsync(c.st.data() + o, L[l].ring, CKPT_RING * 4, cudaMemcpyDeviceToHost, cs)); o += CKPT_RING;
+            CK(cudaMemcpyAsync(c.st.data() + o, L[l].S, (size_t)DVH * DNK * DNV * 4, cudaMemcpyDeviceToHost, cs)); o += (size_t)DVH * DNK * DNV;
+        }
+        CK(cudaStreamSynchronize(cs));
+        auto it = std::lower_bound(ckpts.begin(), ckpts.end(), pos, [](const Ckpt& a, int p) { return a.pos < p; });
+        if (it != ckpts.end() && it->pos == pos) { ckpt_spare = std::move(it->st); it->st = std::move(c.st); }
+        else ckpts.insert(it, std::move(c));
+        while ((int)ckpts.size() > ckpt_max) {  // drop the one closest to its predecessor (never the newest position)
+            size_t best = 0;
+            for (size_t i = 1; i + 1 < ckpts.size(); i++)
+                if (ckpts[i].pos - ckpts[i - 1].pos < ckpts[best].pos - (best ? ckpts[best - 1].pos : 0)) best = i;
+            ckpt_spare = std::move(ckpts[best].st);
+            ckpts.erase(ckpts.begin() + best);
+        }
+    }
+    // the latest checkpoint at or before position limit, or nullptr
+    const Ckpt* ckpt_find(int limit) const {
+        const Ckpt* r = nullptr;
+        for (const Ckpt& c : ckpts) if (c.pos <= limit) r = &c;
+        return r;
+    }
+    // state back to checkpoint c; toks[0..c.pos) are the context's tokens (the repetition penalty / n-gram history)
+    void ckpt_restore(const Ckpt& c, const int* toks) {
+        size_t o = 0;
+        for (int l = 0; l < NL; l++) if (!is_attn(l)) {
+            CK(cudaMemcpyAsync(L[l].ring, c.st.data() + o, CKPT_RING * 4, cudaMemcpyHostToDevice, cs)); o += CKPT_RING;
+            CK(cudaMemcpyAsync(L[l].S, c.st.data() + o, (size_t)DVH * DNK * DNV * 4, cudaMemcpyHostToDevice, cs)); o += (size_t)DVH * DNK * DNV;
+        }
+        recent.clear(); ngram.reset();
+        for (int i = ngram.nmin ? 0 : std::max(0, c.pos - (int)TokList::N); i < c.pos; i++) note(toks[i]);
+    }
+    // checkpoints past position pos belong to a history that was just abandoned
+    void ckpt_drop_after(int pos) {
+        while (!ckpts.empty() && ckpts.back().pos > pos) { ckpt_spare = std::move(ckpts.back().st); ckpts.pop_back(); }
     }
 
     void mark(int i, double& t) { if (prof) { CK(cudaStreamSynchronize(cs)); double n = now(); tp[i] += n - t; t = n; } }
@@ -1120,7 +1181,10 @@ struct Engine {
 
     // One token at position `pos`. If want_logits, logits[] is filled and the greedy id returned.
     // ---- prefill: the prompt in chunks of CH tokens; every weight is read once per chunk ----
-    static constexpr int CH = 1024;
+#ifndef MOEX_CH
+#define MOEX_CH 2048
+#endif
+    static constexpr int CH = MOEX_CH;  // prompt tokens per prefill chunk (-DMOEX_CH=N; 2048 measured best: ~24% faster prompts than 1024, 4096 slower)
     float *Xc, *hc, *tmpc, *moec, *qkvc, *bigc, *convc, *oc, *qoc, *agc, *lgc, *rwc, *actp, *ypair, *shgu, *sha, *shs, *shl;
     int* ridxc;
     float *rows_h, *rows_d, *rwc_h, *rwc_d, *ycpu_h, *ycpu_d;  // mapped host memory (zero-copy)
@@ -1254,7 +1318,10 @@ struct Engine {
 
     // Runs prompt tokens ids[0..n) at positions pos0.. and returns the greedy next token (logits[] filled).
     // Same math as step() except dense projections (fp16 activations on tensor cores) and summation order.
-    int prefill(const int* ids, int n, int pos0) {
+    // follow >= 0 (local, prompt checkpoints): the prompt goes on with token `follow` (the caller reads it next), so no
+    // token is picked (returns -1) and the MTP layer's last row gets the real next token; checkpoints are saved at chunk
+    // ends every ckpt_every positions either way.
+    int prefill(const int* ids, int n, int pos0, int follow = -1) {
         const int LQ = AH * 2 * AHD + 2 * AKV * AHD, LB = DC + DVH * DNV + 2 * DVH;
         int next = -1;
         nvtxRangePushA("prefill");
@@ -1277,21 +1344,25 @@ struct Engine {
             copy_k<<<(T * D + 255) / 256, 256, 0, cs>>>(Xc, rows_d, T * D);
             set_int_k<<<1, 1, 0, cs>>>(pos_d, pos0 + c0);
             for (int l = 0; l < NL; l++) chunk_layer(l, T, pt, false);
+            const bool pick = c0 + T == n && follow < 0;  // this chunk's last row picks the first generated token
             if (has_mtp) {  // fill the MTP layer's cache for these positions; the last chunk also makes the first draft
                 rmsnorm(Xc, moec, norm, hc, D, EPS, T, cs);  // Xc = final hidden of every row, hc = normed
                 calib("lm_head", -1, hc, T, D);
-                if (c0 + T == n) { gemv(lm_head, hc + (size_t)(T - 1) * D, logits, D, V, cs); next = pick_token(); }
-                draft = mtp_forward(ids + c0 + 1, T, c0 + T < n ? ids[c0 + T] : next, pos0 + c0 + 1, pt, false);
-                if (c0 + T == n) choose_draft(draft, next);
+                if (pick) { gemv(lm_head, hc + (size_t)(T - 1) * D, logits, D, V, cs); next = pick_token(); }
+                draft = mtp_forward(ids + c0 + 1, T, c0 + T < n ? ids[c0 + T] : pick ? next : follow, pos0 + c0 + 1, pt, false);
+                if (pick) choose_draft(draft, next);
             } else if (calib_dir) {  // every row's normed final hidden state: lm_head's calibration input
                 rmsnorm(Xc, moec, norm, hc, D, EPS, T, cs);
                 calib("lm_head", -1, hc, T, D);
-                if (c0 + T == n) { gemv(lm_head, hc + (size_t)(T - 1) * D, logits, D, V, cs); next = pick_token(); }
-            } else if (c0 + T == n) {  // the last prompt token: its logits pick the first generated token
+                if (pick) { gemv(lm_head, hc + (size_t)(T - 1) * D, logits, D, V, cs); next = pick_token(); }
+            } else if (pick) {  // the last prompt token: its logits pick the first generated token
                 rmsnorm(Xc + (size_t)(T - 1) * D, moec + (size_t)(T - 1) * D, norm, h, D, EPS, 1, cs);
                 gemv(lm_head, h, logits, D, V, cs);
                 next = pick_token();
             }
+            // a periodic checkpoint at this chunk's end (not the prompt's: the caller saves before its last token)
+            const int pe = pos0 + c0 + T;
+            if (ckpt_max > 0 && ckpt_every > 0 && c0 + T < n && pe / ckpt_every != (pos0 + c0) / ckpt_every) ckpt_save(pe);
         }
         { std::lock_guard<std::mutex> g(st_mu); st_stop = true; }
         streamer.join();

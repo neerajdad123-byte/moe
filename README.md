@@ -18,6 +18,28 @@ A 35-billion-parameter model, ~1.9x faster than tuned llama.cpp and ik_llama.cpp
 
 </div>
 
+## This fork (moe-checkpoint): what changed
+
+Four changes on top of moex v0.2.0 (`8148499`), measured on an RTX 5050 Laptop 8 GB, Core 7 240H, 32 GB RAM, with
+Qwen3.6-35B-A3B **UD-Q4_K_XL** imported via `moex import`. They are mainly for long prompts and agent use, where a
+client resends a slightly different history every turn.
+
+| Change | What it does | Impact (measured) |
+|---|---|---|
+| **Prompt checkpoints** (`src/session.h`, `src/moex.cu`) | The DeltaNet state can't be rewound, so a changed history (a client re-tokenizing a reply, an edited message, a regenerate) used to re-read the whole prompt. A checkpoint is a host-RAM copy of that state (63 MB). One is saved every `MOEX_CKPT_EVERY` prompt tokens (default 8192), plus one where the reply's turn starts (the last `<\|im_start\|>`). On a mismatch, the latest checkpoint inside the unchanged prefix is restored. K/V rows need no copy. `MOEX_CKPT=N` keeps N (default 4, 0 = off). | 21.8k-token chat. Edited history: **18.7 s → 0.63 s** to first token (re-reads 77 tokens). Regenerate: **18.6 s → 0.28 s**. Plain continuation: 0.32 → 0.46 s. |
+| **FlashAttention-2 prefill kernel** (`attn_fa_k` in `src/kernels.cuh`) | `mma.sync` m16n8k16 kernel. Each K/V tile of 64 keys is shared by 16 tokens × 8 query heads, instead of 4 tokens in `attn_prefill_k`. K/V stay int8 in shared memory and are widened to fp16 in registers. S and O live in registers. Checked against an fp64 reference in `tests/test_fa.cu`. `MOEX_FA=0` = the old kernel. | Attention **2.4–2.5× faster** (6.7 → ~16 TFLOPS) at 0–260k context. 252k-token prompt: **~21 min → ~9 min**. |
+| **Prefill chunk 1024 → 2048** (`MOEX_CH`, compile time) | Each expert streamed over PCIe during a prompt serves 2× more tokens. | 21.8k-token prompt: **26.4 s → 19.8 s (~1,100 tok/s)**, with FlashAttention. 4096 measured slower. |
+| **TurboQuant KV cache** (`MOEX_KV=turbo`) | K 4-bit / V 3-bit, as llama.cpp's turbo4 / turbo3. Each 128-value half-row is rotated with a sign-randomized Walsh-Hadamard transform and quantized to Lloyd-Max centroids. Queries get the same rotation, and the output is rotated back before the gate. 240 bytes per (kv head, position) instead of 520. The freed VRAM becomes expert slots automatically. | KV **−54%**. At 262k context: expert slots **1,060 → 1,939 (+83%)**, decode 53/54 → 57/62 tok/s. At 90k: +14% slots, decode unchanged within noise. Mean KL on `--check`: 1.87e-2 → 1.98e-2. |
+
+Decode with a 21.8k-token prompt is ~57–62 tok/s, vs ~47–49 for the best tuned llama.cpp setup on the same machine.
+
+New tests and switches:
+- `tests/test_fa.cu` (built by `build.bat` / `build.sh`) checks the FlashAttention kernel against fp64, the turbo
+  paths against each other, and times both kernels.
+- `MOEX_FA=0`, `MOEX_KV=turbo`, `MOEX_CKPT`, `MOEX_CKPT_EVERY`.
+- On Windows, set `MOEX_CUDA_FREE=1` if loading runs out of VRAM. The NVML free count can exceed what CUDA can
+  allocate under WDDM.
+
 ## Get started in 3 steps
 
 You need: Windows 10/11, an NVIDIA RTX 20 series or newer GPU with 6 GB+ VRAM, NVIDIA driver 580 or newer (older
