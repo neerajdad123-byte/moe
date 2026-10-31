@@ -15,6 +15,7 @@ CXX="g++ -std=c++20 -O2 -mavx2 -mfma -mf16c -pthread"
 if [ "$1" != "moex" ]; then
   KARCH=-arch=native; nvidia-smi > /dev/null 2>&1 || KARCH=-arch=sm_89  # no GPU (CI): it builds, it cannot run
   $NV $KARCH tests/test_kernels.cu -o build/test_kernels
+  $NV $KARCH tests/test_fa.cu -o build/test_fa
   $NV tests/test_download.cu -o build/test_download
   CUDA_INC="$(dirname "$(dirname "$(command -v nvcc)")")/include"
   $CXX -I "$CUDA_INC" tests/test_tokenizer.cpp -o build/test_tokenizer

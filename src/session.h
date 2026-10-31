@@ -215,13 +215,35 @@ struct Session {
         size_t common = 0;
         while (common < ctx.size() && common < prompt.size() && ctx[common] == prompt[common]) common++;
         if ((int)prompt.size() >= eng.ctx) { fprintf(stderr, "[session] prompt (%zu tokens) exceeds --ctx %d\n", prompt.size(), eng.ctx); return {}; }
-        int next;
+        const int n = (int)prompt.size();
+        int start;  // the engine holds the state after prompt[0, start)
         if (common > 0 && common == ctx.size() && common < prompt.size()) {  // extends what the engine holds
-            next = eng.prefill(prompt.data() + common, (int)(prompt.size() - common), (int)common);
-        } else {  // a new conversation (/reset leaves ctx empty) or a changed history: start over from a clean state
-                  // (the DeltaNet state cannot be rewound, and the engine may still hold an earlier conversation)
+            start = (int)common;
+        } else if (const auto* c = eng.ckpt_find(std::min((int)common, n - 1))) {
+            // a changed history (or the same prompt again): back to the latest checkpoint inside the unchanged prefix
+            // (local; the DeltaNet state cannot be rewound, a checkpoint is a copy of it)
+            start = c->pos;
+            eng.ckpt_restore(*c, prompt.data());
+            fprintf(stderr, "[ckpt] history differs from token %zu of %d: restored the checkpoint at %d, reading %d tokens instead of %d\n",
+                    common, n, start, n - start, n);
+        } else {  // a new conversation (/reset leaves ctx empty) or a change before every checkpoint: start over
+                  // (the engine may still hold an earlier conversation)
             eng.reset();
-            next = eng.prefill(prompt.data(), (int)prompt.size(), 0);
+            start = 0;
+        }
+        eng.ckpt_drop_after(start);  // made for the history that was just left
+        // A checkpoint where the reply's turn starts (the last <|im_start|>): a resent history differs from this prompt
+        // from there on at the earliest (the template rewrites a past reply's head, e.g. drops its think block), and a
+        // regenerated reply re-reads only that turn's header. No <|im_start|> in the new part: before the last token.
+        int cp = n - 1;
+        for (int i = n - 2; i > start; i--) if (prompt[i] == im_start) { cp = i; break; }
+        int next;
+        if (cp > start && eng.ckpt_max > 0) {  // the prompt up to cp, a checkpoint, then the rest
+            eng.prefill(prompt.data() + start, cp - start, start, prompt[cp]);
+            eng.ckpt_save(cp);
+            next = eng.prefill(prompt.data() + cp, n - cp, cp);
+        } else {
+            next = eng.prefill(prompt.data() + start, n - start, start);
         }
         ctx = prompt;
         std::vector<int> out;
