@@ -94,6 +94,7 @@ struct Session {
     Tokenizer& tk;
     bool think = false;           // let the model think (<think> ... </think>) instead of an empty think block
     std::vector<int> ctx;         // tokens whose effect is in the engine state, at positions 0..ctx.size()-1
+    int last_read = 0;            // prompt tokens the last generate() actually read (prefilled)
     // Our own replies, keyed by what a client sends back (key_of), so a resent history reuses their exact ids. head is
     // what came after "assistant\n" in the prompt; with thinking, the thinking is in ids, so the history still
     // matches the engine state and only the new turn is prefilled.
@@ -232,13 +233,17 @@ struct Session {
             start = 0;
         }
         eng.ckpt_drop_after(start);  // made for the history that was just left
+        last_read = n - start;
         // A checkpoint where the reply's turn starts (the last <|im_start|>): a resent history differs from this prompt
         // from there on at the earliest (the template rewrites a past reply's head, e.g. drops its think block), and a
         // regenerated reply re-reads only that turn's header. No <|im_start|> in the new part: before the last token.
+        // Only for a new part of CKPT_MIN_READ tokens or more: the split costs a second prefill call and a 63 MB copy
+        // (~0.14 s), more than re-reading a short part from the previous checkpoint later.
+        constexpr int CKPT_MIN_READ = 256;
         int cp = n - 1;
         for (int i = n - 2; i > start; i--) if (prompt[i] == im_start) { cp = i; break; }
         int next;
-        if (cp > start && eng.ckpt_max > 0) {  // the prompt up to cp, a checkpoint, then the rest
+        if (cp > start && cp - start >= CKPT_MIN_READ && eng.ckpt_max > 0) {  // the prompt up to cp, a checkpoint, then the rest
             eng.prefill(prompt.data() + start, cp - start, start, prompt[cp]);
             eng.ckpt_save(cp);
             next = eng.prefill(prompt.data() + cp, n - cp, cp);

@@ -1462,9 +1462,16 @@ __device__ __forceinline__ void fa_i8x4(uint32_t w, uint32_t& lo, uint32_t& hi) 
     half2 hh = __hsub2(*reinterpret_cast<half2*>(&h), *reinterpret_cast<const half2*>(&off));
     lo = fa_h2u(lh); hi = fa_h2u(hh);
 }
+// mma.sync m16n8k16 needs sm_80+. The sm_75 part of the fatbin compiles to a trap: attn_fa_k is never launched there
+// (fa_supported() on the host; RTX 20 runs attn_prefill_k, or the per-token kernel with turbo KV).
 __device__ __forceinline__ void fa_mma(float* c, uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3, uint32_t b0, uint32_t b1) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
+    (void)c; (void)a0; (void)a1; (void)a2; (void)a3; (void)b0; (void)b1;
+    __trap();
+#else
     asm("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
         : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3]) : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+#endif
 }
 // K rows' 16-byte chunks are XORed with ksw(key): the 8 keys a fragment load reads (key 16i + 4(g/2) + g%2 + 2(j%2),
 // g = 0..7) get 8 different values
@@ -1689,12 +1696,27 @@ __global__ void __launch_bounds__(FA_THREADS, 1) attn_fa_k(const float* __restri
     }
 }
 
-inline bool attn_fa_on() {  // MOEX_FA=0: the original attn_prefill_k (A/B)
+inline bool attn_fa_on() {  // MOEX_FA=0: the original attn_prefill_k (A/B; turbo KV always uses attn_fa_k, see attn_decode)
     static const bool on = !(getenv("MOEX_FA") && atoi(getenv("MOEX_FA")) == 0);
     return on;
 }
+// attn_fa_k needs mma.sync m16n8k16 and ~97 KB of shared memory per block: compute capability 8.0+ (RTX 30 and newer).
+// Asked per call (cheap) so a process on several GPUs answers for the current one.
+inline bool fa_supported() {
+    static int cc[16] = {};  // major compute capability per device, 0 = not asked yet
+    int dev = 0;
+    CK(cudaGetDevice(&dev));
+    if (dev < 0 || dev >= 16) return false;
+    if (!cc[dev]) CK(cudaDeviceGetAttribute(&cc[dev], cudaDevAttrComputeCapabilityMajor, dev));
+    return cc[dev] >= 8;
+}
 inline void attn_fa(const float* qo, const float* q, KVCache kv, float* out, int H, int KV, const int* pos_d, int max_t,
                     int ld, int T, cudaStream_t st) {
+    if (!fa_supported()) {  // before sm_80: int8 -> attn_prefill_k; turbo (no attn_prefill_k path) -> the per-token kernel
+        if (kv.turbo) attn_decode_k<<<dim3(H, T, 1), AHD, 0, st>>>(qo, q, kv, out, H, KV, pos_d, max_t, ld, nullptr);
+        else attn_prefill(qo, q, kv, out, H, KV, pos_d, max_t, ld, T, st);
+        return;
+    }
     static bool once = [] {
         CK(cudaFuncSetAttribute(attn_fa_k<false>, cudaFuncAttributeMaxDynamicSharedMemorySize, FA_SMEM));
         CK(cudaFuncSetAttribute(attn_fa_k<true>, cudaFuncAttributeMaxDynamicSharedMemorySize, FA_SMEM_TQ));
@@ -1830,7 +1852,7 @@ inline void attn_decode(const float* q, const float* k, const float* v, const ha
                         int rot, float theta, float eps, int T, int ld, cudaStream_t st = 0, float* part = nullptr, int ns = 1) {
     qk_norm_rope_k<<<dim3(H + KV, T), AHD, 0, st>>>(q, k, v, qn, kn, qo, kv, H, KV, pos_d, max_t, rot, theta, eps, ld);
     const float* gate = kv.turbo ? nullptr : q;  // turbo: the output is gated after turbo_out_k rotates it back
-    if (T > 2 && ns == 1 && H / KV == 8 && (attn_fa_on() || kv.turbo)) attn_fa(qo, gate, kv, out, H, KV, pos_d, max_t, ld, T, st);
+    if (T > 2 && ns == 1 && H / KV == 8 && (attn_fa_on() || kv.turbo) && fa_supported()) attn_fa(qo, gate, kv, out, H, KV, pos_d, max_t, ld, T, st);
     else if (T > 2 && ns == 1 && PR % (H / KV) == 0 && !kv.turbo) attn_prefill(qo, q, kv, out, H, KV, pos_d, max_t, ld, T, st);
     else if (ns > 1 && H / KV == GQ) {
         attn_gqa_k<<<dim3(KV, T, ns), GT, 0, st>>>(qo, kv, H, KV, pos_d, max_t, part);
