@@ -8,8 +8,14 @@
 struct Engine {  // render() needs none of it; generate() is compiled but never called here
     int ctx = 1 << 30;
     bool has_mtp = false;
-    int prefill(const int*, int, int) { return 0; }
+    int prefill(const int*, int, int, int = -1) { return 0; }
     void reset() {}
+    struct Ckpt { int pos; };  // prompt checkpoints (Session::generate)
+    int ckpt_max = 0;
+    const Ckpt* ckpt_find(int) const { return nullptr; }
+    void ckpt_restore(const Ckpt&, const int*) {}
+    void ckpt_save(int) {}
+    void ckpt_drop_after(int) {}
     int step(int, int, bool) { return 0; }
     std::vector<int> mtp_round(int, int) { return {}; }
 };

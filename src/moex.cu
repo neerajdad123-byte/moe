@@ -20,6 +20,7 @@
 #include <cpuid.h>
 #endif
 #include <cstdio>
+#include <cstring>
 #include <deque>
 #include <list>
 #include <memory>
