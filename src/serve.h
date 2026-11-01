@@ -152,7 +152,9 @@ static GenOut run_request(Session& ss, Tokenizer& tk, const GenReq& q, const std
     };
     const int max_new = q.max_new > 0 ? q.max_new : ss.eng.ctx - (int)prompt.size() - 1;
     const double t0 = now();
+    double t1 = 0;  // the first generated token: the prompt is read until then, decode after
     auto out = ss.generate(prompt, max_new, [&](int t) {
+        if (t1 == 0) t1 = now();
         feed(us.push(tk.piece(t)), false);
         return alive && !g.hit_stop;
     });
@@ -170,9 +172,14 @@ static GenOut run_request(Session& ss, Tokenizer& tk, const GenReq& q, const std
     g.length = !g.hit_stop && ((int)out.size() >= max_new || (int)(prompt.size() + out.size()) + 4 >= ss.eng.ctx);
     ss.remember(Session::key_of(g.content, g.calls), out);
     ss.eng.save_hot();
-    fprintf(stderr, "[serve] %zu prompt tokens, %zu generated%s, %.1f s, %.1f tok/s overall\n", prompt.size(), out.size(),
-            g.calls.empty() ? "" : (", " + std::to_string(g.calls.size()) + " tool call(s)").c_str(), now() - t0,
-            out.size() / std::max(now() - t0, 1e-9));
+    const double t2 = now();
+    if (t1 == 0) t1 = t2;
+    // prefill: the prompt tokens actually read (the rest came from the engine state or a checkpoint) over the time to
+    // the first token; decode: the tokens after the first over the time after it
+    fprintf(stderr, "[serve] %zu prompt tokens (%d read), %zu generated%s, %.1f s | prefill %.2f s = %.0f tok/s | decode %.1f tok/s\n",
+            prompt.size(), ss.last_read, out.size(),
+            g.calls.empty() ? "" : (", " + std::to_string(g.calls.size()) + " tool call(s)").c_str(), t2 - t0,
+            t1 - t0, ss.last_read / std::max(t1 - t0, 1e-9), out.size() > 1 ? (out.size() - 1) / std::max(t2 - t1, 1e-9) : 0.0);
     return g;
 }
 
